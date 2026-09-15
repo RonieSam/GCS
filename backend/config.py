@@ -27,6 +27,12 @@ MAVLINK_STREAM_RATE_HZ = 4
 # --- Mission defaults (used from Phase 5/8 onward) ---
 DEFAULT_ALTITUDE = 15  # meters
 
+# --- Phase 8: MAVLink mission upload timeouts ---
+# Total time to wait for the complete upload handshake (CLEAR → COUNT → items → ACK).
+MISSION_UPLOAD_TIMEOUT_S = 15
+# Per-item timeout: how long to wait for PX4 to request the next item.
+MISSION_ITEM_TIMEOUT_S = 5
+
 # --- Coverage model (used from Phase 2 onward) ---
 COVERAGE_RADIUS_DEFAULT_M = 250  # fallback if a node omits coverage_radius_m
 GRID_RESOLUTION_M = 20  # spacing between coverage-grid sample points

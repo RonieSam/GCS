@@ -46,6 +46,9 @@ class VehicleStateOut(BaseModel):
     gps_fix: Optional[str]
     satellites: Optional[int]
     last_heartbeat: Optional[float]
+    # Phase 8 — mission progress (None when no mission is executing)
+    mission_current: Optional[int] = None
+    mission_item_reached: Optional[int] = None
 
 
 class TelemetryMessage(BaseModel):
@@ -136,3 +139,31 @@ class NotImplementedResponse(BaseModel):
     implemented: bool = False
     phase_required: int
     message: str
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — mission upload / execution response models
+# ---------------------------------------------------------------------------
+
+
+class MissionUploadResponse(BaseModel):
+    """Returned by POST /api/mission/send after a real MAVLink upload."""
+    success: bool
+    mission_id: Optional[int] = None
+    status: str                      # e.g. "uploaded", "failed", "timeout"
+    items: int = 0                   # number of items accepted by PX4
+    error: Optional[str] = None      # human-readable error if success=False
+
+
+class MissionStartResponse(BaseModel):
+    """Returned by POST /api/mission/start."""
+    success: bool
+    mode: Optional[str] = None
+    error: Optional[str] = None
+
+
+class MissionAbortResponse(BaseModel):
+    """Returned by POST /api/mission/abort."""
+    success: bool
+    action: str = "RTL"
+    error: Optional[str] = None

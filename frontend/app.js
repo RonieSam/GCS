@@ -48,6 +48,13 @@ const state = {
   lastTelemetryAt: 0,        // ms timestamp telemetry was last received (Date.now())
   telemetryReconnectTimer: null,
   uavMarker: null,           // Leaflet marker for the live UAV position
+
+  // Phase 8 — mission lifecycle
+  missionGenerated: false,   // true after Generate Mission succeeded
+  missionUploaded: false,    // true after Upload Mission succeeded (PX4 ACK)
+  missionExecuting: false,   // true after Start Mission commanded
+  lastMissionId: null,       // SQLite id of last generated mission
+  lastMissionItems: 0,       // number of items PX4 accepted
 };
 
 // A message every ~1/MAVLINK stream rate is expected; if nothing arrives
@@ -548,11 +555,22 @@ function clearMissionPanel() {
   document.getElementById("mission-lat").value = "--";
   document.getElementById("mission-lon").value = "--";
   document.getElementById("btn-generate-mission").disabled = true;
-  document.getElementById("btn-send-target").disabled = true;
+  document.getElementById("btn-upload-mission").disabled = true;
+  document.getElementById("btn-start-mission").disabled = true;
+  document.getElementById("btn-abort-mission").disabled = true;
   document.getElementById("mission-hint").textContent =
     "Select a recommended location to generate a mission.";
   document.getElementById("stat-mission-state").textContent = "PLANNING";
+  document.getElementById("stat-upload-status").textContent = "--";
+  document.getElementById("stat-px4-ack").textContent = "--";
+  document.getElementById("stat-mission-items").textContent = "--";
+  document.getElementById("stat-mission-current").textContent = "--";
   state.selectedTarget = null;
+  state.missionGenerated = false;
+  state.missionUploaded = false;
+  state.missionExecuting = false;
+  state.lastMissionId = null;
+  state.lastMissionItems = 0;
 }
 
 async function selectLocation(candidate, label) {
@@ -588,6 +606,9 @@ async function generateMission() {
   const altInput = document.getElementById("mission-alt");
   const altitude = parseFloat(altInput.value) || 15;
 
+  const btn = document.getElementById("btn-generate-mission");
+  btn.disabled = true;
+
   try {
     const result = await apiPost("/api/mission/generate", {
       lat: state.selectedTarget.lat,
@@ -597,29 +618,188 @@ async function generateMission() {
     if (result.status !== 200) throw new Error(result.body && result.body.detail);
 
     const mission = result.body;
-    document.getElementById("stat-mission-state").textContent = mission.status;
-    document.getElementById("btn-send-target").disabled = false;
+    state.missionGenerated = true;
+    state.missionUploaded = false;
+    state.missionExecuting = false;
+    state.lastMissionId = mission.id;
+
+    document.getElementById("stat-mission-state").textContent = "GENERATED";
+    document.getElementById("stat-upload-status").textContent = "GENERATED";
+    document.getElementById("stat-px4-ack").textContent = "--";
+    document.getElementById("stat-mission-items").textContent = "--";
+
+    // Upload is now possible; Start/Abort remain disabled.
+    document.getElementById("btn-upload-mission").disabled = false;
+    document.getElementById("btn-start-mission").disabled = true;
+    document.getElementById("btn-abort-mission").disabled = true;
+
     document.getElementById("mission-hint").textContent =
-      `Mission #${mission.id} generated (target alt ${mission.target_alt}m). Ready to send.`;
+      `Mission #${mission.id} generated (alt ${mission.target_alt}m). Upload it to PX4.`;
     logEvent(`Mission #${mission.id} generated — status ${mission.status}.`);
   } catch (err) {
     logEvent(`Generate Mission failed: ${err.message}`);
+  } finally {
+    btn.disabled = !state.selectedTarget;
   }
 }
 
-async function sendTarget() {
+// ---------------------------------------------------------------------------
+// Phase 8 — Upload / Start / Abort
+// ---------------------------------------------------------------------------
+
+async function uploadMission() {
+  if (!state.missionGenerated) return;
+
+  const btn = document.getElementById("btn-upload-mission");
+  btn.disabled = true;
+  document.getElementById("btn-start-mission").disabled = true;
+  document.getElementById("btn-abort-mission").disabled = true;
+  document.getElementById("stat-mission-state").textContent = "UPLOADING";
+  document.getElementById("stat-upload-status").textContent = "UPLOADING…";
+  document.getElementById("stat-px4-ack").textContent = "…";
+  document.getElementById("mission-hint").textContent = "Uploading mission to PX4…";
+  logEvent("Mission upload started.");
+
   try {
     const result = await apiPost("/api/mission/send", {});
-    if (result.status === 501) {
-      // Honest stub — MAVLink/SITL connection arrives in Phase 6. Same
-      // "say so instead of faking a result" pattern as every earlier phase.
-      logEvent(`Send Target: ${result.body.message}`);
-      document.getElementById("mission-hint").textContent = result.body.message;
-    } else {
-      logEvent(`Send Target: ${JSON.stringify(result.body)}`);
+    const body = result.body;
+
+    if (result.status === 503) {
+      // PX4 not connected.
+      document.getElementById("stat-mission-state").textContent = "GENERATED";
+      document.getElementById("stat-upload-status").textContent = "NO PX4 LINK";
+      document.getElementById("stat-px4-ack").textContent = "--";
+      document.getElementById("mission-hint").textContent =
+        "PX4 not connected. Start SITL and wait for telemetry link.";
+      logEvent(`Mission upload failed: PX4 not connected.`);
+      btn.disabled = false;
+      return;
     }
+
+    if (!body.success) {
+      document.getElementById("stat-mission-state").textContent = "FAILED";
+      document.getElementById("stat-upload-status").textContent = body.status.toUpperCase();
+      document.getElementById("stat-px4-ack").textContent = "REJECTED";
+      document.getElementById("mission-hint").textContent =
+        `Upload failed: ${body.error || body.status}`;
+      logEvent(`Mission upload failed: ${body.error || body.status}`);
+      state.missionUploaded = false;
+      btn.disabled = false;
+      return;
+    }
+
+    // Success — PX4 acknowledged.
+    state.missionUploaded = true;
+    state.missionExecuting = false;
+    state.lastMissionItems = body.items;
+
+    document.getElementById("stat-mission-state").textContent = "UPLOADED";
+    document.getElementById("stat-upload-status").textContent = "UPLOADED";
+    document.getElementById("stat-px4-ack").textContent = "ACCEPTED";
+    document.getElementById("stat-mission-items").textContent = `${body.items} items`;
+    document.getElementById("mission-hint").textContent =
+      `Mission uploaded (${body.items} items). Arm vehicle then Start Mission.`;
+    logEvent(`Mission uploaded — ${body.items} items accepted by PX4.`);
+
+    // Enable Start; keep Upload enabled (re-upload allowed).
+    btn.disabled = false;
+    document.getElementById("btn-start-mission").disabled = false;
+    document.getElementById("btn-abort-mission").disabled = false;
+
   } catch (err) {
-    logEvent(`Send Target failed: ${err.message}`);
+    document.getElementById("stat-mission-state").textContent = "FAILED";
+    document.getElementById("stat-upload-status").textContent = "ERROR";
+    document.getElementById("mission-hint").textContent = `Upload error: ${err.message}`;
+    logEvent(`Mission upload error: ${err.message}`);
+    btn.disabled = false;
+  }
+}
+
+async function startMission() {
+  if (!state.missionUploaded) return;
+
+  const btn = document.getElementById("btn-start-mission");
+  btn.disabled = true;
+  document.getElementById("mission-hint").textContent = "Commanding PX4 into mission mode…";
+  logEvent("Start Mission commanded.");
+
+  try {
+    const result = await apiPost("/api/mission/start", {});
+    const body = result.body;
+
+    if (result.status === 400 || result.status === 503) {
+      const msg = body && body.detail ? body.detail : JSON.stringify(body);
+      document.getElementById("mission-hint").textContent = `Start failed: ${msg}`;
+      logEvent(`Start Mission failed: ${msg}`);
+      btn.disabled = false;
+      return;
+    }
+
+    if (!body.success) {
+      document.getElementById("mission-hint").textContent =
+        `Start failed: ${body.error || "PX4 rejected mode change"}`;
+      logEvent(`Start Mission rejected: ${body.error}`);
+      btn.disabled = false;
+      return;
+    }
+
+    // PX4 entered mission mode.
+    state.missionExecuting = true;
+    document.getElementById("stat-mission-state").textContent = "EXECUTING";
+    document.getElementById("mission-hint").textContent =
+      "PX4 in mission mode. Watch telemetry for movement.";
+    logEvent("PX4 entered AUTO.MISSION mode — UAV executing mission.");
+
+    // Disable Start while executing; Abort stays enabled.
+    btn.disabled = true;
+    document.getElementById("btn-abort-mission").disabled = false;
+
+  } catch (err) {
+    document.getElementById("mission-hint").textContent = `Start error: ${err.message}`;
+    logEvent(`Start Mission error: ${err.message}`);
+    btn.disabled = !state.missionUploaded;
+  }
+}
+
+async function abortMission() {
+  const btn = document.getElementById("btn-abort-mission");
+  btn.disabled = true;
+  document.getElementById("mission-hint").textContent = "Sending RTL (Return-to-Launch)…";
+  logEvent("Abort (RTL) commanded.");
+
+  try {
+    const result = await apiPost("/api/mission/abort", {});
+    const body = result.body;
+
+    if (result.status === 503) {
+      const msg = body && body.detail ? body.detail : "PX4 not connected";
+      document.getElementById("mission-hint").textContent = `Abort failed: ${msg}`;
+      logEvent(`Abort failed: ${msg}`);
+      btn.disabled = false;
+      return;
+    }
+
+    if (!body.success) {
+      document.getElementById("mission-hint").textContent =
+        `Abort failed: ${body.error || "PX4 rejected RTL"}`;
+      logEvent(`Abort rejected: ${body.error}`);
+      btn.disabled = false;
+      return;
+    }
+
+    state.missionExecuting = false;
+    document.getElementById("stat-mission-state").textContent = "ABORTED";
+    document.getElementById("mission-hint").textContent =
+      "RTL commanded — PX4 returning to launch point.";
+    logEvent("Mission aborted — PX4 returning to launch (RTL).");
+
+    document.getElementById("btn-start-mission").disabled = false;
+    btn.disabled = false;
+
+  } catch (err) {
+    document.getElementById("mission-hint").textContent = `Abort error: ${err.message}`;
+    logEvent(`Abort error: ${err.message}`);
+    btn.disabled = false;
   }
 }
 
@@ -678,6 +858,27 @@ function renderTelemetryPanel() {
   setStat("tel-heading", v.heading != null ? `${v.heading.toFixed(0)}°` : "--");
   setStat("tel-battery", fmtNum(v.battery, 0, "%"));
   setStat("tel-satellites", v.satellites != null ? String(v.satellites) : "--");
+
+  // Phase 8 — mission waypoint progress from live PX4 telemetry.
+  const mcur = v.mission_current;
+  const mreached = v.mission_item_reached;
+  setStat("tel-mission-current", mcur != null ? `WP ${mcur}` : "--");
+  setStat("tel-mission-reached", mreached != null ? `WP ${mreached}` : "--");
+
+  // Also update the mission panel's Current WP stat.
+  document.getElementById("stat-mission-current").textContent =
+    mcur != null ? `WP ${mcur}` : "--";
+
+  // If we reach the final waypoint, update mission state.
+  if (state.missionExecuting && mreached != null && state.lastMissionItems > 0) {
+    if (mreached >= state.lastMissionItems - 1) {
+      document.getElementById("stat-mission-state").textContent = "COMPLETED";
+      document.getElementById("mission-hint").textContent =
+        "Mission complete — UAV reached target waypoint.";
+      state.missionExecuting = false;
+      logEvent(`Mission COMPLETED — waypoint ${mreached} reached.`);
+    }
+  }
 
   // Also drives the existing Mission-panel connection indicator, since
   // that field's meaning (is the vehicle link up?) is the same one.
@@ -816,7 +1017,10 @@ function initControls() {
   document.getElementById("btn-clear").addEventListener("click", clearArea);
   document.getElementById("btn-analyze").addEventListener("click", analyzeArea);
   document.getElementById("btn-generate-mission").addEventListener("click", generateMission);
-  document.getElementById("btn-send-target").addEventListener("click", sendTarget);
+  // Phase 8 buttons
+  document.getElementById("btn-upload-mission").addEventListener("click", uploadMission);
+  document.getElementById("btn-start-mission").addEventListener("click", startMission);
+  document.getElementById("btn-abort-mission").addEventListener("click", abortMission);
 }
 
 // ---------------------------------------------------------------------------
@@ -837,7 +1041,7 @@ async function boot() {
   startTelemetryStaleWatch();
   renderTelemetryPanel();
 
-  logEvent("GCS initialized — Phase 7 (live telemetry) ready.");
+  logEvent("GCS initialized — Phase 8 (mission upload + execution) ready.");
 }
 
 boot();

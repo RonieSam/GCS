@@ -37,6 +37,9 @@ def new_vehicle_state():
         "gps_fix": None,
         "satellites": None,
         "last_heartbeat": None,
+        # Phase 8 — active mission progress (None when no mission is executing)
+        "mission_current": None,       # sequence number of current waypoint
+        "mission_item_reached": None,  # sequence number of last reached waypoint
     }
 
 
@@ -145,5 +148,14 @@ def update_from_message(state, msg, mav_connection=None):
     elif msg_type == "GPS_RAW_INT":
         state["gps_fix"] = _GPS_FIX_TYPES.get(msg.fix_type, f"UNKNOWN({msg.fix_type})")
         state["satellites"] = msg.satellites_visible if msg.satellites_visible != 255 else None
+
+    elif msg_type == "MISSION_CURRENT":
+        # PX4 broadcasts this whenever the active mission waypoint changes.
+        # seq is the 0-based index of the waypoint currently being executed.
+        state["mission_current"] = int(msg.seq)
+
+    elif msg_type == "MISSION_ITEM_REACHED":
+        # PX4 sends this each time it successfully reaches a waypoint.
+        state["mission_item_reached"] = int(msg.seq)
 
     return state

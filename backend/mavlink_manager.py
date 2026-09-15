@@ -12,6 +12,7 @@ import time
 from pymavlink import mavutil
 
 import mavlink_commands
+import mavlink_mission
 import mavlink_telemetry
 from safety_manager import SafetyStateMachine
 
@@ -43,6 +44,15 @@ class MAVLinkManager:
         # Commands that require waiting for a MAVLink response are executed
         # by the same thread that owns and reads the MAVLink connection.
         self._command_queue = queue.Queue()
+
+        # Phase 8 — mission upload state, protected by _lock.
+        # status values: NOT_GENERATED | GENERATED | UPLOADING | UPLOADED | FAILED
+        self._mission_upload_state = {
+            "status": "NOT_GENERATED",
+            "mission_id": None,
+            "items": 0,
+            "error": None,
+        }
 
         self._thread = None
         self._stop_event = threading.Event()
@@ -116,6 +126,23 @@ class MAVLinkManager:
         with self._lock:
             return dict(self._state)
 
+    def get_mission_upload_state(self):
+        """Return a copy of the current mission upload state.
+
+        Thread-safe snapshot; does not touch the MAVLink connection.
+        """
+        with self._lock:
+            return dict(self._mission_upload_state)
+
+    def set_mission_upload_state(self, **kwargs):
+        """Update specific fields in the mission upload state.
+
+        Intended for use by main.py before queuing an upload so the UI
+        can show UPLOADING before the background thread starts.
+        """
+        with self._lock:
+            self._mission_upload_state.update(kwargs)
+
     # ------------------------------------------------------------------
     # Commands
     # ------------------------------------------------------------------
@@ -146,6 +173,13 @@ class MAVLinkManager:
                 kwargs["mode"]
             )
 
+        elif name == "upload_mission":
+            return self._send_upload_mission_and_wait(
+                kwargs["items"],
+                mission_id=kwargs.get("mission_id"),
+                timeout_s=kwargs.get("timeout_s"),
+            )
+
         else:
             raise ValueError(f"Unknown command {name!r}")
 
@@ -173,6 +207,53 @@ class MAVLinkManager:
             raise mavlink_commands.CommandTimeout(
                 f"set_mode({mode_name})",
                 timeout_s,
+            )
+
+        if "error" in result_box:
+            raise result_box["error"]
+
+        return result_box["result"]
+
+    def _send_upload_mission_and_wait(self, items, mission_id=None, timeout_s=None):
+        """
+        Queue a mission upload and block until PX4 confirms or times out.
+
+        Args:
+            items      : list of mission item dicts from mavlink_mission.build_mission_items()
+            mission_id : optional SQLite mission id for state tracking
+            timeout_s  : forwarded to mavlink_mission.upload_mission()
+
+        Returns:
+            dict with {"items": n} on success.
+
+        Raises:
+            mavlink_mission.MissionTimeout
+            mavlink_mission.MissionRejected
+            mavlink_mission.MissionUploadError
+        """
+        import config as _config
+        wait_timeout = (timeout_s or _config.MISSION_UPLOAD_TIMEOUT_S) + 2
+
+        result_box = {}
+        done = threading.Event()
+
+        self._command_queue.put(
+            (
+                "upload_mission",
+                {
+                    "items": items,
+                    "mission_id": mission_id,
+                    "timeout_s": timeout_s,
+                },
+                result_box,
+                done,
+            )
+        )
+
+        if not done.wait(wait_timeout):
+            raise mavlink_mission.MissionTimeout(
+                "MISSION upload (queue processing)",
+                wait_timeout,
             )
 
         if "error" in result_box:
@@ -241,12 +322,47 @@ class MAVLinkManager:
                             ),
                         )
                     )
+
+                elif name == "upload_mission":
+                    # Update state to UPLOADING so the API can reflect this
+                    # while the blocking upload_mission() call is in flight.
+                    mid = kwargs.get("mission_id")
+                    with self._lock:
+                        self._mission_upload_state.update(
+                            status="UPLOADING",
+                            mission_id=mid,
+                            items=0,
+                            error=None,
+                        )
+
+                    n = mavlink_mission.upload_mission(
+                        self._conn,
+                        kwargs["items"],
+                        timeout_s=kwargs.get("timeout_s"),
+                    )
+
+                    with self._lock:
+                        self._mission_upload_state.update(
+                            status="UPLOADED",
+                            items=n,
+                            error=None,
+                        )
+
+                    result_box["result"] = {"items": n}
+
                 else:
                     raise ValueError(
                         f"Unknown queued command {name!r}"
                     )
 
             except Exception as e:
+                # Capture upload failures into upload state as well as result_box.
+                if name == "upload_mission":
+                    with self._lock:
+                        self._mission_upload_state.update(
+                            status="FAILED",
+                            error=str(e),
+                        )
                 result_box["error"] = e
 
             finally:
