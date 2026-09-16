@@ -27,6 +27,13 @@ _px4_reference_set_from_home = False
 _px4_reference_set_from_gps = False
 
 
+def reset_px4_reference_tracking():
+    """Reset tracking flags (primarily for test teardown and reconnection)."""
+    global _px4_reference_set_from_home, _px4_reference_set_from_gps
+    _px4_reference_set_from_home = False
+    _px4_reference_set_from_gps = False
+
+
 def _self_update_px4_reference(msg, state):
     """Update the coordinate mapper's PX4 reference from live MAVLink messages.
 
@@ -37,6 +44,12 @@ def _self_update_px4_reference(msg, state):
       1. HOME_POSITION — most authoritative; once seen we stop overriding.
       2. First GLOBAL_POSITION_INT with a valid fix — early-arrival fallback
          (SITL emits these before HOME_POSITION on first boot).
+
+    CRITICAL: Once the initial PX4 home reference is latched from HOME_POSITION,
+    subsequent HOME_POSITION messages (e.g. emitted by PX4 upon landing/disarming
+    at the mission target) MUST NOT overwrite the home reference. Overwriting it
+    would cause px4_to_gcs() to report target displacement as zero, resetting
+    the GCS UAV marker to home even though the physical UAV remains at the target.
 
     Args:
         msg:   The incoming MAVLink message (already processed by
@@ -50,7 +63,7 @@ def _self_update_px4_reference(msg, state):
     global _px4_reference_set_from_home, _px4_reference_set_from_gps
     msg_type = msg.get_type()
 
-    if msg_type == "HOME_POSITION":
+    if msg_type == "HOME_POSITION" and not _px4_reference_set_from_home:
         # lat/lon are integers in 1e7 degrees.
         lat = msg.latitude  / 1e7
         lon = msg.longitude / 1e7

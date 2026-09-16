@@ -53,6 +53,9 @@ const state = {
   missionGenerated: false,   // true after Generate Mission succeeded
   missionUploaded: false,    // true after Upload Mission succeeded (PX4 ACK)
   missionExecuting: false,   // true after Start Mission commanded
+  missionCompleted: false,   // true after autonomous mission has reached final waypoint/landed
+  returningHome: false,      // true while return-home mission is in flight
+  returnCompleted: false,    // true after UAV has completed return flight and landed at home
   lastMissionId: null,       // SQLite id of last generated mission
   lastMissionItems: 0,       // number of items PX4 accepted
 };
@@ -626,6 +629,9 @@ async function generateMission() {
     state.missionGenerated = true;
     state.missionUploaded = false;
     state.missionExecuting = false;
+    state.missionCompleted = false;
+    state.returningHome = false;
+    state.returnCompleted = false;
     state.lastMissionId = mission.id;
 
     document.getElementById("stat-mission-state").textContent = "GENERATED";
@@ -851,6 +857,53 @@ async function disarmVehicle() {
 }
 
 // ---------------------------------------------------------------------------
+// Return to Home (Post-mission return workflow)
+// ---------------------------------------------------------------------------
+
+async function returnHome() {
+  const btn = document.getElementById("btn-return-home");
+  if (btn) btn.disabled = true;
+
+  document.getElementById("stat-mission-state").textContent = "RETURNING HOME";
+  document.getElementById("mission-hint").textContent = "Commanding UAV to return to home…";
+  logEvent("Return to Home commanded.");
+
+  try {
+    const result = await apiPost("/api/vehicle/return-home", {});
+    const body = result.body;
+
+    if (result.status === 503 || result.status === 400) {
+      const msg = body && body.detail ? body.detail : JSON.stringify(body);
+      document.getElementById("mission-hint").textContent = `Return failed: ${msg}`;
+      logEvent(`Return to Home failed: ${msg}`);
+      if (btn) btn.disabled = false;
+      return;
+    }
+
+    if (!body.success) {
+      document.getElementById("mission-hint").textContent =
+        `Return failed: ${body.error || "PX4 rejected return"}`;
+      logEvent(`Return to Home rejected: ${body.error}`);
+      if (btn) btn.disabled = false;
+      return;
+    }
+
+    state.returningHome = true;
+    state.missionExecuting = false;
+    state.lastMissionItems = body.items || 3;
+    document.getElementById("stat-mission-state").textContent = "RETURNING HOME";
+    document.getElementById("mission-hint").textContent =
+      "UAV returning to home coordinates. Watch telemetry for movement.";
+    logEvent("PX4 executing Return to Home mission.");
+
+  } catch (err) {
+    document.getElementById("mission-hint").textContent = `Return error: ${err.message}`;
+    logEvent(`Return to Home error: ${err.message}`);
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Live telemetry (Phase 7) — /ws/telemetry -> UAV marker + telemetry panel
 // ---------------------------------------------------------------------------
 
@@ -898,10 +951,12 @@ function renderTelemetryPanel() {
 
   const armBtn = document.getElementById("btn-arm");
   const disarmBtn = document.getElementById("btn-disarm");
+  const returnHomeBtn = document.getElementById("btn-return-home");
 
   if (stale) {
     armBtn.disabled = true;
     disarmBtn.disabled = true;
+    if (returnHomeBtn) returnHomeBtn.disabled = true;
   } else {
     if (v.armed) {
       armBtn.disabled = true;
@@ -909,6 +964,15 @@ function renderTelemetryPanel() {
     } else {
       armBtn.disabled = false;
       disarmBtn.disabled = true;
+    }
+
+    if (returnHomeBtn) {
+      // Return to Home is enabled only post-mission when mission completed, UAV at target, not executing/returning
+      if (state.missionExecuting || state.returningHome || !state.missionCompleted || state.returnCompleted) {
+        returnHomeBtn.disabled = true;
+      } else {
+        returnHomeBtn.disabled = false;
+      }
     }
   }
 
@@ -933,14 +997,27 @@ function renderTelemetryPanel() {
   document.getElementById("stat-mission-current").textContent =
     mcur != null ? `WP ${mcur}` : "--";
 
-  // If we reach the final waypoint, update mission state.
+  // If we reach the final waypoint of forward mission, update mission state.
   if (state.missionExecuting && mreached != null && state.lastMissionItems > 0) {
     if (mreached >= state.lastMissionItems - 1) {
+      state.missionCompleted = true;
+      state.missionExecuting = false;
       document.getElementById("stat-mission-state").textContent = "COMPLETED";
       document.getElementById("mission-hint").textContent =
-        "Mission complete — UAV reached target waypoint.";
-      state.missionExecuting = false;
+        "Mission complete — UAV landed at target. Ready to Return to Home.";
       logEvent(`Mission COMPLETED — waypoint ${mreached} reached.`);
+    }
+  }
+
+  // If returning home and reached final waypoint, mark return complete.
+  if (state.returningHome && mreached != null && state.lastMissionItems > 0) {
+    if (mreached >= state.lastMissionItems - 1) {
+      state.returningHome = false;
+      state.returnCompleted = true;
+      document.getElementById("stat-mission-state").textContent = "RETURN COMPLETE";
+      document.getElementById("mission-hint").textContent =
+        "Return complete — UAV reached home coordinates.";
+      logEvent(`Return to Home COMPLETED — waypoint ${mreached} reached.`);
     }
   }
 
@@ -1088,6 +1165,11 @@ function initControls() {
   // Arm/Disarm buttons
   document.getElementById("btn-arm").addEventListener("click", armVehicle);
   document.getElementById("btn-disarm").addEventListener("click", disarmVehicle);
+  // Return to Home button
+  const returnHomeBtn = document.getElementById("btn-return-home");
+  if (returnHomeBtn) {
+    returnHomeBtn.addEventListener("click", returnHome);
+  }
 }
 
 // ---------------------------------------------------------------------------

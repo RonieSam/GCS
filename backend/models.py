@@ -206,3 +206,13 @@ class CoordinateTranslateResponse(BaseModel):
     north_m:       float
     east_m:        float
 
+
+class ReturnHomeResponse(BaseModel):
+    """Returned by POST /api/vehicle/return-home."""
+    success: bool
+    action: str = "RETURN_HOME"
+    home_target: Optional[CoordinateReferencePoint] = None
+    items: Optional[int] = None
+    error: Optional[str] = None
+
+

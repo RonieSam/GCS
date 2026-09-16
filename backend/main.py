@@ -63,6 +63,7 @@ from models import (
     MissionUploadResponse,
     NodeOut,
     NotImplementedResponse,
+    ReturnHomeResponse,
     SelectTargetRequest,
     SelectTargetResponse,
     StatusResponse,
@@ -214,6 +215,131 @@ def api_vehicle_mode(mode_name: str):
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/vehicle/return-home", response_model=ReturnHomeResponse)
+def api_vehicle_return_home():
+    """Command the UAV to physically return to its original home coordinates.
+
+    Used post-mission after the UAV has landed at the target.
+    Uploads a dedicated return mission (TAKEOFF at current UAV pos -> WAYPOINT at home -> LAND at home),
+    arms the vehicle, and commands PX4 into MISSION mode so the UAV physically flies home.
+    """
+    logger.info("RETURN HOME requested")
+
+    # 1. Validate MAVLink link
+    if not mav_manager.is_connected():
+        logger.warning("RETURN HOME failed: PX4 is not connected.")
+        raise HTTPException(503, "PX4 is not connected. Cannot command return to home.")
+
+    # 2. Validate PX4 home/reference is available
+    mapper = coordinate_mapper.get_mapper()
+    refs = mapper.get_references()
+    px4_ref = refs.get("px4_reference", {})
+    home_lat = px4_ref.get("latitude")
+    home_lon = px4_ref.get("longitude")
+
+    if home_lat is None or home_lon is None:
+        logger.warning("RETURN HOME failed: PX4 home/reference is not available.")
+        raise HTTPException(400, "PX4 home/reference coordinate is not available.")
+
+    # 3. Validate current UAV position
+    uav_state = mav_manager.get_vehicle_state()
+    uav_lat = uav_state.get("latitude")
+    uav_lon = uav_state.get("longitude")
+
+    if uav_lat is None or uav_lon is None:
+        logger.warning("RETURN HOME failed: Current UAV position is unknown.")
+        raise HTTPException(400, "Current UAV position is unknown.")
+
+    logger.info(f"Current UAV position: lat={uav_lat:.7f}, lon={uav_lon:.7f}")
+    logger.info(f"PX4 home/reference: lat={home_lat:.7f}, lon={home_lon:.7f}")
+
+    # Check if already at home coordinates (within 3m) and not flying
+    R = 6371000.0
+    phi1, phi2 = math.radians(uav_lat), math.radians(home_lat)
+    dphi = math.radians(home_lat - uav_lat)
+    dlam = math.radians(home_lon - uav_lon)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    dist_to_home = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    if dist_to_home < 3.0 and not uav_state.get("armed"):
+        logger.info(f"RETURN HOME: UAV is already at home coordinates ({dist_to_home:.1f}m away).")
+        return ReturnHomeResponse(
+            success=False,
+            action="RETURN_HOME",
+            home_target=CoordinateReferencePoint(latitude=home_lat, longitude=home_lon),
+            error="UAV is already at home coordinates.",
+        )
+
+    # 4. Construct return mission from current position to home reference
+    last_mission = session_state.get("last_mission")
+    alt = last_mission.get("target_alt") if last_mission else config.DEFAULT_ALTITUDE
+    if not alt or alt <= 0:
+        alt = config.DEFAULT_ALTITUDE
+
+    try:
+        items = mavlink_mission.build_mission_items(
+            target_lat=home_lat,
+            target_lon=home_lon,
+            target_alt_m=alt,
+            home_lat=uav_lat,
+            home_lon=uav_lon,
+        )
+    except mavlink_mission.InvalidMission as e:
+        logger.error(f"RETURN HOME failed: Invalid return mission: {e}")
+        raise HTTPException(400, f"Invalid return mission: {e}")
+
+    logger.info("RETURN HOME command sent")
+
+    try:
+        upload_result = mav_manager.send_command(
+            "upload_mission",
+            items=items,
+            timeout_s=config.MISSION_UPLOAD_TIMEOUT_S,
+        )
+        n_items = upload_result.get("items", len(items))
+
+        # If vehicle is disarmed at target, arm it for the return flight
+        if not uav_state.get("armed"):
+            logger.info("Vehicle disarmed at target — commanding ARM for return flight")
+            mav_manager.send_command("arm")
+
+        # Command PX4 into MISSION mode to execute the return mission
+        mav_manager.send_command("set_mode", mode="MISSION")
+
+        session_state["mission_state"] = "RETURNING"
+        logger.info("RETURN HOME result: ACCEPTED")
+
+        return ReturnHomeResponse(
+            success=True,
+            action="RETURN_HOME",
+            home_target=CoordinateReferencePoint(latitude=home_lat, longitude=home_lon),
+            items=n_items,
+        )
+
+    except (mavlink_commands.CommandRejected, mavlink_mission.MissionRejected) as e:
+        logger.warning(f"RETURN HOME result: REJECTED - {e}")
+        return ReturnHomeResponse(
+            success=False,
+            action="RETURN_HOME",
+            home_target=CoordinateReferencePoint(latitude=home_lat, longitude=home_lon),
+            error=str(e),
+        )
+    except (mavlink_commands.CommandTimeout, mavlink_mission.MissionTimeout) as e:
+        logger.warning(f"RETURN HOME result: TIMEOUT - {e}")
+        return ReturnHomeResponse(
+            success=False,
+            action="RETURN_HOME",
+            home_target=CoordinateReferencePoint(latitude=home_lat, longitude=home_lon),
+            error=str(e),
+        )
+    except (RuntimeError, ValueError) as e:
+        logger.error(f"RETURN HOME result: ERROR - {e}")
+        raise HTTPException(503, str(e))
+    except Exception as e:
+        logger.error(f"RETURN HOME result: UNEXPECTED ERROR - {e}")
         raise HTTPException(500, str(e))
 
 
