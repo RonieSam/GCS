@@ -240,6 +240,22 @@ class MAVLinkManager:
                 timeout_s=kwargs.get("timeout_s"),
             )
 
+        elif name == "send_velocity":
+            # Fire-and-forget: queue and return immediately.
+            # No ACK expected from PX4 for SET_POSITION_TARGET_LOCAL_NED.
+            self._command_queue.put((
+                "send_velocity",
+                {
+                    "vx": kwargs["vx"],
+                    "vy": kwargs["vy"],
+                    "vz": kwargs["vz"],
+                    "yaw_rate": kwargs["yaw_rate"],
+                },
+                {},
+                threading.Event(),  # dummy done-event; never waited on
+            ))
+            return {"success": True}
+
         else:
             raise ValueError(f"Unknown command {name!r}")
 
@@ -446,6 +462,16 @@ class MAVLinkManager:
                         )
 
                     result_box["result"] = {"items": n}
+
+                elif name == "send_velocity":
+                    mavlink_commands.send_velocity_setpoint(
+                        self._conn,
+                        kwargs["vx"],
+                        kwargs["vy"],
+                        kwargs["vz"],
+                        kwargs["yaw_rate"],
+                    )
+                    result_box["result"] = {"success": True}
 
                 else:
                     raise ValueError(

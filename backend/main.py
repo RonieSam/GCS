@@ -56,6 +56,9 @@ from models import (
     CoordinateTranslateResponse,
     DeploymentOut,
     LatLon,
+    ManualControlResponse,
+    ManualVelocityRequest,
+    ManualVelocityResponse,
     MissionAbortResponse,
     MissionGenerateRequest,
     MissionOut,
@@ -341,6 +344,113 @@ def api_vehicle_return_home():
     except Exception as e:
         logger.error(f"RETURN HOME result: UNEXPECTED ERROR - {e}")
         raise HTTPException(500, str(e))
+
+
+# ---------------------------------------------------------------------------
+# Manual Control — POSCTL override + velocity setpoint + MISSION resume
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/vehicle/manual-control", response_model=ManualControlResponse)
+def api_vehicle_manual_control():
+    """Enter manual (POSCTL) override mode.
+
+    Switches PX4 into Position Control (POSCTL) so the operator can fly
+    the vehicle with a gamepad.  The current mission is NOT cleared — PX4
+    preserves the mission sequence index across mode changes, so Resume
+    Auto (POST /api/vehicle/resume-mission) will continue from the same
+    waypoint.
+
+    Prerequisites: PX4 must be connected and the vehicle must be armed.
+    """
+    logger.info("MANUAL CONTROL (POSCTL) requested")
+
+    if not mav_manager.is_connected():
+        raise HTTPException(503, "PX4 is not connected.")
+
+    try:
+        mav_manager.send_command("set_mode", mode="POSCTL")
+        session_state["mission_state"] = "MANUAL"
+        logger.info("MANUAL CONTROL result: POSCTL mode set")
+        return ManualControlResponse(success=True, mode="POSCTL")
+
+    except mavlink_commands.CommandRejected as e:
+        logger.warning(f"MANUAL CONTROL result: REJECTED - {e}")
+        return ManualControlResponse(success=False, mode="POSCTL", error=str(e))
+    except mavlink_commands.CommandTimeout as e:
+        logger.warning(f"MANUAL CONTROL result: TIMEOUT - {e}")
+        return ManualControlResponse(success=False, mode="POSCTL", error=str(e))
+    except (RuntimeError, ValueError) as e:
+        raise HTTPException(503, str(e))
+
+
+@app.post("/api/vehicle/manual-velocity", response_model=ManualVelocityResponse)
+def api_vehicle_manual_velocity(req: ManualVelocityRequest):
+    """Send a single NED velocity setpoint to PX4.
+
+    Intended to be called at ~20 Hz by the frontend gamepad loop while the
+    vehicle is in POSCTL mode.  The message is fire-and-forget
+    (SET_POSITION_TARGET_LOCAL_NED) — PX4 does not ACK it, so this
+    endpoint returns immediately.
+
+    Clamp limits are enforced server-side to protect against runaway
+    browser bugs: ±10 m/s on translational axes, ±1.5 rad/s on yaw_rate.
+    """
+    if not mav_manager.is_connected():
+        # Silently succeed if the link dropped — the gamepad loop keeps
+        # firing; we don't want to flood the browser with 503 errors.
+        return ManualVelocityResponse(success=False, error="PX4 not connected")
+
+    MAX_V   = 10.0   # m/s — hard clamp on each translational axis
+    MAX_YAW = 1.5    # rad/s
+
+    vx       = max(-MAX_V,   min(MAX_V,   req.vx))
+    vy       = max(-MAX_V,   min(MAX_V,   req.vy))
+    vz       = max(-MAX_V,   min(MAX_V,   req.vz))
+    yaw_rate = max(-MAX_YAW, min(MAX_YAW, req.yaw_rate))
+
+    try:
+        mav_manager.send_command(
+            "send_velocity",
+            vx=vx, vy=vy, vz=vz, yaw_rate=yaw_rate,
+        )
+        return ManualVelocityResponse(success=True)
+    except Exception as e:
+        logger.warning(f"manual-velocity error: {e}")
+        return ManualVelocityResponse(success=False, error=str(e))
+
+
+@app.post("/api/vehicle/resume-mission", response_model=ManualControlResponse)
+def api_vehicle_resume_mission():
+    """Resume the loaded mission after manual override.
+
+    Switches PX4 back into MISSION mode.  Because PX4 preserves the
+    mission sequence index across mode changes, it will continue from
+    the waypoint it was on when manual override was activated — no
+    mission re-upload required.
+
+    Prerequisites: PX4 must be connected.  A mission must have been
+    uploaded previously.
+    """
+    logger.info("RESUME MISSION (MISSION mode) requested")
+
+    if not mav_manager.is_connected():
+        raise HTTPException(503, "PX4 is not connected.")
+
+    try:
+        mav_manager.send_command("set_mode", mode="MISSION")
+        session_state["mission_state"] = "EXECUTING"
+        logger.info("RESUME MISSION result: MISSION mode set")
+        return ManualControlResponse(success=True, mode="MISSION")
+
+    except mavlink_commands.CommandRejected as e:
+        logger.warning(f"RESUME MISSION result: REJECTED - {e}")
+        return ManualControlResponse(success=False, mode="MISSION", error=str(e))
+    except mavlink_commands.CommandTimeout as e:
+        logger.warning(f"RESUME MISSION result: TIMEOUT - {e}")
+        return ManualControlResponse(success=False, mode="MISSION", error=str(e))
+    except (RuntimeError, ValueError) as e:
+        raise HTTPException(503, str(e))
 
 
 @app.get("/api/nodes", response_model=List[NodeOut])

@@ -147,3 +147,47 @@ def set_mode(mav_connection, mode_name, timeout_s=_ACK_TIMEOUT_S):
         if msg.result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
             raise CommandRejected(f"set_mode({mode_name})", msg.result)
         return msg  # the accepted COMMAND_ACK
+
+
+def send_velocity_setpoint(mav_connection, vx, vy, vz, yaw_rate):
+    """Send a NED velocity setpoint via SET_POSITION_TARGET_LOCAL_NED.
+
+    Uses the velocity-only type_mask (0x0FC7 = 0b0000_111_111_000_111):
+      - bits 0-2  set   → ignore position (x/y/z)
+      - bits 3-5  clear → use velocity (vx/vy/vz)
+      - bits 6-8  set   → ignore acceleration (afx/afy/afz)
+      - bit  10   set   → ignore yaw (position)
+      - bit  11   clear → use yaw_rate
+
+    Frame is MAV_FRAME_LOCAL_NED:
+      vx  : +forward (North), m/s
+      vy  : +right   (East),  m/s
+      vz  : +down    (Down),  m/s  — caller negates for intuitive "up" input
+      yaw_rate : rad/s, positive = clockwise
+
+    This message has no ACK from PX4.  It must only be called from the
+    single thread that owns the MAVLink connection (see
+    mavlink_manager._process_command_queue) — never from a request thread.
+    """
+    # type_mask: velocity-only + yaw_rate
+    TYPE_MASK_VELOCITY_YAW_RATE = (
+        mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE |
+        mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE |
+        mavutil.mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE |
+        mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
+        mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
+        mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE |
+        mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE
+    )
+    mav_connection.mav.set_position_target_local_ned_send(
+        0,                                           # time_boot_ms (ignored)
+        mav_connection.target_system,
+        mav_connection.target_component,
+        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+        TYPE_MASK_VELOCITY_YAW_RATE,
+        0, 0, 0,                                     # x, y, z (ignored)
+        float(vx), float(vy), float(vz),             # velocity m/s
+        0, 0, 0,                                     # acceleration (ignored)
+        0,                                           # yaw (ignored)
+        float(yaw_rate),                             # yaw_rate rad/s
+    )

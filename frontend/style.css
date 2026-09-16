@@ -217,6 +217,23 @@ body {
   color: var(--red);
 }
 
+.btn-warning {
+  background: transparent;
+  color: var(--amber);
+  border-color: var(--amber-dim);
+}
+
+.btn-warning:hover:not(:disabled) {
+  background: rgba(255, 176, 32, 0.12);
+  border-color: var(--amber);
+}
+
+.btn-warning.active {
+  background: rgba(255, 176, 32, 0.18);
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
 .btn-block {
   display: block;
   width: 100%;

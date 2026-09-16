@@ -216,3 +216,34 @@ class ReturnHomeResponse(BaseModel):
     error: Optional[str] = None
 
 
+# ---------------------------------------------------------------------------
+# Manual Control — velocity override models
+# ---------------------------------------------------------------------------
+
+
+class ManualVelocityRequest(BaseModel):
+    """Body for POST /api/vehicle/manual-velocity.
+
+    All velocities are in the MAV_FRAME_LOCAL_NED frame:
+      vx  : forward/back  m/s  (+North, -South)
+      vy  : right/left    m/s  (+East,  -West)
+      vz  : up/down       m/s  (+Down,  -Up)   — caller must negate for intuitive input
+      yaw_rate : rad/s, positive = clockwise
+    """
+    vx: float
+    vy: float
+    vz: float
+    yaw_rate: float
+
+
+class ManualVelocityResponse(BaseModel):
+    """Returned by POST /api/vehicle/manual-velocity."""
+    success: bool
+    error: Optional[str] = None
+
+
+class ManualControlResponse(BaseModel):
+    """Returned by POST /api/vehicle/manual-control and POST /api/vehicle/resume-mission."""
+    success: bool
+    mode: Optional[str] = None
+    error: Optional[str] = None

@@ -58,6 +58,14 @@ const state = {
   returnCompleted: false,    // true after UAV has completed return flight and landed at home
   lastMissionId: null,       // SQLite id of last generated mission
   lastMissionItems: 0,       // number of items PX4 accepted
+
+  // Manual override (gamepad)
+  manualControl: {
+    active: false,          // true = currently in POSCTL manual override
+    gamepadIndex: null,     // index in navigator.getGamepads() of connected controller
+    sendTimer: null,        // setInterval handle for 20 Hz velocity loop
+    lastLogError: 0,        // throttle console error spam from velocity POST failures
+  },
 };
 
 // A message every ~1/MAVLINK stream rate is expected; if nothing arrives
@@ -904,6 +912,273 @@ async function returnHome() {
 }
 
 // ---------------------------------------------------------------------------
+// Manual Control — POSCTL override + Gamepad velocity loop + MISSION resume
+// ---------------------------------------------------------------------------
+
+/**
+ * Axis mapping (Standard W3C Gamepad API — Xbox / PlayStation layout):
+ *   axes[0] = Left stick X   → vy  (+right / East)
+ *   axes[1] = Left stick Y   → vx  (-forward / North, inverted)
+ *   axes[2] = Right stick X  → yaw_rate
+ *   axes[3] = Right stick Y  → vz  (NED down — right-stick up = negative = ascending)
+ */
+const GAMEPAD_MAX_V   = 3.0;   // m/s max on translational axes (GCS-side cap)
+const GAMEPAD_MAX_YAW = 0.5;   // rad/s
+const GAMEPAD_DEADZONE = 0.08;
+const GAMEPAD_POLL_MS = 50;    // 20 Hz
+
+function _gpDeadzone(v) {
+  return Math.abs(v) < GAMEPAD_DEADZONE ? 0 : v;
+}
+
+function _detectGamepad() {
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  for (let i = 0; i < pads.length; i++) {
+    if (pads[i]) return i;
+  }
+  return null;
+}
+
+function _updateGamepadStat() {
+  const el = document.getElementById("stat-gamepad");
+  if (!el) return;
+  const idx = state.manualControl.gamepadIndex;
+  if (idx === null) {
+    el.textContent = "NONE";
+    el.classList.remove("status-connected");
+    el.classList.add("status-disconnected");
+  } else {
+    const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    const gp = pads[idx];
+    el.textContent = gp ? `PAD ${idx}` : `PAD ${idx} (lost)`;
+    el.classList.remove("status-disconnected");
+    el.classList.add("status-connected");
+  }
+}
+
+function _updateOverrideStat() {
+  const el = document.getElementById("stat-override-mode");
+  if (!el) return;
+  if (state.manualControl.active) {
+    el.textContent = "MANUAL";
+    el.classList.add("status-degraded");
+    el.classList.remove("status-connected");
+  } else {
+    el.textContent = "AUTO";
+    el.classList.remove("status-degraded");
+    el.classList.add("status-connected");
+  }
+}
+
+function _sendGamepadVelocity() {
+  const mc = state.manualControl;
+  if (!mc.active) return;
+
+  const idx = mc.gamepadIndex !== null ? mc.gamepadIndex : _detectGamepad();
+  if (idx === null) return;
+
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  const gp = pads[idx];
+  if (!gp) return;
+
+  const raw_vx  = _gpDeadzone(-(gp.axes[1] || 0));  // left-Y inverted  → forward
+  const raw_vy  = _gpDeadzone(  gp.axes[0] || 0);   // left-X            → right
+  const raw_vz  = _gpDeadzone(  gp.axes[3] || 0);   // right-Y NED down  → down
+  const raw_yaw = _gpDeadzone(  gp.axes[2] || 0);   // right-X           → yaw CW
+
+  const vx       = raw_vx  * GAMEPAD_MAX_V;
+  const vy       = raw_vy  * GAMEPAD_MAX_V;
+  const vz       = raw_vz  * GAMEPAD_MAX_V;
+  const yaw_rate = raw_yaw * GAMEPAD_MAX_YAW;
+
+  // Update live velocity readout in Manual Override panel
+  const setV = (id, val) => {
+    const e = document.getElementById(id);
+    if (e) e.textContent = val.toFixed(2);
+  };
+  setV("stat-vx", vx);
+  setV("stat-vy", vy);
+  setV("stat-vz", vz);
+  const yrEl = document.getElementById("stat-yaw-rate");
+  if (yrEl) yrEl.textContent = (yaw_rate * 57.296).toFixed(1);  // rad/s → deg/s
+
+  apiPost("/api/vehicle/manual-velocity", { vx, vy, vz, yaw_rate })
+    .catch((err) => {
+      const now = Date.now();
+      if (now - mc.lastLogError > 5000) {
+        mc.lastLogError = now;
+        logEvent(`Manual velocity send error: ${err.message}`);
+      }
+    });
+}
+
+function _startGamepadLoop() {
+  if (state.manualControl.sendTimer) return;
+  state.manualControl.sendTimer = setInterval(_sendGamepadVelocity, GAMEPAD_POLL_MS);
+}
+
+function _stopGamepadLoop() {
+  if (state.manualControl.sendTimer) {
+    clearInterval(state.manualControl.sendTimer);
+    state.manualControl.sendTimer = null;
+  }
+  // Zero out the velocity readouts
+  ["stat-vx", "stat-vy", "stat-vz", "stat-yaw-rate"].forEach((id) => {
+    const e = document.getElementById(id);
+    if (e) e.textContent = "--";
+  });
+}
+
+function initGamepadListeners() {
+  window.addEventListener("gamepadconnected", (e) => {
+    logEvent(`Gamepad connected: ${e.gamepad.id} (index ${e.gamepad.index})`);
+    if (state.manualControl.gamepadIndex === null) {
+      state.manualControl.gamepadIndex = e.gamepad.index;
+    }
+    _updateGamepadStat();
+    _updateManualButtons();
+  });
+
+  window.addEventListener("gamepaddisconnected", (e) => {
+    logEvent(`Gamepad disconnected: index ${e.gamepad.index}`);
+    if (state.manualControl.gamepadIndex === e.gamepad.index) {
+      state.manualControl.gamepadIndex = null;
+      // Try to pick up another connected pad
+      const fallback = _detectGamepad();
+      state.manualControl.gamepadIndex = fallback;
+    }
+    _updateGamepadStat();
+    _updateManualButtons();
+  });
+}
+
+function _updateManualButtons() {
+  const manualBtn = document.getElementById("btn-manual-control");
+  const resumeBtn = document.getElementById("btn-resume-mission");
+  if (!manualBtn || !resumeBtn) return;
+
+  const mc = state.manualControl;
+  const vehicle = state.vehicle;
+  const fresh = isTelemetryFresh();
+  const linked = state.telemetrySocketOpen && fresh && vehicle && vehicle.connected;
+  const armed  = linked && vehicle.armed;
+  // Manual Control available when: connected + armed + (executing or manual already) + NOT returning home
+  const canManual = armed && !state.returningHome &&
+                    (state.missionExecuting || mc.active || state.missionUploaded);
+  const canResume = mc.active && linked;
+
+  manualBtn.disabled = !canManual || mc.active;  // disabled once already in manual
+  resumeBtn.disabled = !canResume;
+}
+
+async function enterManualControl() {
+  const mc = state.manualControl;
+  const btn = document.getElementById("btn-manual-control");
+  if (btn) btn.disabled = true;
+
+  logEvent("MANUAL CONTROL requested — switching to POSCTL.");
+  document.getElementById("manual-hint").textContent = "Switching to POSCTL…";
+
+  try {
+    const result = await apiPost("/api/vehicle/manual-control", {});
+    const body = result.body;
+
+    if (result.status === 503) {
+      const msg = body && body.detail ? body.detail : "PX4 not connected";
+      document.getElementById("manual-hint").textContent = `Manual failed: ${msg}`;
+      logEvent(`Manual Control failed: ${msg}`);
+      if (btn) btn.disabled = false;
+      return;
+    }
+
+    if (!body.success) {
+      document.getElementById("manual-hint").textContent =
+        `Manual failed: ${body.error || "PX4 rejected POSCTL"}`;
+      logEvent(`Manual Control rejected: ${body.error}`);
+      if (btn) btn.disabled = false;
+      return;
+    }
+
+    mc.active = true;
+    state.missionExecuting = false;  // pause auto-mission state tracking
+
+    // If no gamepad index set yet, try detecting one now
+    if (mc.gamepadIndex === null) {
+      mc.gamepadIndex = _detectGamepad();
+    }
+
+    _startGamepadLoop();
+    _updateOverrideStat();
+    _updateGamepadStat();
+    _updateManualButtons();
+
+    document.getElementById("stat-mission-state").textContent = "MANUAL";
+    document.getElementById("manual-hint").textContent =
+      mc.gamepadIndex !== null
+        ? "POSCTL active — use gamepad to fly. Click Resume Auto to hand back."
+        : "POSCTL active — no gamepad detected yet. Connect one to fly.";
+    logEvent("POSCTL manual override active. Gamepad loop started.");
+
+  } catch (err) {
+    document.getElementById("manual-hint").textContent = `Manual error: ${err.message}`;
+    logEvent(`Manual Control error: ${err.message}`);
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function resumeMission() {
+  const mc = state.manualControl;
+  const btn = document.getElementById("btn-resume-mission");
+  if (btn) btn.disabled = true;
+
+  logEvent("RESUME AUTO requested — switching to MISSION mode.");
+  document.getElementById("manual-hint").textContent = "Resuming autonomous mission…";
+
+  _stopGamepadLoop();
+
+  try {
+    const result = await apiPost("/api/vehicle/resume-mission", {});
+    const body = result.body;
+
+    if (result.status === 503) {
+      const msg = body && body.detail ? body.detail : "PX4 not connected";
+      document.getElementById("manual-hint").textContent = `Resume failed: ${msg}`;
+      logEvent(`Resume Mission failed: ${msg}`);
+      // Re-start loop — still in manual if PX4 couldn't switch modes
+      if (mc.active) _startGamepadLoop();
+      if (btn) btn.disabled = !mc.active;
+      return;
+    }
+
+    if (!body.success) {
+      document.getElementById("manual-hint").textContent =
+        `Resume failed: ${body.error || "PX4 rejected MISSION mode"}`;
+      logEvent(`Resume Mission rejected: ${body.error}`);
+      if (mc.active) _startGamepadLoop();
+      if (btn) btn.disabled = !mc.active;
+      return;
+    }
+
+    mc.active = false;
+    state.missionExecuting = true;  // back to auto tracking
+
+    _updateOverrideStat();
+    _updateManualButtons();
+
+    document.getElementById("stat-mission-state").textContent = "EXECUTING";
+    document.getElementById("manual-hint").textContent =
+      "PX4 resumed MISSION mode — UAV continuing autonomous waypoints.";
+    logEvent("PX4 resumed MISSION mode — autonomous mission continuing.");
+
+  } catch (err) {
+    document.getElementById("manual-hint").textContent = `Resume error: ${err.message}`;
+    logEvent(`Resume Mission error: ${err.message}`);
+    if (mc.active) _startGamepadLoop();
+    if (btn) btn.disabled = !mc.active;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Live telemetry (Phase 7) — /ws/telemetry -> UAV marker + telemetry panel
 // ---------------------------------------------------------------------------
 
@@ -975,6 +1250,10 @@ function renderTelemetryPanel() {
       }
     }
   }
+
+  // Update Manual Override button gating whenever telemetry refreshes
+  _updateManualButtons();
+  _updateOverrideStat();
 
   setStat("tel-mode", v.mode || "--");
   setStat("tel-gps-fix", v.gps_fix || "--");
@@ -1170,6 +1449,11 @@ function initControls() {
   if (returnHomeBtn) {
     returnHomeBtn.addEventListener("click", returnHome);
   }
+  // Manual Override buttons
+  const manualBtn = document.getElementById("btn-manual-control");
+  if (manualBtn) manualBtn.addEventListener("click", enterManualControl);
+  const resumeBtn = document.getElementById("btn-resume-mission");
+  if (resumeBtn) resumeBtn.addEventListener("click", resumeMission);
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,6 +1473,10 @@ async function boot() {
   connectTelemetry();
   startTelemetryStaleWatch();
   renderTelemetryPanel();
+
+  initGamepadListeners();
+  _updateGamepadStat();
+  _updateOverrideStat();
 
   logEvent("GCS initialized — Phase 8 (mission upload + execution) ready.");
 }

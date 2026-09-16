@@ -136,6 +136,55 @@
         </div>
       </div>
 
+      <!-- ================================================================
+           Manual Override panel
+           ================================================================ -->
+      <div class="panel" id="panel-manual">
+        <h2 class="panel-title">Manual Override</h2>
+
+        <div class="btn-row">
+          <button id="btn-manual-control" class="btn btn-block btn-warning" disabled>
+            &#x1F579; Manual Control
+          </button>
+        </div>
+        <div class="btn-row">
+          <button id="btn-resume-mission" class="btn btn-block btn-primary" disabled>
+            &#9654; Resume Auto
+          </button>
+        </div>
+
+        <p class="hint" id="manual-hint">
+          Connect a gamepad, then click Manual Control during an active mission to take over.
+        </p>
+
+        <div class="stat-grid">
+          <div class="stat">
+            <span class="stat-label">Override Mode</span>
+            <span class="stat-value" id="stat-override-mode">AUTO</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Gamepad</span>
+            <span class="stat-value" id="stat-gamepad">NONE</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">vx (fwd)</span>
+            <span class="stat-value" id="stat-vx">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">vy (right)</span>
+            <span class="stat-value" id="stat-vy">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">vz (down)</span>
+            <span class="stat-value" id="stat-vz">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">yaw &#176;/s</span>
+            <span class="stat-value" id="stat-yaw-rate">--</span>
+          </div>
+        </div>
+      </div>
+
       <div class="panel" id="panel-telemetry">
         <h2 class="panel-title">Live Telemetry</h2>
 
@@ -216,6 +265,6 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-<script src="app.js?v=9"></script>
+<script src="app.js?v=10"></script>
 </body>
 </html>
