@@ -96,7 +96,7 @@ _CMD_TAKEOFF   = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
 _CMD_WAYPOINT  = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
 
 
-def build_mission_items(target_lat, target_lon, target_alt_m):
+def build_mission_items(target_lat, target_lon, target_alt_m, home_lat, home_lon):
     """Build a minimal two-item MAVLink mission targeting one waypoint.
 
     Returns a list of dicts, each containing all fields needed to send
@@ -143,8 +143,8 @@ def build_mission_items(target_lat, target_lon, target_alt_m):
             "command" : _CMD_TAKEOFF,
             "current" : 1,          # first item to execute
             "param1"  : 0.0,        # min pitch (deg) — 0 = don't care
-            "lat"     : 0.0,        # 0 = take off from current position
-            "lon"     : 0.0,
+            "lat"     : home_lat,        # 0 = take off from current position
+            "lon"     : home_lon,
             "alt"     : target_alt_m,
         },
         # Item 1: WAYPOINT — fly to target coordinates.

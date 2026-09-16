@@ -438,7 +438,7 @@ def api_mission_send():
 
     # Validate coordinates before trying the upload.
     try:
-        items = mavlink_mission.build_mission_items(px4_lat, px4_lon, alt)
+        items = mavlink_mission.build_mission_items(px4_lat, px4_lon, alt,px4_ref["latitude"],px4_ref["longitude"])
     except mavlink_mission.InvalidMission as e:
         raise HTTPException(400, str(e))
 
