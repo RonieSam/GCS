@@ -7,6 +7,31 @@ have a single place to change values instead of scattering magic
 numbers through the code, per the project spec.
 """
 
+# ---------------------------------------------------------------------------
+# Phase 9A — Simulation coordinate transformation
+# ---------------------------------------------------------------------------
+
+# Set to True when running against PX4 SITL / Gazebo so the backend
+# transparently remaps coordinates between the GCS planning space and the
+# PX4/Gazebo geographic space.  Set to False for real-hardware deployments
+# where GCS and vehicle share the same WGS84 reference frame.
+SIMULATION_MODE = True
+
+# GCS map reference origin — the point on the GCS map that corresponds to the
+# PX4/Gazebo home position.  All user-selected targets are expressed as a
+# displacement from this point before being re-anchored around PX4_REFERENCE.
+# Using the Chennai node cluster centre as the GCS planning origin.
+GCS_REFERENCE_LAT = 13.0827   # °N  (Chennai)
+GCS_REFERENCE_LON = 80.2707   # °E
+
+# PX4/Gazebo home position — the physical location that maps to
+# (GCS_REFERENCE_LAT, GCS_REFERENCE_LON) in the simulation.
+# These are static fallback values; the MAVLinkManager overrides them at
+# runtime with the first HOME_POSITION message received from PX4 so we
+# remain correct regardless of PX4_HOME_LAT/LON environment variables.
+PX4_REFERENCE_LAT = 47.397742   # °N  (PX4 SITL default — overridden at runtime)
+PX4_REFERENCE_LON = 8.545594    # °E
+
 # --- MAVLink / SITL (used from Phase 6 onward) ---
 MAVLINK_CONNECTION = "udp:127.0.0.1:14550"
 ARRIVAL_THRESHOLD_METERS = 5
@@ -50,8 +75,10 @@ MIN_CANDIDATES = 5    # prototype should surface at least this many candidates
 MIN_NODE_SEPARATION_M = 30  # reject a target this close to an existing node
 
 # --- UAV home / launch point (used from Phase 6 onward) ---
-UAV_HOME_LAT = 13.0827
-UAV_HOME_LON = 80.2707
+# NOTE: In simulation mode this is the GCS map home, not the PX4 home.
+# Coordinate remapping is handled by coordinate_mapper.py.
+UAV_HOME_LAT = GCS_REFERENCE_LAT
+UAV_HOME_LON = GCS_REFERENCE_LON
 
 # --- Data files ---
 NODES_FILE = "data/nodes.json"

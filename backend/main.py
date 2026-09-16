@@ -17,6 +17,7 @@ The single-reader MAVLink architecture is preserved: all recv_match()
 import os
 import mavlink_commands   # NEW import, alongside the mavlink_manager import
 import mavlink_mission    # Phase 8 — MAVLink mission protocol
+import coordinate_mapper  # Phase 9A — simulation coordinate transformation
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import RedirectResponse
@@ -43,6 +44,10 @@ from models import (
     AreaResponse,
     CandidateOut,
     CandidatesResponse,
+    CoordinateReferencePoint,
+    CoordinateReferenceResponse,
+    CoordinateTranslateRequest,
+    CoordinateTranslateResponse,
     DeploymentOut,
     LatLon,
     MissionAbortResponse,
@@ -370,9 +375,18 @@ def api_mission_send():
     alt  = mission["target_alt"]
     mid  = mission["id"]
 
+    # Phase 9A — when running against SITL, transform the GCS planning
+    # coordinates into the PX4/Gazebo geographic frame before building
+    # mission items.  In production (SIMULATION_MODE=False) this is a
+    # no-op that returns (lat, lon) unchanged.
+    if config.SIMULATION_MODE:
+        px4_lat, px4_lon = coordinate_mapper.get_mapper().gcs_to_px4(lat, lon)
+    else:
+        px4_lat, px4_lon = lat, lon
+
     # Validate coordinates before trying the upload.
     try:
-        items = mavlink_mission.build_mission_items(lat, lon, alt)
+        items = mavlink_mission.build_mission_items(px4_lat, px4_lon, alt)
     except mavlink_mission.InvalidMission as e:
         raise HTTPException(400, str(e))
 
@@ -541,6 +555,58 @@ def api_deployment_simulate():
     return NotImplementedResponse(
         phase_required=10,
         message="Virtual deployment simulation arrives in Phase 10.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 9A — Coordinate transformation diagnostic endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/coordinates/reference", response_model=CoordinateReferenceResponse)
+def api_coordinates_reference():
+    """Return the current GCS and PX4 reference coordinates.
+
+    The PX4 reference is updated dynamically from the vehicle's
+    HOME_POSITION message once PX4 SITL connects, so this endpoint
+    reflects the live mapping currently in use.
+    """
+    refs = coordinate_mapper.get_mapper().get_references()
+    return CoordinateReferenceResponse(
+        simulation_mode=config.SIMULATION_MODE,
+        gcs_reference=CoordinateReferencePoint(
+            latitude=refs["gcs_reference"]["latitude"],
+            longitude=refs["gcs_reference"]["longitude"],
+        ),
+        px4_reference=CoordinateReferencePoint(
+            latitude=refs["px4_reference"]["latitude"],
+            longitude=refs["px4_reference"]["longitude"],
+        ),
+    )
+
+
+@app.post("/api/coordinates/translate", response_model=CoordinateTranslateResponse)
+def api_coordinates_translate(req: CoordinateTranslateRequest):
+    """Translate a coordinate through the current GCS ↔ PX4 mapping.
+
+    Accepts a WGS84 coordinate (interpreted as a GCS map coordinate) and
+    returns both the corresponding PX4 coordinate and the intermediate
+    north/east displacement.  Useful for verifying that the coordinate
+    mapper is producing the expected results.
+
+    When SIMULATION_MODE is False, gcs_lat/lon and px4_lat/lon will be
+    identical (identity transform).
+    """
+    mapper = coordinate_mapper.get_mapper()
+    north_m, east_m = mapper.gcs_to_displacement(req.latitude, req.longitude)
+    px4_lat, px4_lon = mapper.gcs_to_px4(req.latitude, req.longitude)
+    return CoordinateTranslateResponse(
+        gcs_latitude=req.latitude,
+        gcs_longitude=req.longitude,
+        px4_latitude=px4_lat,
+        px4_longitude=px4_lon,
+        north_m=north_m,
+        east_m=east_m,
     )
 
 

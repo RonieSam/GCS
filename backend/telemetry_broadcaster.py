@@ -69,13 +69,40 @@ class TelemetryBroadcaster:
         Safe to call from the WebSocket handler for the initial push as
         well as from the broadcast loop — get_vehicle_state() just takes
         a lock and copies a dict, no MAVLink I/O.
+
+        Phase 9A: when SIMULATION_MODE is True, the raw PX4 lat/lon in the
+        vehicle state are transformed back into GCS coordinates before being
+        sent to the frontend.  The GCS map therefore always operates in its
+        own coordinate space, and the UAV marker tracks movements correctly
+        regardless of which geographic region PX4/Gazebo is running in.
         """
+        import config
+        import coordinate_mapper
+
         state = self._mav_manager.get_vehicle_state()
+
+        # Phase 9A — remap PX4 telemetry coordinates → GCS coordinates so the
+        # UAV marker on the Leaflet map moves in the correct relative position.
+        if (
+            config.SIMULATION_MODE
+            and state.get("latitude") is not None
+            and state.get("longitude") is not None
+        ):
+            gcs_lat, gcs_lon = coordinate_mapper.get_mapper().px4_to_gcs(
+                state["latitude"],
+                state["longitude"],
+            )
+            # Build a shallow copy so we don't mutate the shared state dict.
+            state = dict(state)
+            state["latitude"]  = gcs_lat
+            state["longitude"] = gcs_lon
+
         message = TelemetryMessage(
             timestamp=time.time(),
             vehicle=VehicleStateOut(**state),
         )
         return message.model_dump()
+
 
     # ------------------------------------------------------------------
     # Broadcast loop

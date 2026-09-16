@@ -15,9 +15,56 @@ import mavlink_commands
 import mavlink_mission
 import mavlink_telemetry
 from safety_manager import SafetyStateMachine
+import coordinate_mapper as _coord_mapper  # Phase 9A — simulation coordinate sync
 
 
 _POLL_INTERVAL_S = 0.1
+
+# Phase 9A — track whether we have already snapped the PX4 reference from a
+# HOME_POSITION message.  GLOBAL_POSITION_INT is used as an early fallback only
+# until HOME_POSITION arrives, after which we stop updating from position fixes.
+_px4_reference_set_from_home = False
+
+
+def _self_update_px4_reference(msg, state):
+    """Update the coordinate mapper's PX4 reference from live MAVLink messages.
+
+    Called from _drain_incoming() while the manager lock is held.  Must not
+    perform any I/O or blocking operations.
+
+    Priority:
+      1. HOME_POSITION — most authoritative; once seen we stop overriding.
+      2. First GLOBAL_POSITION_INT with a valid fix — early-arrival fallback
+         (SITL emits these before HOME_POSITION on first boot).
+
+    Args:
+        msg:   The incoming MAVLink message (already processed by
+               mavlink_telemetry.update_from_message).
+        state: The current vehicle state dict (used to check GPS validity).
+    """
+    import config as _config
+    if not _config.SIMULATION_MODE:
+        return
+
+    global _px4_reference_set_from_home
+    msg_type = msg.get_type()
+
+    if msg_type == "HOME_POSITION":
+        # lat/lon are integers in 1e7 degrees.
+        lat = msg.latitude  / 1e7
+        lon = msg.longitude / 1e7
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            _coord_mapper.get_mapper().update_px4_reference(lat, lon)
+            _px4_reference_set_from_home = True
+
+    elif msg_type == "GLOBAL_POSITION_INT" and not _px4_reference_set_from_home:
+        # Use the first valid GPS fix as a temporary reference until
+        # HOME_POSITION arrives.
+        lat = state.get("latitude")
+        lon = state.get("longitude")
+        if lat is not None and lon is not None:
+            _coord_mapper.get_mapper().update_px4_reference(lat, lon)
+
 
 
 class MAVLinkManager:
@@ -486,3 +533,13 @@ class MAVLinkManager:
 
                 if msg.get_type() == "HEARTBEAT":
                     self._safety.heartbeat_received()
+
+                # Phase 9A — keep the PX4 reference coordinate up-to-date
+                # so the coordinate mapper reflects the vehicle's actual home
+                # rather than the static fallback in config.py.
+                #
+                # HOME_POSITION is the authoritative PX4 home (set once on
+                # arming / SITL startup). GLOBAL_POSITION_INT on the very first
+                # valid fix is used as an early-arrival fallback in case
+                # HOME_POSITION arrives late or is delayed by SITL startup.
+                _self_update_px4_reference(msg, self._state)

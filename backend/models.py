@@ -167,3 +167,42 @@ class MissionAbortResponse(BaseModel):
     success: bool
     action: str = "RTL"
     error: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Phase 9A — Coordinate transformation API models
+# ---------------------------------------------------------------------------
+
+
+class CoordinateReferencePoint(BaseModel):
+    """A single lat/lon reference coordinate."""
+    latitude: float
+    longitude: float
+
+
+class CoordinateReferenceResponse(BaseModel):
+    """Returned by GET /api/coordinates/reference."""
+    simulation_mode: bool
+    gcs_reference: CoordinateReferencePoint
+    px4_reference: CoordinateReferencePoint
+
+
+class CoordinateTranslateRequest(BaseModel):
+    """Input for POST /api/coordinates/translate."""
+    latitude: float
+    longitude: float
+
+
+class CoordinateTranslateResponse(BaseModel):
+    """Output of POST /api/coordinates/translate.
+
+    All four coordinates plus the intermediate displacement so callers
+    can inspect exactly what the mapper computed.
+    """
+    gcs_latitude:  float
+    gcs_longitude: float
+    px4_latitude:  float
+    px4_longitude: float
+    north_m:       float
+    east_m:        float
+
