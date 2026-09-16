@@ -24,6 +24,7 @@ _POLL_INTERVAL_S = 0.1
 # HOME_POSITION message.  GLOBAL_POSITION_INT is used as an early fallback only
 # until HOME_POSITION arrives, after which we stop updating from position fixes.
 _px4_reference_set_from_home = False
+_px4_reference_set_from_gps = False
 
 
 def _self_update_px4_reference(msg, state):
@@ -46,7 +47,7 @@ def _self_update_px4_reference(msg, state):
     if not _config.SIMULATION_MODE:
         return
 
-    global _px4_reference_set_from_home
+    global _px4_reference_set_from_home, _px4_reference_set_from_gps
     msg_type = msg.get_type()
 
     if msg_type == "HOME_POSITION":
@@ -57,13 +58,14 @@ def _self_update_px4_reference(msg, state):
             _coord_mapper.get_mapper().update_px4_reference(lat, lon)
             _px4_reference_set_from_home = True
 
-    elif msg_type == "GLOBAL_POSITION_INT" and not _px4_reference_set_from_home:
+    elif msg_type == "GLOBAL_POSITION_INT" and not _px4_reference_set_from_home and not _px4_reference_set_from_gps:
         # Use the first valid GPS fix as a temporary reference until
         # HOME_POSITION arrives.
         lat = state.get("latitude")
         lon = state.get("longitude")
         if lat is not None and lon is not None:
             _coord_mapper.get_mapper().update_px4_reference(lat, lon)
+            _px4_reference_set_from_gps = True
 
 
 

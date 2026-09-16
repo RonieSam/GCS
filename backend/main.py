@@ -15,9 +15,15 @@ The single-reader MAVLink architecture is preserved: all recv_match()
 
 
 import os
+import math
+import logging
 import mavlink_commands   # NEW import, alongside the mavlink_manager import
 import mavlink_mission    # Phase 8 — MAVLink mission protocol
 import coordinate_mapper  # Phase 9A — simulation coordinate transformation
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import RedirectResponse
@@ -380,7 +386,53 @@ def api_mission_send():
     # mission items.  In production (SIMULATION_MODE=False) this is a
     # no-op that returns (lat, lon) unchanged.
     if config.SIMULATION_MODE:
-        px4_lat, px4_lon = coordinate_mapper.get_mapper().gcs_to_px4(lat, lon)
+        mapper = coordinate_mapper.get_mapper()
+        px4_lat, px4_lon = mapper.gcs_to_px4(lat, lon)
+        
+        # Step 2: Debug logging as requested
+        refs = mapper.get_references()
+        gcs_ref = refs["gcs_reference"]
+        px4_ref = refs["px4_reference"]
+        
+        north_m, east_m = mapper.gcs_to_displacement(lat, lon)
+        
+        uav_state = mav_manager.get_vehicle_state()
+        uav_lat = uav_state.get("latitude")
+        uav_lon = uav_state.get("longitude")
+        
+        logger.info("\n--- COORDINATE DEBUG CHAIN ---")
+        if uav_lat is not None and uav_lon is not None:
+            gcs_uav_lat, gcs_uav_lon = mapper.px4_to_gcs(uav_lat, uav_lon)
+            logger.info(f"GCS UAV:\n    lat={gcs_uav_lat:.7f}\n    lon={gcs_uav_lon:.7f}")
+        else:
+            logger.info("GCS UAV:\n    lat=UNKNOWN\n    lon=UNKNOWN")
+            
+        logger.info(f"\nGCS TARGET:\n    lat={lat:.7f}\n    lon={lon:.7f}")
+        logger.info(f"\nGCS DISPLACEMENT:\n    north={north_m:+.1f}m\n    east={east_m:+.1f}m")
+        logger.info(f"\nPX4 REFERENCE:\n    lat={px4_ref['latitude']:.7f}\n    lon={px4_ref['longitude']:.7f}")
+        logger.info(f"\nPX4 TARGET:\n    lat={px4_lat:.7f}\n    lon={px4_lon:.7f}")
+        
+        if uav_lat is not None and uav_lon is not None:
+            # Calculate distance and bearing from UAV to target
+            R = 6371000.0
+            phi1, phi2 = math.radians(uav_lat), math.radians(px4_lat)
+            dphi = math.radians(px4_lat - uav_lat)
+            dlam = math.radians(px4_lon - uav_lon)
+            a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
+            distance_m = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+            
+            y = math.sin(dlam) * math.cos(phi2)
+            x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlam)
+            bearing_deg = (math.degrees(math.atan2(y, x)) + 360) % 360
+            
+            MPD = 111320.0
+            px4_cos = math.cos(math.radians(uav_lat))
+            target_north_m = (px4_lat - uav_lat) * MPD
+            target_east_m = (px4_lon - uav_lon) * MPD * px4_cos
+            
+            logger.info(f"\nEXPECTED (From current PX4 UAV pos to PX4 target):\n    north={target_north_m:+.1f}m\n    east={target_east_m:+.1f}m\n    distance={distance_m:.1f}m\n    bearing={bearing_deg:.1f}deg")
+        logger.info("------------------------------\n")
+        
     else:
         px4_lat, px4_lon = lat, lon
 
