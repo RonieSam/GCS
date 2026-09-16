@@ -436,7 +436,12 @@ async function analyzeArea() {
   try {
     await apiPost("/api/area", { polygon: state.points });
 
-    const analysis = await apiGet("/api/analyze");
+    const result = await apiPost("/api/analyze");
+    if (result.status !== 200) {
+      throw new Error(result.body && result.body.detail ? result.body.detail : `HTTP ${result.status}`);
+    }
+
+    const analysis = result.body;
     document.getElementById("stat-coverage").textContent = `${analysis.coverage_percentage.toFixed(1)}%`;
     document.getElementById("stat-gap").textContent = `${analysis.gap_percentage.toFixed(1)}%`;
     logEvent(
@@ -748,7 +753,7 @@ async function startMission() {
     document.getElementById("stat-mission-state").textContent = "EXECUTING";
     document.getElementById("mission-hint").textContent =
       "PX4 in mission mode. Watch telemetry for movement.";
-    logEvent("PX4 entered AUTO.MISSION mode — UAV executing mission.");
+    logEvent("PX4 entered MISSION mode — UAV executing mission.");
 
     // Disable Start while executing; Abort stays enabled.
     btn.disabled = true;

@@ -483,14 +483,14 @@ def api_mission_start():
         )
 
     try:
-        mav_manager.send_command("set_mode", mode="AUTO.MISSION")
+        mav_manager.send_command("set_mode", mode="MISSION")
         session_state["mission_state"] = "EXECUTING"
-        return MissionStartResponse(success=True, mode="AUTO.MISSION")
+        return MissionStartResponse(success=True, mode="MISSION")
 
     except mavlink_commands.CommandRejected as e:
         return MissionStartResponse(
             success=False,
-            mode="AUTO.MISSION",
+            mode="MISSION",
             error=str(e),
         )
     except mavlink_commands.CommandTimeout as e:
@@ -516,7 +516,7 @@ def api_mission_abort():
         )
 
     try:
-        mav_manager.send_command("set_mode", mode="AUTO.RTL")
+        mav_manager.send_command("set_mode", mode="RTL")
         session_state["mission_state"] = "ABORTED"
         return MissionAbortResponse(success=True, action="RTL")
 

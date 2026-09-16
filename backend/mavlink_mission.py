@@ -205,7 +205,25 @@ def upload_mission(conn, items, timeout_s=None):
     # ------------------------------------------------------------------ #
     # Step 1 — clear any existing mission stored on PX4                  #
     # ------------------------------------------------------------------ #
+    # PX4 may respond to MISSION_CLEAR_ALL with MISSION_ACK. We MUST
+    # consume that ACK before starting the upload, otherwise the ACK can
+    # be mistaken for the final ACK for MISSION_COUNT.
     conn.mav.mission_clear_all_send(target_system, target_component)
+
+    clear_remaining = deadline - time.time()
+    if clear_remaining <= 0:
+        raise MissionTimeout("MISSION_CLEAR_ALL ACK", timeout_s)
+
+    clear_ack = conn.recv_match(
+        type=["MISSION_ACK"],
+        blocking=True,
+        timeout=min(clear_remaining, config.MISSION_ITEM_TIMEOUT_S),
+    )
+
+    if clear_ack is not None:
+        clear_result = clear_ack.type
+        if clear_result != mavutil.mavlink.MAV_MISSION_ACCEPTED:
+            raise MissionRejected(clear_result)
 
     # ------------------------------------------------------------------ #
     # Step 2 — tell PX4 how many items we're about to upload             #
