@@ -809,6 +809,48 @@ async function abortMission() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 8.5 — Arm/Disarm
+// ---------------------------------------------------------------------------
+
+async function armVehicle() {
+  const btn = document.getElementById("btn-arm");
+  btn.disabled = true;
+  logEvent("ARM commanded.");
+
+  try {
+    const result = await apiPost("/api/vehicle/arm", {});
+    const body = result.body;
+
+    if (result.status !== 200 || !body.success) {
+      logEvent(`ARM failed: ${body?.error || "Unknown error"}`);
+    } else {
+      logEvent("ARM command sent successfully.");
+    }
+  } catch (err) {
+    logEvent(`ARM error: ${err.message}`);
+  }
+}
+
+async function disarmVehicle() {
+  const btn = document.getElementById("btn-disarm");
+  btn.disabled = true;
+  logEvent("DISARM commanded.");
+
+  try {
+    const result = await apiPost("/api/vehicle/disarm", {});
+    const body = result.body;
+
+    if (result.status !== 200 || !body.success) {
+      logEvent(`DISARM failed: ${body?.error || "Unknown error"}`);
+    } else {
+      logEvent("DISARM command sent successfully.");
+    }
+  } catch (err) {
+    logEvent(`DISARM error: ${err.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Live telemetry (Phase 7) — /ws/telemetry -> UAV marker + telemetry panel
 // ---------------------------------------------------------------------------
 
@@ -853,6 +895,23 @@ function renderTelemetryPanel() {
   const v = vehicle || {};
 
   setStat("tel-armed", v.armed ? "ARMED" : "DISARMED", v.armed ? "status-degraded" : null);
+
+  const armBtn = document.getElementById("btn-arm");
+  const disarmBtn = document.getElementById("btn-disarm");
+
+  if (stale) {
+    armBtn.disabled = true;
+    disarmBtn.disabled = true;
+  } else {
+    if (v.armed) {
+      armBtn.disabled = true;
+      disarmBtn.disabled = false;
+    } else {
+      armBtn.disabled = false;
+      disarmBtn.disabled = true;
+    }
+  }
+
   setStat("tel-mode", v.mode || "--");
   setStat("tel-gps-fix", v.gps_fix || "--");
   setStat("tel-lat", v.latitude != null ? v.latitude.toFixed(6) : "--");
@@ -1026,6 +1085,9 @@ function initControls() {
   document.getElementById("btn-upload-mission").addEventListener("click", uploadMission);
   document.getElementById("btn-start-mission").addEventListener("click", startMission);
   document.getElementById("btn-abort-mission").addEventListener("click", abortMission);
+  // Arm/Disarm buttons
+  document.getElementById("btn-arm").addEventListener("click", armVehicle);
+  document.getElementById("btn-disarm").addEventListener("click", disarmVehicle);
 }
 
 // ---------------------------------------------------------------------------

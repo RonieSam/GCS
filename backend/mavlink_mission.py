@@ -91,9 +91,10 @@ def mav_mission_ack_name(result_code):
 # PX4 SITL supports MAV_FRAME_GLOBAL_RELATIVE_ALT (int value 3).
 _FRAME_GLOBAL_RELATIVE_ALT = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
 
-# MAV_CMD values used in our simple two-item mission.
+# MAV_CMD values used in our simple three-item mission.
 _CMD_TAKEOFF   = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
 _CMD_WAYPOINT  = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+_CMD_LAND      = mavutil.mavlink.MAV_CMD_NAV_LAND
 
 
 def build_mission_items(target_lat, target_lon, target_alt_m, home_lat, home_lon):
@@ -104,13 +105,16 @@ def build_mission_items(target_lat, target_lon, target_alt_m, home_lat, home_lon
     (upload_mission) decides which message type to use depending on what
     PX4 requests.
 
-    Item 0 — TAKEOFF from current position to target altitude.
+    Item 0 — TAKEOFF from home position to target altitude.
     Item 1 — FLY TO target lat/lon at target altitude.
+    Item 2 — LAND at target lat/lon at ground level.
 
     Args:
         target_lat  (float): Target latitude in decimal degrees.
         target_lon  (float): Target longitude in decimal degrees.
         target_alt_m (float): Target altitude in metres, relative to home.
+        home_lat    (float): Home latitude in decimal degrees.
+        home_lon    (float): Home longitude in decimal degrees.
 
     Returns:
         list[dict]: Mission items ready for upload_mission().
@@ -136,18 +140,18 @@ def build_mission_items(target_lat, target_lon, target_alt_m, home_lat, home_lon
     )
 
     return [
-        # Item 0: TAKEOFF — latitude/longitude 0 means "here" in PX4.
+        # Item 0: TAKEOFF — use actual PX4 home coordinates, not 0,0.
         {
             **common,
             "seq"     : 0,
             "command" : _CMD_TAKEOFF,
             "current" : 1,          # first item to execute
             "param1"  : 0.0,        # min pitch (deg) — 0 = don't care
-            "lat"     : home_lat,        # 0 = take off from current position
+            "lat"     : home_lat,
             "lon"     : home_lon,
             "alt"     : target_alt_m,
         },
-        # Item 1: WAYPOINT — fly to target coordinates.
+        # Item 1: WAYPOINT — fly to target coordinates at safe flight altitude.
         {
             **common,
             "seq"     : 1,
@@ -158,6 +162,18 @@ def build_mission_items(target_lat, target_lon, target_alt_m, home_lat, home_lon
             "lat"     : target_lat,
             "lon"     : target_lon,
             "alt"     : target_alt_m,
+        },
+        # Item 2: LAND — land at target coordinates.
+        {
+            **common,
+            "seq"     : 2,
+            "command" : _CMD_LAND,
+            "current" : 0,
+            "param1"  : 0.0,        # abort altitude
+            "param2"  : 0.0,        # land mode
+            "lat"     : target_lat,
+            "lon"     : target_lon,
+            "alt"     : 0.0,        # relative to home (ground level)
         },
     ]
 

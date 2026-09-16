@@ -47,23 +47,42 @@ def request_data_streams(mav_connection, rate_hz):
     )
 
 
-def arm(mav_connection):
-    _send_arm_disarm(mav_connection, arm=True)
+def arm(mav_connection, timeout_s=_ACK_TIMEOUT_S):
+    _send_arm_disarm_and_wait(mav_connection, True, timeout_s)
 
 
-def disarm(mav_connection):
-    _send_arm_disarm(mav_connection, arm=False)
+def disarm(mav_connection, timeout_s=_ACK_TIMEOUT_S):
+    _send_arm_disarm_and_wait(mav_connection, False, timeout_s)
 
 
-def _send_arm_disarm(mav_connection, arm):
+def _send_arm_disarm_and_wait(mav_connection, arm, timeout_s):
+    cmd = mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM
+    action_name = "arm" if arm else "disarm"
     mav_connection.mav.command_long_send(
         mav_connection.target_system,
         mav_connection.target_component,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        cmd,
         0,
         1 if arm else 0,
         0, 0, 0, 0, 0, 0,
     )
+
+    deadline = time.time() + timeout_s
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise CommandTimeout(f"{action_name}", timeout_s)
+        msg = mav_connection.recv_match(
+            type="COMMAND_ACK", blocking=True, timeout=remaining
+        )
+        if msg is None:
+            raise CommandTimeout(f"{action_name}", timeout_s)
+        if msg.command != cmd:
+            continue
+
+        if msg.result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
+            raise CommandRejected(f"{action_name}", msg.result)
+        return msg
 
 
 def set_mode(mav_connection, mode_name, timeout_s=_ACK_TIMEOUT_S):

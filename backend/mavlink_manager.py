@@ -210,12 +210,10 @@ class MAVLinkManager:
             )
 
         if name == "arm":
-            mavlink_commands.arm(self._conn)
-            return {"success": True, "command": "arm"}
+            return self._send_arm_disarm_and_wait(True)
 
         elif name == "disarm":
-            mavlink_commands.disarm(self._conn)
-            return {"success": True, "command": "disarm"}
+            return self._send_arm_disarm_and_wait(False)
 
         elif name == "set_mode":
             return self._send_set_mode_and_wait(
@@ -231,6 +229,34 @@ class MAVLinkManager:
 
         else:
             raise ValueError(f"Unknown command {name!r}")
+
+    def _send_arm_disarm_and_wait(self, arm, timeout_s=3):
+        """Queue an arm/disarm request and wait for PX4's COMMAND_ACK."""
+        result_box = {}
+        done = threading.Event()
+
+        self._command_queue.put(
+            (
+                "arm_disarm",
+                {
+                    "arm": arm,
+                    "timeout_s": timeout_s,
+                },
+                result_box,
+                done,
+            )
+        )
+
+        if not done.wait(timeout_s + 1):
+            raise mavlink_commands.CommandTimeout(
+                "arm" if arm else "disarm",
+                timeout_s,
+            )
+
+        if "error" in result_box:
+            raise result_box["error"]
+
+        return result_box["result"]
 
     def _send_set_mode_and_wait(self, mode_name, timeout_s=3):
         """
@@ -360,7 +386,16 @@ class MAVLinkManager:
                         "Cannot send command: no active MAVLink connection."
                     )
 
-                if name == "set_mode":
+                if name == "arm_disarm":
+                    is_arm = kwargs["arm"]
+                    timeout_s = kwargs.get("timeout_s", 3)
+                    if is_arm:
+                        mavlink_commands.arm(self._conn, timeout_s=timeout_s)
+                    else:
+                        mavlink_commands.disarm(self._conn, timeout_s=timeout_s)
+                    result_box["result"] = {"success": True, "command": "arm" if is_arm else "disarm"}
+
+                elif name == "set_mode":
                     result_box["result"] = (
                         mavlink_commands.set_mode(
                             self._conn,

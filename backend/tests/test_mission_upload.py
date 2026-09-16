@@ -56,22 +56,24 @@ def _msg(type_name, **attrs):
 
 class TestBuildMissionItems(unittest.TestCase):
 
-    def test_returns_two_items(self):
-        items = mm.build_mission_items(13.0827, 80.2707, 15.0)
-        self.assertEqual(len(items), 2)
+    def test_returns_three_items(self):
+        items = mm.build_mission_items(13.0827, 80.2707, 15.0, 13.0, 80.0)
+        self.assertEqual(len(items), 3)
 
     def test_item0_is_takeoff(self):
-        items = mm.build_mission_items(13.0827, 80.2707, 15.0)
+        items = mm.build_mission_items(13.0827, 80.2707, 15.0, 13.0, 80.0)
         takeoff = items[0]
         self.assertEqual(takeoff["seq"], 0)
         self.assertEqual(takeoff["command"], mavutil.mavlink.MAV_CMD_NAV_TAKEOFF)
         self.assertEqual(takeoff["current"], 1)
         self.assertEqual(takeoff["autocontinue"], 1)
         self.assertEqual(takeoff["alt"], 15.0)
+        self.assertEqual(takeoff["lat"], 13.0)
+        self.assertEqual(takeoff["lon"], 80.0)
 
     def test_item1_is_waypoint_with_target_coords(self):
         lat, lon, alt = 13.0827, 80.2707, 20.0
-        items = mm.build_mission_items(lat, lon, alt)
+        items = mm.build_mission_items(lat, lon, alt, 13.0, 80.0)
         wp = items[1]
         self.assertEqual(wp["seq"], 1)
         self.assertEqual(wp["command"], mavutil.mavlink.MAV_CMD_NAV_WAYPOINT)
@@ -80,8 +82,19 @@ class TestBuildMissionItems(unittest.TestCase):
         self.assertAlmostEqual(wp["lon"], lon, places=6)
         self.assertEqual(wp["alt"], alt)
 
+    def test_item2_is_land(self):
+        lat, lon, alt = 13.0827, 80.2707, 20.0
+        items = mm.build_mission_items(lat, lon, alt, 13.0, 80.0)
+        land = items[2]
+        self.assertEqual(land["seq"], 2)
+        self.assertEqual(land["command"], mavutil.mavlink.MAV_CMD_NAV_LAND)
+        self.assertEqual(land["current"], 0)
+        self.assertAlmostEqual(land["lat"], lat, places=6)
+        self.assertAlmostEqual(land["lon"], lon, places=6)
+        self.assertEqual(land["alt"], 0.0)
+
     def test_frame_is_global_relative_alt(self):
-        items = mm.build_mission_items(0.0, 0.0, 10.0)
+        items = mm.build_mission_items(0.0, 0.0, 10.0, 0.0, 0.0)
         for item in items:
             self.assertEqual(
                 item["frame"],
@@ -90,24 +103,24 @@ class TestBuildMissionItems(unittest.TestCase):
 
     def test_invalid_latitude_raises(self):
         with self.assertRaises(mm.InvalidMission):
-            mm.build_mission_items(91.0, 0.0, 10.0)
+            mm.build_mission_items(91.0, 0.0, 10.0, 0.0, 0.0)
 
     def test_invalid_longitude_raises(self):
         with self.assertRaises(mm.InvalidMission):
-            mm.build_mission_items(0.0, 181.0, 10.0)
+            mm.build_mission_items(0.0, 181.0, 10.0, 0.0, 0.0)
 
     def test_zero_altitude_raises(self):
         with self.assertRaises(mm.InvalidMission):
-            mm.build_mission_items(0.0, 0.0, 0.0)
+            mm.build_mission_items(0.0, 0.0, 0.0, 0.0, 0.0)
 
     def test_negative_altitude_raises(self):
         with self.assertRaises(mm.InvalidMission):
-            mm.build_mission_items(0.0, 0.0, -5.0)
+            mm.build_mission_items(0.0, 0.0, -5.0, 0.0, 0.0)
 
     def test_southern_hemisphere_coordinates(self):
         # Negative lat/lon must be valid.
-        items = mm.build_mission_items(-33.8688, 151.2093, 50.0)
-        self.assertEqual(len(items), 2)
+        items = mm.build_mission_items(-33.8688, 151.2093, 50.0, -33.0, 151.0)
+        self.assertEqual(len(items), 3)
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +148,7 @@ class TestMavMissionAckName(unittest.TestCase):
 class TestUploadMissionSuccess(unittest.TestCase):
 
     def _make_items(self):
-        return mm.build_mission_items(13.0827, 80.2707, 15.0)
+        return mm.build_mission_items(13.0827, 80.2707, 15.0, 13.0, 80.0)
 
     def test_success_via_mission_request_int(self):
         """PX4 requests each item with MISSION_REQUEST_INT → upload succeeds."""
@@ -146,9 +159,10 @@ class TestUploadMissionSuccess(unittest.TestCase):
         # Simulate: PX4 requests item 0, then item 1, then sends MISSION_ACK=accepted
         req0 = _msg("MISSION_REQUEST_INT", seq=0)
         req1 = _msg("MISSION_REQUEST_INT", seq=1)
+        req2 = _msg("MISSION_REQUEST_INT", seq=2)
         ack  = _msg("MISSION_ACK", type=mavutil.mavlink.MAV_MISSION_ACCEPTED)
 
-        conn.recv_match.side_effect = [req0, req1, ack]
+        conn.recv_match.side_effect = [None, req0, req1, req2, ack]
 
         result = mm.upload_mission(conn, items, timeout_s=5)
         self.assertEqual(result, n)
@@ -167,9 +181,10 @@ class TestUploadMissionSuccess(unittest.TestCase):
 
         req0 = _msg("MISSION_REQUEST", seq=0)
         req1 = _msg("MISSION_REQUEST", seq=1)
+        req2 = _msg("MISSION_REQUEST", seq=2)
         ack  = _msg("MISSION_ACK", type=mavutil.mavlink.MAV_MISSION_ACCEPTED)
 
-        conn.recv_match.side_effect = [req0, req1, ack]
+        conn.recv_match.side_effect = [None, req0, req1, req2, ack]
 
         result = mm.upload_mission(conn, items, timeout_s=5)
         self.assertEqual(result, len(items))
@@ -184,16 +199,17 @@ class TestUploadMissionSuccess(unittest.TestCase):
 
         req1 = _msg("MISSION_REQUEST_INT", seq=1)
         req0 = _msg("MISSION_REQUEST_INT", seq=0)
+        req2 = _msg("MISSION_REQUEST_INT", seq=2)
         ack  = _msg("MISSION_ACK", type=mavutil.mavlink.MAV_MISSION_ACCEPTED)
 
-        conn.recv_match.side_effect = [req1, req0, ack]
+        conn.recv_match.side_effect = [None, req1, req0, req2, ack]
 
         result = mm.upload_mission(conn, items, timeout_s=5)
         self.assertEqual(result, len(items))
 
-        # First call should have sent item 1, second item 0.
+        # First call should have sent item 1, second item 0, third item 2.
         calls = conn.mav.mission_item_int_send.call_args_list
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
         # call args: (ts, tc, seq, frame, cmd, current, autocontinue, ...)
         # seq is the 3rd positional arg (index 2)
         sent_seqs = [c[0][2] for c in calls]
@@ -207,13 +223,14 @@ class TestUploadMissionSuccess(unittest.TestCase):
 
         req0_int   = _msg("MISSION_REQUEST_INT", seq=0)
         req1_float = _msg("MISSION_REQUEST",     seq=1)
+        req2_int   = _msg("MISSION_REQUEST_INT", seq=2)
         ack        = _msg("MISSION_ACK", type=mavutil.mavlink.MAV_MISSION_ACCEPTED)
 
-        conn.recv_match.side_effect = [req0_int, req1_float, ack]
+        conn.recv_match.side_effect = [None, req0_int, req1_float, req2_int, ack]
 
         result = mm.upload_mission(conn, items, timeout_s=5)
         self.assertEqual(result, len(items))
-        self.assertEqual(conn.mav.mission_item_int_send.call_count, 1)
+        self.assertEqual(conn.mav.mission_item_int_send.call_count, 2)
         self.assertEqual(conn.mav.mission_item_send.call_count, 1)
 
 
@@ -225,7 +242,7 @@ class TestUploadMissionSuccess(unittest.TestCase):
 class TestUploadMissionFailure(unittest.TestCase):
 
     def _make_items(self):
-        return mm.build_mission_items(13.0827, 80.2707, 15.0)
+        return mm.build_mission_items(13.0827, 80.2707, 15.0, 13.0, 80.0)
 
     def test_timeout_when_no_response(self):
         """recv_match always returns None → MissionTimeout raised."""
@@ -242,10 +259,11 @@ class TestUploadMissionFailure(unittest.TestCase):
 
         req0 = _msg("MISSION_REQUEST_INT", seq=0)
         req1 = _msg("MISSION_REQUEST_INT", seq=1)
+        req2 = _msg("MISSION_REQUEST_INT", seq=2)
         # MAV_MISSION_NO_SPACE = 1 is a commonly tested failure code.
         ack  = _msg("MISSION_ACK", type=mavutil.mavlink.MAV_MISSION_NO_SPACE)
 
-        conn.recv_match.side_effect = [req0, req1, ack]
+        conn.recv_match.side_effect = [None, req0, req1, req2, ack]
 
         with self.assertRaises(mm.MissionRejected) as ctx:
             mm.upload_mission(conn, items, timeout_s=5)
@@ -258,9 +276,10 @@ class TestUploadMissionFailure(unittest.TestCase):
 
         req0 = _msg("MISSION_REQUEST_INT", seq=0)
         req1 = _msg("MISSION_REQUEST_INT", seq=1)
+        req2 = _msg("MISSION_REQUEST_INT", seq=2)
         ack  = _msg("MISSION_ACK", type=mavutil.mavlink.MAV_MISSION_ERROR)
 
-        conn.recv_match.side_effect = [req0, req1, ack]
+        conn.recv_match.side_effect = [None, req0, req1, req2, ack]
 
         with self.assertRaises(mm.MissionRejected) as ctx:
             mm.upload_mission(conn, items, timeout_s=5)
@@ -273,7 +292,7 @@ class TestUploadMissionFailure(unittest.TestCase):
         items = self._make_items()
 
         bad_req = _msg("MISSION_REQUEST_INT", seq=99)
-        conn.recv_match.side_effect = [bad_req]
+        conn.recv_match.side_effect = [None, bad_req]
 
         with self.assertRaises(mm.MissionUploadError):
             mm.upload_mission(conn, items, timeout_s=5)
@@ -287,13 +306,14 @@ class TestUploadMissionFailure(unittest.TestCase):
         """MISSION_ITEM_INT must use int(lat * 1e7) and int(lon * 1e7)."""
         lat, lon = 13.12345, 80.54321
         conn = _make_conn()
-        items = mm.build_mission_items(lat, lon, 15.0)
+        items = mm.build_mission_items(lat, lon, 15.0, 13.0, 80.0)
 
         # Only request item 1 (the waypoint with real coords), skip item 0.
         req1 = _msg("MISSION_REQUEST_INT", seq=1)
+        req2 = _msg("MISSION_REQUEST_INT", seq=2)
         ack  = _msg("MISSION_ACK", type=mavutil.mavlink.MAV_MISSION_ACCEPTED)
         req0 = _msg("MISSION_REQUEST_INT", seq=0)
-        conn.recv_match.side_effect = [req0, req1, ack]
+        conn.recv_match.side_effect = [None, req0, req1, req2, ack]
 
         mm.upload_mission(conn, items, timeout_s=5)
 
@@ -317,18 +337,18 @@ class TestBuildMissionItemsEdgeCases(unittest.TestCase):
 
     def test_boundary_latitudes(self):
         """Exactly ±90 lat should be valid."""
-        mm.build_mission_items(90.0, 0.0, 10.0)
-        mm.build_mission_items(-90.0, 0.0, 10.0)
+        mm.build_mission_items(90.0, 0.0, 10.0, 0.0, 0.0)
+        mm.build_mission_items(-90.0, 0.0, 10.0, 0.0, 0.0)
 
     def test_boundary_longitudes(self):
         """Exactly ±180 lon should be valid."""
-        mm.build_mission_items(0.0, 180.0, 10.0)
-        mm.build_mission_items(0.0, -180.0, 10.0)
+        mm.build_mission_items(0.0, 180.0, 10.0, 0.0, 0.0)
+        mm.build_mission_items(0.0, -180.0, 10.0, 0.0, 0.0)
 
     def test_very_small_positive_altitude(self):
         """Any positive altitude (even 0.001 m) is valid."""
-        items = mm.build_mission_items(0.0, 0.0, 0.001)
-        self.assertEqual(len(items), 2)
+        items = mm.build_mission_items(0.0, 0.0, 0.001, 0.0, 0.0)
+        self.assertEqual(len(items), 3)
 
 
 if __name__ == "__main__":

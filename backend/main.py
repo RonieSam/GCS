@@ -158,23 +158,45 @@ def api_vehicle_state():
 
 @app.post("/api/vehicle/arm")
 def api_vehicle_arm():
+    logger.info("ARM requested")
     try:
+        logger.info("ARM command sent")
         mav_manager.send_command("arm")
+        logger.info("ARM result: ACCEPTED")
         return {"success": True, "command": "arm"}
+    except mavlink_commands.CommandRejected as e:
+        logger.warning(f"ARM result: REJECTED - {e}")
+        return {"success": False, "command": "arm", "error": str(e)}
+    except mavlink_commands.CommandTimeout as e:
+        logger.warning(f"ARM result: TIMEOUT - {e}")
+        return {"success": False, "command": "arm", "error": str(e)}
     except RuntimeError as e:
+        logger.error(f"ARM result: ERROR - {e}")
         raise HTTPException(503, str(e))
     except Exception as e:
+        logger.error(f"ARM result: ERROR - {e}")
         raise HTTPException(500, str(e))
 
 
 @app.post("/api/vehicle/disarm")
 def api_vehicle_disarm():
+    logger.info("DISARM requested")
     try:
+        logger.info("DISARM command sent")
         mav_manager.send_command("disarm")
+        logger.info("DISARM result: ACCEPTED")
         return {"success": True, "command": "disarm"}
+    except mavlink_commands.CommandRejected as e:
+        logger.warning(f"DISARM result: REJECTED - {e}")
+        return {"success": False, "command": "disarm", "error": str(e)}
+    except mavlink_commands.CommandTimeout as e:
+        logger.warning(f"DISARM result: TIMEOUT - {e}")
+        return {"success": False, "command": "disarm", "error": str(e)}
     except RuntimeError as e:
+        logger.error(f"DISARM result: ERROR - {e}")
         raise HTTPException(503, str(e))
     except Exception as e:
+        logger.error(f"DISARM result: ERROR - {e}")
         raise HTTPException(500, str(e))
 
 
