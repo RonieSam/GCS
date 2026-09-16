@@ -1,0 +1,8 @@
+# Phases 1-4 needed no Python dependencies (standalone stdlib-only modules
+# plus a static Leaflet/vanilla-JS frontend). Phase 5 adds the backend API:
+
+fastapi          # Phase 5 — backend API
+uvicorn          # Phase 5 — ASGI server for FastAPI
+httpx            # Phase 5 — required by FastAPI's TestClient (tests only)
+pymavlink        # Phase 6 — MAVLink connection to PX4 SITL
+websockets       # Phase 7 — live telemetry streaming
