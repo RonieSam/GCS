@@ -21,6 +21,7 @@ import mavlink_commands   # NEW import, alongside the mavlink_manager import
 import mavlink_mission    # Phase 8 — MAVLink mission protocol
 import coordinate_mapper  # Phase 9A — simulation coordinate transformation
 import survey_planner    # Phase 2 — RF scan survey path planner
+from rf_collector import get_rf_collector  # Phase 3 — RF Survey collector
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -631,12 +632,43 @@ def api_rf_scan_upload():
             "Start PX4 SITL and wait for a heartbeat.",
         )
 
-    # Build the MAVLink mission items (same schema as build_mission_items()).
+    # Capture the UAV's original position before starting/uploading the RF Scan mission.
+    # Call this: scanStartPosition.
+    uav_state = mav_manager.get_vehicle_state()
+    raw_uav_lat = uav_state.get("latitude")
+    raw_uav_lon = uav_state.get("longitude")
+    uav_alt = uav_state.get("altitude", 0.0)
+
+    # Use current UAV telemetry position if available, fallback to PX4 home reference
+    if raw_uav_lat is not None and raw_uav_lon is not None:
+        start_lat = raw_uav_lat
+        start_lon = raw_uav_lon
+    else:
+        start_lat = home_lat
+        start_lon = home_lon
+
+    gcs_start_lat, gcs_start_lon = mapper.px4_to_gcs(start_lat, start_lon)
+    scan_start_pos = {
+        "latitude": gcs_start_lat,
+        "longitude": gcs_start_lon,
+        "altitude": uav_alt,
+        "px4_latitude": start_lat,
+        "px4_longitude": start_lon,
+    }
+    session_state["scan_start_position"] = scan_start_pos
+    logger.info(f"RF Scan start position captured (scanStartPosition): {scan_start_pos}")
+
+    # Build the MAVLink mission items (TAKEOFF -> survey waypoints -> RETURN TO START -> LAND).
+    # The return altitude follows the configured survey altitude.
+    survey_alt = rf_mission.get("altitude_m", config.DEFAULT_ALTITUDE)
     try:
         items = mavlink_mission.build_survey_mission_items(
             px4_waypoints=px4_waypoints,
             home_lat=home_lat,
             home_lon=home_lon,
+            return_lat=start_lat,
+            return_lon=start_lon,
+            return_alt_m=survey_alt,
         )
     except mavlink_mission.InvalidMission as e:
         raise HTTPException(400, str(e))
@@ -711,7 +743,24 @@ def api_rf_scan_upload():
         error=None,
     )
 
-    logger.info(f"RF scan mission uploaded: {n} items accepted by PX4.")
+    # Phase 3 — prepare the RF Survey Collector with the scan start position,
+    # affected area, deployed nodes, and mission item counts.
+    # survey_wps occupy items 1..waypoint_count; item waypoint_count+1 = RETURN;
+    # item waypoint_count+2 = LAND.  Total items = waypoint_count + 3
+    # (TAKEOFF + survey_wps + RETURN + LAND).
+    deployed_nodes = list_nodes()
+    rf_collector = get_rf_collector()
+    rf_collector.prepare_scan(
+        start_position=scan_start_pos,
+        affected_area=session_state.get("polygon"),
+        deployed_nodes=deployed_nodes,
+        survey_waypoint_count=rf_mission["waypoint_count"],
+        total_mission_items=n,
+    )
+    logger.info(
+        f"RF scan mission uploaded: {n} items accepted by PX4. "
+        f"Collector prepared with {len(deployed_nodes)} nodes."
+    )
 
     return MissionUploadResponse(
         success=True,
@@ -1004,6 +1053,10 @@ def api_mission_start():
 
     Does NOT automatically arm the vehicle. The user must arm separately
     via POST /api/vehicle/arm before or after setting mission mode.
+
+    Phase 3: If the current uploaded mission is an RF Scan (rf_scan_state ==
+    MISSION_UPLOADED), the RF collector is transitioned to SCANNING so that
+    live telemetry samples begin accumulating immediately.
     """
     upload_st = mav_manager.get_mission_upload_state()
     if upload_st["status"] != "UPLOADED":
@@ -1023,6 +1076,15 @@ def api_mission_start():
     try:
         mav_manager.send_command("set_mode", mode="MISSION")
         session_state["mission_state"] = "EXECUTING"
+
+        # Phase 3 — if this start is for an RF Scan mission, transition the
+        # RF collector to SCANNING so telemetry samples begin accumulating.
+        if session_state.get("rf_scan_state") == "MISSION_UPLOADED":
+            rf_collector = get_rf_collector()
+            rf_collector.start_scan()
+            session_state["rf_scan_state"] = "RUNNING"
+            logger.info("RF Scan mission started — collector now SCANNING.")
+
         return MissionStartResponse(success=True, mode="MISSION")
 
     except mavlink_commands.CommandRejected as e:
@@ -1151,6 +1213,146 @@ def api_deployments():
     # "no deployments yet", not "not implemented".
     return list_deployments()
 
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — RF Survey Data endpoints (HTTP + WebSocket for Simulink bridge)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/rf-survey/state")
+def api_rf_survey_state():
+    """Return the current RF survey collector state and summary.
+
+    Used by Simulink / external tools to check scan progress without
+    pulling the full sample dataset.
+    """
+    rf_collector = get_rf_collector()
+    survey = rf_collector.get_survey_data()
+    mission = session_state.get("rf_scan_mission")
+    return {
+        "state": survey["state"],
+        "backend_rf_scan_state": session_state.get("rf_scan_state", "IDLE"),
+        "sample_count": survey["sample_count"],
+        "scan_start_position": survey["scan_start_position"],
+        "affected_area": survey["affected_area"],
+        "deployed_node_count": len(survey["deployed_nodes"]),
+        "waypoint_count": mission["waypoint_count"] if mission else 0,
+        "line_count": mission["line_count"] if mission else 0,
+        "spacing_m": mission["spacing_m"] if mission else 0.0,
+        "altitude_m": mission["altitude_m"] if mission else 0.0,
+    }
+
+
+@app.get("/api/rf-survey/data")
+def api_rf_survey_data():
+    """Return the complete accumulated RF survey dataset.
+
+    Intended for Simulink to poll after (or during) an RF Scan to retrieve
+    all GPS + RSSI samples.  The response is stable under concurrent reads
+    (RFSurveyCollector uses a lock) and never mutates between calls.
+
+    Response fields:
+        state           — current collector state (IDLE/SCANNING/RETURNING/etc.)
+        sample_count    — number of survey samples accumulated so far
+        scan_start_position — {lat, lon, alt, px4_lat, px4_lon} captured at upload
+        affected_area   — polygon [{lat, lon}, ...] of the user-drawn area
+        deployed_nodes  — [{id, lat, lon, ...}] list used for RSSI calculation
+        samples         — array of survey samples (see RFSurveyCollector docstring)
+    """
+    rf_collector = get_rf_collector()
+    return rf_collector.get_survey_data()
+
+
+@app.post("/api/rf-survey/reset")
+def api_rf_survey_reset():
+    """Reset the RF survey collector to IDLE, clearing all accumulated data.
+
+    Call this before starting a new RF scan if you want to discard the
+    previous run's data without restarting the backend.
+    """
+    rf_collector = get_rf_collector()
+    rf_collector.reset()
+    session_state["rf_scan_state"] = "IDLE"
+    logger.info("RF Survey collector reset to IDLE.")
+    return {"success": True, "state": "IDLE"}
+
+
+@app.websocket("/ws/rf-survey")
+async def ws_rf_survey(websocket: WebSocket):
+    """WebSocket endpoint for real-time RF survey sample streaming.
+
+    On connect, immediately sends the current full survey dataset (so
+    Simulink gets a complete picture from the first message). Thereafter,
+    each new sample collected during an active scan is pushed as it arrives.
+
+    Message format:
+        {"type": "rf_survey_data", "state": ..., "sample_count": ...,
+         "samples": [...], "scan_start_position": {...},
+         "affected_area": [...], "deployed_nodes": [...]}
+
+    or for individual new samples:
+        {"type": "rf_survey_sample", "sample": {...}}
+    """
+    import asyncio
+    import queue as _queue
+
+    await websocket.accept()
+    logger.info("RF survey WebSocket client connected.")
+
+    # Queue that the collector's callback posts new samples into.
+    # The asyncio event loop then drains it.
+    sample_q: _queue.SimpleQueue = _queue.SimpleQueue()
+
+    def _on_new_sample(sample: dict):
+        sample_q.put_nowait(sample)
+
+    rf_collector = get_rf_collector()
+    rf_collector.subscribe(_on_new_sample)
+
+    try:
+        # Send the current complete dataset immediately on connect.
+        await websocket.send_json({
+            "type": "rf_survey_data",
+            **rf_collector.get_survey_data(),
+        })
+
+        # Drain incoming websocket messages (disconnect detection) while also
+        # forwarding new samples from the collector's callback.
+        loop = asyncio.get_event_loop()
+        while True:
+            # Check for new samples (non-blocking) and forward them.
+            forwarded = 0
+            while not sample_q.empty():
+                try:
+                    sample = sample_q.get_nowait()
+                    await websocket.send_json({
+                        "type": "rf_survey_sample",
+                        "sample": sample,
+                        "state": rf_collector.get_state(),
+                    })
+                    forwarded += 1
+                except _queue.Empty:
+                    break
+
+            # Wait briefly for the next message / disconnect from the client.
+            try:
+                msg = await asyncio.wait_for(
+                    websocket.receive(),
+                    timeout=0.1,  # 100 ms — keeps forwarding at up to 10 Hz
+                )
+                if msg.get("type") == "websocket.disconnect":
+                    break
+            except asyncio.TimeoutError:
+                pass  # normal; just loop again
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.warning(f"RF survey WebSocket error: {e}")
+    finally:
+        rf_collector.unsubscribe(_on_new_sample)
+        logger.info("RF survey WebSocket client disconnected.")
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,12 @@ the socket; this module only calls its already thread-safe snapshot
 method, get_vehicle_state(), from the asyncio event loop. That keeps
 "exactly one reader of the pymavlink connection" true regardless of how
 many WebSocket clients are attached.
+
+Phase 3: The broadcast loop also feeds the raw vehicle state into the
+RF survey collector (rf_collector.ingest_telemetry) on every tick.  The
+collector decides internally whether to record a sample based on its own
+state machine (SCANNING vs anything else). No state checking is needed
+here — the collector is entirely self-governing.
 """
 
 import asyncio
@@ -111,6 +117,28 @@ class TelemetryBroadcaster:
     async def _run(self):
         while True:
             await asyncio.sleep(self.interval_s)
+
+            # Phase 3 — feed the raw vehicle state into the RF survey
+            # collector on every broadcast tick, regardless of whether any
+            # GCS WebSocket clients are currently connected.  The collector's
+            # own state machine decides whether to accumulate a sample.
+            # We always use run_in_executor because ingest_telemetry() holds
+            # a threading.Lock and computes RSSI — both would block the event loop.
+            try:
+                raw_state = self._mav_manager.get_vehicle_state()
+                if raw_state.get("latitude") is not None:
+                    import asyncio as _asyncio
+                    from rf_collector import get_rf_collector as _get_rf_collector
+                    loop = _asyncio.get_event_loop()
+                    collector = _get_rf_collector()
+                    await loop.run_in_executor(
+                        None, collector.ingest_telemetry, raw_state
+                    )
+            except Exception as _e:
+                import logging as _logging
+                _logging.getLogger("telemetry_broadcaster").debug(
+                    f"RF collector ingest error (non-fatal): {_e}"
+                )
 
             async with self._clients_lock:
                 clients = list(self._clients)

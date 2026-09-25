@@ -1874,6 +1874,217 @@ async function uploadRfScanMission() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3 — RF Survey Live Data (WebSocket to /ws/rf-survey)
+// ---------------------------------------------------------------------------
+
+const RF_SURVEY_WS_RECONNECT_MS = 3000;
+
+const rfSurveyWsState = {
+  ws: null,
+  open: false,
+  reconnectTimer: null,
+  lastData: null,         // last full rf_survey_data message
+  latestSample: null,     // last rf_survey_sample received
+};
+
+function rfSurveyWsUrl() {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}/ws/rf-survey`;
+}
+
+function connectRfSurveyWs() {
+  if (rfSurveyWsState.reconnectTimer) {
+    clearTimeout(rfSurveyWsState.reconnectTimer);
+    rfSurveyWsState.reconnectTimer = null;
+  }
+
+  let ws;
+  try {
+    ws = new WebSocket(rfSurveyWsUrl());
+  } catch (err) {
+    scheduleRfSurveyReconnect();
+    return;
+  }
+
+  rfSurveyWsState.ws = ws;
+
+  ws.onopen = () => {
+    rfSurveyWsState.open = true;
+  };
+
+  ws.onmessage = (event) => {
+    let data;
+    try { data = JSON.parse(event.data); } catch { return; }
+    if (!data) return;
+
+    if (data.type === "rf_survey_data") {
+      rfSurveyWsState.lastData = data;
+      // Update latest sample from last element if available
+      if (data.samples && data.samples.length > 0) {
+        rfSurveyWsState.latestSample = data.samples[data.samples.length - 1];
+      }
+      renderRfSurveyPanel(data);
+    } else if (data.type === "rf_survey_sample") {
+      rfSurveyWsState.latestSample = data.sample;
+      // Update sample count and state without waiting for full data
+      renderRfSurveySample(data);
+    }
+  };
+
+  ws.onclose = () => {
+    rfSurveyWsState.open = false;
+    rfSurveyWsState.ws = null;
+    scheduleRfSurveyReconnect();
+  };
+
+  ws.onerror = () => {
+    try { ws.close(); } catch { /* already closing */ }
+  };
+}
+
+function scheduleRfSurveyReconnect() {
+  if (rfSurveyWsState.reconnectTimer) return;
+  rfSurveyWsState.reconnectTimer = setTimeout(() => {
+    rfSurveyWsState.reconnectTimer = null;
+    connectRfSurveyWs();
+  }, RF_SURVEY_WS_RECONNECT_MS);
+}
+
+/**
+ * Render the RF Survey live data panel from a full rf_survey_data message.
+ */
+function renderRfSurveyPanel(data) {
+  const stateEl   = document.getElementById("stat-rfs-state");
+  const samplesEl = document.getElementById("stat-rfs-samples");
+  const rssiEl    = document.getElementById("stat-rfs-best-rssi");
+  const nodesEl   = document.getElementById("stat-rfs-nodes");
+  const hintEl    = document.getElementById("rf-survey-hint");
+
+  const collectorState = data.state || "IDLE";
+  if (stateEl)   stateEl.textContent   = collectorState;
+  if (samplesEl) samplesEl.textContent = data.sample_count || 0;
+  if (nodesEl)   nodesEl.textContent   = (data.deployed_nodes || []).length;
+
+  // Best RSSI from last sample
+  const samples = data.samples || [];
+  if (samples.length > 0) {
+    const last = samples[samples.length - 1];
+    if (rssiEl) rssiEl.textContent = last.best_rssi != null ? `${last.best_rssi} dBm` : "--";
+    _renderRssiTable(last.rssi || {});
+  } else {
+    if (rssiEl) rssiEl.textContent = "--";
+  }
+
+  // Update hint based on state
+  if (hintEl) {
+    const hints = {
+      IDLE:          "No scan active. Upload and start an RF Scan mission to collect data.",
+      SCAN_READY:    "Mission uploaded. Start RF Scan to begin collecting data.",
+      SCANNING:      `Collecting samples… ${data.sample_count || 0} samples so far.`,
+      RETURNING:     `Survey complete (${data.sample_count || 0} samples). UAV returning to start.`,
+      SCAN_COMPLETE: `Scan complete — ${data.sample_count || 0} survey samples collected.`,
+      FAILED:        "RF scan failed. Check logs.",
+    };
+    hintEl.textContent = hints[collectorState] || `State: ${collectorState}`;
+  }
+
+  // Also update the RF scan state badge in the RF Scan panel
+  const rfStateEl = document.getElementById("stat-rf-state");
+  if (rfStateEl && collectorState !== "IDLE") {
+    rfStateEl.textContent = collectorState;
+  }
+}
+
+/**
+ * Fast-update from a single new rf_survey_sample message.
+ */
+function renderRfSurveySample(data) {
+  const samplesEl = document.getElementById("stat-rfs-samples");
+  const rssiEl    = document.getElementById("stat-rfs-best-rssi");
+  const stateEl   = document.getElementById("stat-rfs-state");
+  const hintEl    = document.getElementById("rf-survey-hint");
+
+  const sample = data.sample || {};
+  const collectorState = data.state || "SCANNING";
+
+  if (stateEl)   stateEl.textContent = collectorState;
+  if (samplesEl && sample.sample_id) samplesEl.textContent = sample.sample_id;
+  if (rssiEl && sample.best_rssi != null) rssiEl.textContent = `${sample.best_rssi} dBm`;
+  if (hintEl) hintEl.textContent = `Collecting… sample #${sample.sample_id || "?"} at WP ${sample.current_waypoint || "?"}`;
+
+  _renderRssiTable(sample.rssi || {});
+
+  // Log to mission log on every 10th sample to avoid flooding
+  if (sample.sample_id && sample.sample_id % 10 === 0) {
+    logEvent(`RF sample #${sample.sample_id}: lat=${sample.latitude?.toFixed(5)}, best=${sample.best_rssi} dBm`);
+  }
+}
+
+/**
+ * Render the per-node RSSI mini-table from the most recent sample.
+ */
+function _renderRssiTable(rssiDict) {
+  const container = document.getElementById("rf-rssi-table-container");
+  const table     = document.getElementById("rf-rssi-table");
+  if (!container || !table) return;
+
+  const nodeIds = Object.keys(rssiDict);
+  if (nodeIds.length === 0) {
+    container.classList.add("hidden");
+    return;
+  }
+
+  container.classList.remove("hidden");
+  table.innerHTML = nodeIds.map(id => {
+    const val = rssiDict[id];
+    const bar = Math.max(0, Math.min(100, Math.round((val + 100) * 2)));
+    const color = val > -70 ? "#3FDA7F" : val > -85 ? "#F5A623" : "#FF5C5C";
+    return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px;font-family:var(--font-data);font-size:10px">` +
+           `<span style="color:#8A9AB0;min-width:64px">${id}</span>` +
+           `<div style="flex:1;background:#1c232b;border-radius:2px;height:6px">` +
+           `<div style="width:${bar}%;height:6px;background:${color};border-radius:2px"></div></div>` +
+           `<span style="color:${color};min-width:54px;text-align:right">${val} dBm</span>` +
+           `</div>`;
+  }).join("");
+}
+
+/**
+ * Reset the RF survey data on the backend and clear the live panel.
+ */
+async function resetSurveyData() {
+  const btn = document.getElementById("btn-reset-rf-survey");
+  if (btn) btn.disabled = true;
+
+  try {
+    await apiPost("/api/rf-survey/reset", {});
+    rfSurveyWsState.lastData    = null;
+    rfSurveyWsState.latestSample = null;
+
+    const stateEl   = document.getElementById("stat-rfs-state");
+    const samplesEl = document.getElementById("stat-rfs-samples");
+    const rssiEl    = document.getElementById("stat-rfs-best-rssi");
+    const nodesEl   = document.getElementById("stat-rfs-nodes");
+    const hintEl    = document.getElementById("rf-survey-hint");
+    const container = document.getElementById("rf-rssi-table-container");
+    const rfStateEl = document.getElementById("stat-rf-state");
+
+    if (stateEl)   stateEl.textContent   = "IDLE";
+    if (samplesEl) samplesEl.textContent = "0";
+    if (rssiEl)    rssiEl.textContent    = "--";
+    if (nodesEl)   nodesEl.textContent   = "--";
+    if (hintEl)    hintEl.textContent    = "Survey data cleared. Ready for next scan.";
+    if (container) container.classList.add("hidden");
+    if (rfStateEl) rfStateEl.textContent = "IDLE";
+
+    logEvent("RF survey data reset to IDLE.");
+  } catch (err) {
+    logEvent(`RF survey reset failed: ${err.message}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Wire up controls
 // ---------------------------------------------------------------------------
 
@@ -1910,6 +2121,9 @@ function initControls() {
   if (uploadRfBtn) uploadRfBtn.addEventListener("click", uploadRfScanMission);
   const startRfBtn = document.getElementById("btn-start-rf-scan");
   if (startRfBtn) startRfBtn.addEventListener("click", startMission);
+  // Phase 3 — RF Survey Live Data reset button
+  const resetRfBtn = document.getElementById("btn-reset-rf-survey");
+  if (resetRfBtn) resetRfBtn.addEventListener("click", resetSurveyData);
 }
 
 // ---------------------------------------------------------------------------
@@ -1932,6 +2146,9 @@ async function boot() {
   connectTelemetry();
   startTelemetryStaleWatch();
   renderTelemetryPanel();
+
+  // Phase 3 — connect to RF survey real-time stream alongside telemetry.
+  connectRfSurveyWs();
 
   initGamepadListeners();
   _updateGamepadStat();

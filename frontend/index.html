@@ -158,6 +158,46 @@
         </div>
       </div>
 
+      <!-- RF Survey Live Data panel — Phase 3 -->
+      <div class="panel" id="panel-rf-survey">
+        <h2 class="panel-title">RF Survey Data</h2>
+
+        <p class="hint" id="rf-survey-hint">
+          Live data will appear here once an RF Scan mission is started.
+        </p>
+
+        <div class="stat-grid">
+          <div class="stat">
+            <span class="stat-label">Collector State</span>
+            <span class="stat-value" id="stat-rfs-state">IDLE</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Samples</span>
+            <span class="stat-value" id="stat-rfs-samples">0</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Best RSSI</span>
+            <span class="stat-value" id="stat-rfs-best-rssi">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Nodes Tracked</span>
+            <span class="stat-value" id="stat-rfs-nodes">--</span>
+          </div>
+        </div>
+
+        <!-- Per-node RSSI table (most recent sample) -->
+        <div id="rf-rssi-table-container" class="hidden" style="margin-top:8px">
+          <div class="stat-label" style="margin-bottom:4px;font-size:10px">Latest RSSI per node:</div>
+          <div id="rf-rssi-table"></div>
+        </div>
+
+        <div class="btn-row" style="margin-top:10px">
+          <button id="btn-reset-rf-survey" class="btn btn-block btn-danger" style="font-size:11px">
+            Reset Survey Data
+          </button>
+        </div>
+      </div>
+
       <div class="panel" id="panel-recommended">
         <h2 class="panel-title">Recommended Locations</h2>
         <p class="not-yet" id="recommended-empty">Analyze an area to generate and score candidate deployment sites.</p>
@@ -354,6 +394,6 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-<script src="app.js?v=12"></script>
+<script src="app.js?v=13"></script>
 </body>
 </html>
