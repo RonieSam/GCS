@@ -16,7 +16,7 @@ Default parameters match Simulink exactly:
 import math
 from typing import Dict, List, Optional, Tuple
 
-from config import DEFAULT_ALTITUDE
+from config import DEFAULT_ALTITUDE, RF_RANGE_SCALE
 from coverage import haversine_distance_m
 
 DEFAULT_REFERENCE_RSSI = -30.0   # dBm at 1 m
@@ -43,9 +43,16 @@ def calculate_rssi(
     reference_rssi: float = DEFAULT_REFERENCE_RSSI,
     path_loss_exponent: float = DEFAULT_PATH_LOSS_EXP,
     reference_distance_m: float = DEFAULT_REF_DISTANCE,
+    rf_range_scale: float = RF_RANGE_SCALE,
 ) -> float:
-    """Calculate simulated RSSI (dBm) for a given 3D distance in metres."""
-    d = max(distance_m, reference_distance_m)
+    """Calculate simulated RSSI (dBm) for a given 3D distance in metres.
+
+    Phase 4: rf_range_scale scales the effective coverage range.
+    At distance_m = R * rf_range_scale, the path loss matches that of distance R.
+    When rf_range_scale = 0.25, the effective coverage distance is 1/4 of normal range.
+    """
+    scale = max(rf_range_scale, 1e-6)
+    d = max(distance_m, reference_distance_m) / scale
     rssi = reference_rssi - (10.0 * path_loss_exponent * math.log10(d / reference_distance_m))
     return round(rssi, 2)
 
@@ -57,6 +64,7 @@ def calculate_node_rssi_vector(
     deployed_nodes: List[Dict],
     reference_rssi: float = DEFAULT_REFERENCE_RSSI,
     path_loss_exponent: float = DEFAULT_PATH_LOSS_EXP,
+    rf_range_scale: float = RF_RANGE_SCALE,
 ) -> Dict[str, float]:
     """Calculate RSSI for all deployed communication nodes.
 
@@ -67,6 +75,7 @@ def calculate_node_rssi_vector(
         deployed_nodes: List of dicts with 'id', 'lat', 'lon', optional 'alt'
         reference_rssi: Reference RSSI at 1m (default -30 dBm)
         path_loss_exponent: Path loss exponent (default 2.2)
+        rf_range_scale: Effective range scale (default 0.25 for Phase 4)
 
     Returns:
         Dict mapping node ID (e.g. 'COMM-001') to simulated RSSI in dBm.
@@ -89,6 +98,7 @@ def calculate_node_rssi_vector(
             dist_3d,
             reference_rssi=reference_rssi,
             path_loss_exponent=path_loss_exponent,
+            rf_range_scale=rf_range_scale,
         )
 
     return rssi_dict

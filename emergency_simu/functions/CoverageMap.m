@@ -15,7 +15,7 @@ classdef CoverageMap < matlab.System
     % and calls a real CoverageClassifier instance -- not a second, separately
     % maintained copy of the threshold logic).
 
-    properties (Nontunable)
+    properties
         AreaSize  = [1000 1000]
         MaxPoints = 25   % total survey points, only used for the progress title
     end
@@ -32,6 +32,12 @@ classdef CoverageMap < matlab.System
 
     methods (Access = protected)
         function setupImpl(obj)
+            if evalin('base', 'exist(''areaSize'', ''var'')')
+                obj.AreaSize = evalin('base', 'areaSize');
+            end
+            if evalin('base', 'exist(''maxSurveyPoints'', ''var'')')
+                obj.MaxPoints = max(evalin('base', 'maxSurveyPoints'), 25);
+            end
             obj.FigureHandle = figure('Name', 'EmergencyNetwork - Coverage Map', ...
                 'NumberTitle', 'off', 'Color', 'w');
             obj.AxesHandle = axes('Parent', obj.FigureHandle);

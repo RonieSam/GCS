@@ -13,21 +13,30 @@ classdef RFModel < matlab.System
     %   ReferenceDistance  = 1 m
     %   PathLossExponent   = 3 (moderate outdoor/obstructed environment)
 
-    properties (Nontunable)
+    properties
         ReferenceRSSI     = -30
         PathLossExponent  = 2.2
         ReferenceDistance = 1
+        RFRangeScale      = 0.25
     end
 
     methods (Access = protected)
+        function setupImpl(obj)
+            if evalin('base', 'exist(''RFRangeScale'', ''var'')')
+                obj.RFRangeScale = evalin('base', 'RFRangeScale');
+            end
+        end
+
         function rssiValues = stepImpl(obj, nodePositions, dronePosition)
             numNodes = size(nodePositions, 1);
             rssiValues = zeros(1, numNodes);
+            scale = max(obj.RFRangeScale, 1e-6);
             for i = 1:numNodes
                 d = norm(dronePosition - nodePositions(i, :));
-                d = max(d, obj.ReferenceDistance);  % avoid log(0) if drone is on top of a node
+                d = max(d, obj.ReferenceDistance);
+                dEff = d / scale;
                 rssiValues(i) = obj.ReferenceRSSI - ...
-                    10 * obj.PathLossExponent * log10(d / obj.ReferenceDistance);
+                    10 * obj.PathLossExponent * log10(dEff / obj.ReferenceDistance);
             end
         end
 

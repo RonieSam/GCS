@@ -36,9 +36,12 @@ import config
 from candidate_generator import generate_candidates
 from coverage import compute_coverage, haversine_distance_m, point_in_polygon
 from database import (
+    clear_nodes,
+    delete_node,
     get_mission,
     init_db,
     insert_mission,
+    insert_node,
     list_deployments,
     list_missions,
     list_nodes,
@@ -464,6 +467,45 @@ def api_vehicle_resume_mission():
 @app.get("/api/nodes", response_model=List[NodeOut])
 def api_nodes():
     return list_nodes()
+
+
+@app.post("/api/nodes", response_model=NodeOut)
+def api_add_node(node: NodeOut):
+    """Deploy/register a communication node dynamically."""
+    created = insert_node(
+        node_id=node.id,
+        lat=node.lat,
+        lon=node.lon,
+        coverage_radius_m=node.coverage_radius_m or config.COVERAGE_RADIUS_DEFAULT_M,
+    )
+    if not created:
+        raise HTTPException(500, "Failed to insert node into database.")
+    rf_collector = get_rf_collector()
+    rf_collector.update_deployed_nodes(list_nodes())
+    logger.info(f"Node deployed: {created['id']} at ({created['lat']}, {created['lon']})")
+    return NodeOut(**created)
+
+
+@app.delete("/api/nodes/{node_id}")
+def api_delete_node(node_id: str):
+    """Delete a deployed communication node by ID."""
+    deleted = delete_node(node_id)
+    if not deleted:
+        raise HTTPException(404, f"Node '{node_id}' not found.")
+    rf_collector = get_rf_collector()
+    rf_collector.update_deployed_nodes(list_nodes())
+    logger.info(f"Node deleted: {node_id}. Remaining nodes: {len(list_nodes())}")
+    return {"success": True, "deleted": node_id, "remaining_count": len(list_nodes())}
+
+
+@app.post("/api/nodes/clear")
+def api_clear_nodes():
+    """Remove all deployed communication nodes."""
+    clear_nodes()
+    rf_collector = get_rf_collector()
+    rf_collector.update_deployed_nodes([])
+    logger.info("All deployed nodes cleared.")
+    return {"success": True, "count": 0}
 
 
 # ---------------------------------------------------------------------------

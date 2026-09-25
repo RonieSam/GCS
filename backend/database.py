@@ -78,37 +78,63 @@ def get_connection():
 
 
 def init_db():
-    """Create tables if they don't exist yet, and seed `nodes` from
-    data/nodes.json if the table is currently empty (first run)."""
+    """Create tables if they don't exist yet."""
     conn = get_connection()
     try:
         conn.executescript(SCHEMA)
         conn.commit()
-        _seed_nodes_if_empty(conn)
     finally:
         conn.close()
 
 
 def _seed_nodes_if_empty(conn):
-    count = conn.execute("SELECT COUNT(*) AS n FROM nodes").fetchone()["n"]
-    if count > 0:
-        return
-    if not os.path.exists(NODES_JSON_PATH):
-        return
-    with open(NODES_JSON_PATH) as f:
-        nodes = json.load(f)
-    conn.executemany(
-        "INSERT OR REPLACE INTO nodes (id, lat, lon, coverage_radius_m) VALUES (?, ?, ?, ?)",
-        [(n["id"], n["lat"], n["lon"], n.get("coverage_radius_m", 250)) for n in nodes],
-    )
-    conn.commit()
+    """Legacy helper disabled for Phase 4 dynamic node handling.
+    Nodes are now strictly added and removed via user deployment and API."""
+    pass
 
 
 def list_nodes():
+    """Return all currently active deployed communication nodes."""
     conn = get_connection()
     try:
         rows = conn.execute("SELECT id, lat, lon, coverage_radius_m FROM nodes").fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def insert_node(node_id: str, lat: float, lon: float, coverage_radius_m: float = 250.0):
+    """Insert or update a deployed communication node."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO nodes (id, lat, lon, coverage_radius_m) VALUES (?, ?, ?, ?)",
+            (node_id, lat, lon, coverage_radius_m),
+        )
+        conn.commit()
+        row = conn.execute("SELECT id, lat, lon, coverage_radius_m FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def delete_node(node_id: str) -> bool:
+    """Delete a deployed communication node by ID."""
+    conn = get_connection()
+    try:
+        cur = conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def clear_nodes():
+    """Remove all deployed communication nodes."""
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM nodes")
+        conn.commit()
     finally:
         conn.close()
 

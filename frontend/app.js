@@ -154,6 +154,16 @@ async function apiPost(path, payload) {
   return { status: res.status, body };
 }
 
+async function apiDelete(path) {
+  const res = await fetch(path, { method: "DELETE" });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    const detail = body && body.detail ? body.detail : `HTTP ${res.status}`;
+    throw new Error(detail);
+  }
+  return body;
+}
+
 // ---------------------------------------------------------------------------
 // Map setup, with schematic fallback if tile imagery can't load
 // ---------------------------------------------------------------------------
@@ -203,45 +213,42 @@ function enableFallbackBasemap() {
 }
 
 // ---------------------------------------------------------------------------
-// Node display (loaded from the backend, which seeds from data/nodes.json)
+// Node display & deployment (Phase 4 — dynamic nodes, deletion & scaled RF range)
 // ---------------------------------------------------------------------------
 
+// Phase 4: calibrate RF range to 1/4 of default range
+const RF_RANGE_SCALE = 0.25;
+
 /**
- * loadNodes — fetches node definitions from the backend and stores them
- * in state.availableNodes.  Does NOT draw anything on the map.
- * Returns the list so boot() can use it to centre the map.
+ * loadNodes — fetches currently deployed node definitions from the backend.
+ * If nodes are already registered in the backend, adds them to the map.
  */
 async function loadNodes() {
   try {
-    state.availableNodes = await apiGet(NODES_URL);
+    const nodes = await apiGet(NODES_URL);
+    state.availableNodes = nodes || [];
+    if (Array.isArray(nodes) && nodes.length > 0) {
+      nodes.forEach((n) => addDeployedNode(n));
+    }
   } catch (err) {
-    logEvent(`Could not load nodes from ${NODES_URL} (${err.message}) — using built-in fallback nodes.`);
-    state.availableNodes = [
-      { id: "NODE-001", lat: 13.0827, lon: 80.2707, coverage_radius_m: 250 },
-      { id: "NODE-002", lat: 13.0891, lon: 80.2785, coverage_radius_m: 250 },
-      { id: "NODE-003", lat: 13.0774, lon: 80.2812, coverage_radius_m: 250 },
-    ];
+    logEvent(`Could not load nodes from ${NODES_URL} (${err.message})`);
+    state.availableNodes = [];
   }
-  return state.availableNodes;
+  updateNodeUI();
+  return state.deployedNodes;
 }
 
 /**
  * addDeployedNode — renders a single node onto the shared nodeLayerGroup
- * and appends it to state.deployedNodes.
- *
- * Using this helper (rather than drawing directly to `map`) means:
- *   - Every deployed node lives in the same LayerGroup, so we can
- *     add Node 4 later without touching Node 1-3 markers.
- *   - state.deployedNodes is the single source of truth for what is shown.
+ * and appends it to state.deployedNodes if not already present.
  */
 function addDeployedNode(node) {
-  // Ensure the shared layer group exists
   if (!state.nodeLayerGroup) {
     state.nodeLayerGroup = L.layerGroup().addTo(map);
   }
 
   const marker = L.circleMarker([node.lat, node.lon], {
-    radius: 6,
+    radius: 7,
     color: "#3FDA7F",
     fillColor: "#3FDA7F",
     fillOpacity: 0.9,
@@ -251,30 +258,100 @@ function addDeployedNode(node) {
   marker.bindTooltip(node.id, {
     permanent: true,
     direction: "top",
-    offset: [0, -6],
+    offset: [0, -7],
     className: "node-label",
   });
 
-  L.circle([node.lat, node.lon], {
-    radius: node.coverage_radius_m,
+  const scaledRadius = (node.coverage_radius_m || 250) * RF_RANGE_SCALE;
+
+  const circle = L.circle([node.lat, node.lon], {
+    radius: scaledRadius,
     color: "#3FDA7F",
-    weight: 1,
+    weight: 1.5,
     fillColor: "#3FDA7F",
     fillOpacity: 0.08,
     dashArray: "4 4",
   }).addTo(state.nodeLayerGroup);
 
-  state.deployedNodes.push(node);
+  marker.bindPopup(`
+    <div style="font-family: inherit; font-size: 13px; min-width: 150px; line-height: 1.5;">
+      <strong style="color: #3FDA7F;">${node.id}</strong><br/>
+      <span style="color: #aaa; font-size: 11px;">Lat: ${node.lat.toFixed(5)}<br/>Lon: ${node.lon.toFixed(5)}<br/>Coverage: ${Math.round(scaledRadius)} m (scaled 1/4)</span>
+      <div style="margin-top: 8px;">
+        <button class="btn btn-sm btn-danger" style="width: 100%; padding: 4px 8px; font-size: 11px;" onclick="window.deleteDeployedNode('${node.id}')">
+          &#x1F5D1; Delete Node
+        </button>
+      </div>
+    </div>
+  `);
+
+  node._marker = marker;
+  node._circle = circle;
+
+  if (!state.deployedNodes.some((n) => n.id === node.id)) {
+    state.deployedNodes.push(node);
+  }
+
+  updateNodeUI();
 }
+
+/**
+ * updateNodeUI — syncs stat counters and the Manage Deployed Nodes dropdown.
+ */
+function updateNodeUI() {
+  const countEl = document.getElementById("stat-deployed-count");
+  if (countEl) countEl.textContent = state.deployedNodes.length;
+
+  const nodesEl = document.getElementById("stat-nodes");
+  if (nodesEl) nodesEl.textContent = state.deployedNodes.length;
+
+  const selectEl = document.getElementById("select-delete-node");
+  const deleteBtn = document.getElementById("btn-delete-node");
+  if (selectEl) {
+    selectEl.innerHTML = "";
+    if (state.deployedNodes.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "(No nodes deployed)";
+      selectEl.appendChild(opt);
+      if (deleteBtn) deleteBtn.disabled = true;
+    } else {
+      state.deployedNodes.forEach((n) => {
+        const opt = document.createElement("option");
+        opt.value = n.id;
+        opt.textContent = `${n.id} (${n.lat.toFixed(4)}, ${n.lon.toFixed(4)})`;
+        selectEl.appendChild(opt);
+      });
+      if (deleteBtn) deleteBtn.disabled = false;
+    }
+  }
+}
+
+/**
+ * deleteDeployedNode — deletes a deployed node from backend, GCS state, and map.
+ */
+async function deleteDeployedNode(nodeId) {
+  if (!nodeId) return;
+  try {
+    await apiDelete(`/api/nodes/${encodeURIComponent(nodeId)}`);
+    const node = state.deployedNodes.find((n) => n.id === nodeId);
+    if (node) {
+      if (node._marker && state.nodeLayerGroup) state.nodeLayerGroup.removeLayer(node._marker);
+      if (node._circle && state.nodeLayerGroup) state.nodeLayerGroup.removeLayer(node._circle);
+    }
+    state.deployedNodes = state.deployedNodes.filter((n) => n.id !== nodeId);
+    updateNodeUI();
+    logEvent(`Node ${nodeId} deleted. Active deployed nodes: ${state.deployedNodes.length}.`);
+  } catch (err) {
+    logEvent(`Failed to delete node ${nodeId}: ${err.message}`);
+  }
+}
+window.deleteDeployedNode = deleteDeployedNode;
 
 /**
  * selectDeploymentLocation — single shared entry point for setting the
  * pending deployment location, regardless of whether it came from a direct
  * map click or a candidate selection.
- *
- * @param {number} lat
- * @param {number} lon
- * @param {'map'|'candidate'} source  - for display/logging only
  */
 function selectDeploymentLocation(lat, lon, source) {
   state.selectedDeploymentLocation = { lat, lon, source };
@@ -293,13 +370,11 @@ function selectDeploymentLocation(lat, lon, source) {
     }).addTo(map);
   }
 
-  // Bind a tooltip so the operator can see the coords at a glance
   state.deploymentSelectionMarker.bindTooltip(
     `Deploy here (${source})`,
     { direction: "top", offset: [0, -10], className: "node-label" }
   ).openTooltip();
 
-  // Update the Node Deployment panel
   const locText = document.getElementById("deploy-location-text");
   if (locText) locText.textContent = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
 
@@ -315,17 +390,14 @@ function selectDeploymentLocation(lat, lon, source) {
   logEvent(`Deployment location selected (${source}): lat=${lat.toFixed(5)}, lon=${lon.toFixed(5)}`);
 }
 
-// Running counter for deployed-node IDs (session-scoped, starts at 1)
+// Running counter for deployed-node IDs
 let _deployNodeSeq = 0;
 
 /**
- * autoDeploy — creates a new logical communication node at
- * state.selectedDeploymentLocation and renders it on the map.
- *
- * This is the single deployment path for both map-click and candidate-select.
- * It does NOT touch the UAV marker, the mission system, or existing nodes.
+ * autoDeploy — creates a new logical communication node, saves it to the
+ * backend, and renders it on the map.
  */
-function autoDeploy() {
+async function autoDeploy() {
   if (!state.selectedDeploymentLocation) {
     logEvent("AUTO DEPLOY: no location selected. Click the map or pick a candidate first.");
     return;
@@ -335,28 +407,21 @@ function autoDeploy() {
   _deployNodeSeq++;
   const nodeId = `COMM-${String(_deployNodeSeq).padStart(3, "0")}`;
 
-  // Standard coverage radius — same as existing nodes
   const node = { id: nodeId, lat, lon, coverage_radius_m: 250 };
-  addDeployedNode(node);
+  try {
+    await apiPost("/api/nodes", node);
+    addDeployedNode(node);
+  } catch (err) {
+    logEvent(`AUTO DEPLOY failed: ${err.message}`);
+    return;
+  }
 
-  // Remove the temporary selection marker now that the node is permanent
   if (state.deploymentSelectionMarker) {
     map.removeLayer(state.deploymentSelectionMarker);
     state.deploymentSelectionMarker = null;
   }
-
-  // Clear the selection state
   state.selectedDeploymentLocation = null;
 
-  // Update stat counters
-  const countEl = document.getElementById("stat-deployed-count");
-  if (countEl) countEl.textContent = state.deployedNodes.length;
-
-  // Also keep the legacy "Existing Nodes" stat in Area Planning in sync
-  const nodesEl = document.getElementById("stat-nodes");
-  if (nodesEl) nodesEl.textContent = state.deployedNodes.length;
-
-  // Reset the Node Deployment panel
   const locText = document.getElementById("deploy-location-text");
   if (locText) locText.textContent = "None";
   const srcEl = document.getElementById("stat-deploy-source");
@@ -369,7 +434,7 @@ function autoDeploy() {
 
   logEvent(
     `AUTO DEPLOY: node ${nodeId} deployed at lat=${lat.toFixed(5)}, lon=${lon.toFixed(5)}. ` +
-    `Total deployed: ${state.deployedNodes.length}.`
+    `Total active deployed nodes: ${state.deployedNodes.length}.`
   );
 }
 
@@ -2124,6 +2189,16 @@ function initControls() {
   // Phase 3 — RF Survey Live Data reset button
   const resetRfBtn = document.getElementById("btn-reset-rf-survey");
   if (resetRfBtn) resetRfBtn.addEventListener("click", resetSurveyData);
+  // Phase 4 — Delete Node button
+  const deleteNodeBtn = document.getElementById("btn-delete-node");
+  if (deleteNodeBtn) {
+    deleteNodeBtn.addEventListener("click", () => {
+      const selectEl = document.getElementById("select-delete-node");
+      if (selectEl && selectEl.value) {
+        deleteDeployedNode(selectEl.value);
+      }
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

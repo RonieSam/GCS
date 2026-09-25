@@ -59,7 +59,8 @@ MISSION_UPLOAD_TIMEOUT_S = 15
 MISSION_ITEM_TIMEOUT_S = 5
 
 # --- Coverage model (used from Phase 2 onward) ---
-COVERAGE_RADIUS_DEFAULT_M = 250  # fallback if a node omits coverage_radius_m
+RF_RANGE_SCALE = 0.25  # Phase 4: 1.0 = current range, 0.25 = approx 1/4 range
+COVERAGE_RADIUS_DEFAULT_M = 250 * RF_RANGE_SCALE  # scaled coverage radius (62.5 m)
 GRID_RESOLUTION_M = 20  # spacing between coverage-grid sample points
 
 # --- Scoring weights (used from Phase 4 onward) ---

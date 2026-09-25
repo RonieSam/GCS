@@ -16,7 +16,7 @@ classdef DroneSurvey < matlab.System
     % (200 m spacing, altitude 30 m), 25 points total, direction alternating
     % row to row so consecutive points are always adjacent.
 
-    properties (Nontunable)
+    properties
         SurveyPoints = [ ...
             50   50  30;  250   50  30;  450   50  30;  650   50  30;  850   50  30; ...
             850  250  30;  650  250  30;  450  250  30;  250  250  30;   50  250  30; ...
@@ -32,12 +32,23 @@ classdef DroneSurvey < matlab.System
     methods (Access = protected)
         function setupImpl(obj)
             obj.Index = 1;
+            if evalin('base', 'exist(''surveyPoints'', ''var'')')
+                pts = evalin('base', 'surveyPoints');
+                if ~isempty(pts)
+                    obj.SurveyPoints = pts;
+                end
+            end
         end
 
         function dronePosition = stepImpl(obj)
-            dronePosition = obj.SurveyPoints(obj.Index, :);
             n = size(obj.SurveyPoints, 1);
-            obj.Index = mod(obj.Index, n) + 1;   % advance, wrap after the last point
+            if n > 0
+                idx = min(obj.Index, n);
+                dronePosition = obj.SurveyPoints(idx, :);
+                obj.Index = mod(obj.Index, n) + 1;
+            else
+                dronePosition = [50 50 30];
+            end
         end
 
         function resetImpl(obj)

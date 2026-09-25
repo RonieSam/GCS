@@ -43,12 +43,12 @@ class TestPhase3RFModel(unittest.TestCase):
     """Verify RF model equations match Simulink RFModel.m exactly."""
 
     def test_log_distance_path_loss(self):
-        # At 1 metre (reference distance): RSSI = -30 dBm
-        rssi_1m = calculate_rssi(distance_m=1.0, reference_rssi=-30.0, path_loss_exponent=2.2)
+        # At 1 metre (reference distance) with full scale (1.0): RSSI = -30 dBm
+        rssi_1m = calculate_rssi(distance_m=1.0, reference_rssi=-30.0, path_loss_exponent=2.2, rf_range_scale=1.0)
         self.assertAlmostEqual(rssi_1m, -30.0, places=1)
 
         # At 10 metres: -30 - 10*2.2*log10(10) = -30 - 22 = -52.0 dBm
-        rssi_10m = calculate_rssi(distance_m=10.0, reference_rssi=-30.0, path_loss_exponent=2.2)
+        rssi_10m = calculate_rssi(distance_m=10.0, reference_rssi=-30.0, path_loss_exponent=2.2, rf_range_scale=1.0)
         self.assertAlmostEqual(rssi_10m, -52.0, places=1)
 
     def test_distance_3d(self):

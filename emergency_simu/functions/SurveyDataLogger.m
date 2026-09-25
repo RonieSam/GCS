@@ -17,7 +17,7 @@ classdef SurveyDataLogger < matlab.System
     %                  (reused via composition, thresholds never duplicated)
     %   pointCount   - scalar, how many points have been recorded so far
 
-    properties (Nontunable)
+    properties
         MaxPoints = 25
     end
 
@@ -32,6 +32,9 @@ classdef SurveyDataLogger < matlab.System
 
     methods (Access = protected)
         function setupImpl(obj)
+            if evalin('base', 'exist(''maxSurveyPoints'', ''var'')')
+                obj.MaxPoints = max(evalin('base', 'maxSurveyPoints'), 25);
+            end
             obj.Classifier   = CoverageClassifier();
             obj.SurveyX      = NaN(1, obj.MaxPoints);
             obj.SurveyY      = NaN(1, obj.MaxPoints);

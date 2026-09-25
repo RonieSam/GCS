@@ -16,7 +16,7 @@ classdef GapVisualizer < matlab.System
     % squares, candidate locations = black stars (larger, sized/labeled by
     % rank so higher-priority candidates stand out).
 
-    properties (Nontunable)
+    properties
         AreaSize  = [1000 1000]
         Buildings = zeros(0, 4)
     end
@@ -28,6 +28,9 @@ classdef GapVisualizer < matlab.System
 
     methods (Access = protected)
         function setupImpl(obj)
+            if evalin('base', 'exist(''areaSize'', ''var'')')
+                obj.AreaSize = evalin('base', 'areaSize');
+            end
             obj.FigureHandle = figure('Name', 'EmergencyNetwork - Gap Analysis', ...
                 'NumberTitle', 'off', 'Color', 'w');
             obj.AxesHandle = axes('Parent', obj.FigureHandle);
@@ -64,14 +67,24 @@ classdef GapVisualizer < matlab.System
                 'MarkerFaceColor', 'r', 'MarkerEdgeColor', 'k', 'MarkerSize', 9, ...
                 'DisplayName', 'Coverage gap');
 
-            % --- Candidate locations: black stars, labeled by rank ---
+            % --- Candidate locations: best candidate clearly highlighted ---
             for i = 1:candidateCount
-                plot(ax, candidateX(i), candidateY(i), 'p', ...
-                    'MarkerFaceColor', 'k', 'MarkerEdgeColor', 'y', ...
-                    'MarkerSize', 18, 'LineWidth', 1.5);
-                text(ax, candidateX(i) + 15, candidateY(i), ...
-                    sprintf('Candidate %d', i), ...
-                    'FontSize', 9, 'FontWeight', 'bold', 'Color', 'k');
+                if i == 1
+                    % Best candidate: prominent gold star with bold label
+                    plot(ax, candidateX(i), candidateY(i), 'p', ...
+                        'MarkerFaceColor', [1 0.8 0], 'MarkerEdgeColor', [0 0.2 0.8], ...
+                        'MarkerSize', 24, 'LineWidth', 2.5);
+                    text(ax, candidateX(i) + 18, candidateY(i), ...
+                        sprintf('★ BEST CANDIDATE (Rank 1)'), ...
+                        'FontSize', 10, 'FontWeight', 'bold', 'Color', [0.8 0.4 0]);
+                else
+                    plot(ax, candidateX(i), candidateY(i), 'p', ...
+                        'MarkerFaceColor', 'k', 'MarkerEdgeColor', 'y', ...
+                        'MarkerSize', 16, 'LineWidth', 1.5);
+                    text(ax, candidateX(i) + 15, candidateY(i), ...
+                        sprintf('Candidate %d', i), ...
+                        'FontSize', 9, 'FontWeight', 'bold', 'Color', 'k');
+                end
             end
 
             legend(ax, {'Existing node', 'Coverage gap'}, 'Location', 'bestoutside');

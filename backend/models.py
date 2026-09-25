@@ -19,7 +19,7 @@ class NodeOut(BaseModel):
     id: str
     lat: float
     lon: float
-    coverage_radius_m: float
+    coverage_radius_m: Optional[float] = 250.0
 
 
 class StatusResponse(BaseModel):

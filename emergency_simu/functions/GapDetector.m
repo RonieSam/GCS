@@ -15,11 +15,17 @@ classdef GapDetector < matlab.System
     %   gapCount   - scalar, number of gap points found (calculated, never
     %                hard-coded)
 
-    properties (Nontunable)
+    properties
         MaxPoints = 25
     end
 
     methods (Access = protected)
+        function setupImpl(obj)
+            if evalin('base', 'exist(''maxSurveyPoints'', ''var'')')
+                obj.MaxPoints = max(evalin('base', 'maxSurveyPoints'), 25);
+            end
+        end
+
         function [gapX, gapY, gapCount] = stepImpl(obj, surveyX, surveyY, surveyStatus, pointCount)
             gapX = NaN(1, obj.MaxPoints);
             gapY = NaN(1, obj.MaxPoints);

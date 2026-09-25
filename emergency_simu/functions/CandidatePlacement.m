@@ -31,7 +31,7 @@ classdef CandidatePlacement < matlab.System
     %     ranks higher. Weights are plain tunable numbers, not a claim of
     %     mathematical optimality.
 
-    properties (Nontunable)
+    properties
         GapClusterDistance = 250    % metres -- points this close join one region
         MaxPoints          = 25
         MaxCandidates      = 25
@@ -40,9 +40,24 @@ classdef CandidatePlacement < matlab.System
         Buildings          = zeros(0, 4)   % [x y width depth], optional
         GapCountWeight     = 10
         DistanceWeight     = 0.1
+        RFRangeScale       = 0.25
     end
 
     methods (Access = protected)
+        function setupImpl(obj)
+            if evalin('base', 'exist(''areaSize'', ''var'')')
+                obj.AreaSize = evalin('base', 'areaSize');
+            end
+            if evalin('base', 'exist(''maxSurveyPoints'', ''var'')')
+                obj.MaxPoints = max(evalin('base', 'maxSurveyPoints'), 25);
+                obj.MaxCandidates = obj.MaxPoints;
+            end
+            if evalin('base', 'exist(''RFRangeScale'', ''var'')')
+                obj.RFRangeScale = evalin('base', 'RFRangeScale');
+                obj.GapClusterDistance = 250 * obj.RFRangeScale;
+            end
+        end
+
         function [candidateX, candidateY, candidateZ, candidateGapCount, ...
                 candidateScore, candidateInBuilding, candidateCount] = ...
                 stepImpl(obj, gapX, gapY, gapCount, nodePositions)

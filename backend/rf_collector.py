@@ -111,6 +111,12 @@ class RFSurveyCollector:
                 f"nodes={len(deployed_nodes)}, survey_wps={survey_waypoint_count}"
             )
 
+    def update_deployed_nodes(self, deployed_nodes: List[Dict]) -> None:
+        """Dynamically update active deployed nodes list (called when nodes are added or deleted)."""
+        with self._lock:
+            self._deployed_nodes = [dict(n) for n in deployed_nodes]
+            logger.info(f"RF Collector deployed nodes updated: {len(self._deployed_nodes)} nodes.")
+
     def start_scan(self) -> None:
         """Called when mission execution begins."""
         with self._lock:

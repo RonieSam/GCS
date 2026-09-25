@@ -13,7 +13,7 @@ classdef EnvironmentVisualizer < matlab.System
     %   NodeLabels  - cell array of label strings
     %   Buildings   - Nx4 matrix [x y width depth]
 
-    properties (Nontunable)
+    properties
         AreaSize   = [1000 1000]
         NodeLabels = {'Node 1', 'Node 2', 'Node 3'}
         Buildings  = zeros(0, 4)
@@ -26,6 +26,12 @@ classdef EnvironmentVisualizer < matlab.System
 
     methods (Access = protected)
         function setupImpl(obj)
+            if evalin('base', 'exist(''areaSize'', ''var'')')
+                obj.AreaSize = evalin('base', 'areaSize');
+            end
+            if evalin('base', 'exist(''nodeLabels'', ''var'')')
+                obj.NodeLabels = evalin('base', 'nodeLabels');
+            end
             obj.FigureHandle = figure('Name', 'EmergencyNetwork - Coverage', ...
                 'NumberTitle', 'off', 'Color', 'w');
             obj.AxesHandle = axes('Parent', obj.FigureHandle);
@@ -59,8 +65,12 @@ classdef EnvironmentVisualizer < matlab.System
                 nodeColor = statusColors{idx};
                 plot(ax, nodePositions(i, 1), nodePositions(i, 2), 'o', ...
                     'MarkerFaceColor', nodeColor, 'MarkerEdgeColor', 'k', 'MarkerSize', 10);
+                lbl = sprintf('Node %d', i);
+                if i <= numel(obj.NodeLabels) && ~isempty(obj.NodeLabels{i})
+                    lbl = obj.NodeLabels{i};
+                end
                 labelText = sprintf('%s\nRSSI: %.0f dBm\n%s', ...
-                    obj.NodeLabels{i}, rssiValues(i), statusNames{idx});
+                    lbl, rssiValues(i), statusNames{idx});
                 text(ax, nodePositions(i, 1) + 15, nodePositions(i, 2), labelText, ...
                     'FontSize', 8, 'Color', nodeColor, 'VerticalAlignment', 'middle');
             end
@@ -92,7 +102,7 @@ classdef EnvironmentVisualizer < matlab.System
             num = 0;
         end
         function flag = isInputSizeMutableImpl(~, ~)
-            flag = false;
+            flag = true;
         end
     end
 end

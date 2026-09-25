@@ -96,6 +96,21 @@
             <span class="stat-value" id="stat-deploy-source">--</span>
           </div>
         </div>
+
+        <div id="deployed-nodes-container" style="margin-top:12px;border-top:1px solid #232c37;padding-top:10px;">
+          <label class="field-label" style="margin-bottom:4px;display:block;">Delete Deployed Node</label>
+          <div style="display:flex;gap:6px;">
+            <select id="select-delete-node" class="field-input" style="flex:1;">
+              <option value="">(No nodes deployed)</option>
+            </select>
+            <button id="btn-delete-node" class="btn btn-danger" style="padding:4px 12px;font-size:12px;" disabled>
+              Delete
+            </button>
+          </div>
+          <p class="hint" style="margin-top:4px;font-size:11px;">
+            You can also click any node on the map to delete it.
+          </p>
+        </div>
       </div>
 
       <div class="panel" id="panel-rf-scan">
@@ -394,6 +409,6 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-<script src="app.js?v=13"></script>
+<script src="app.js?v=14"></script>
 </body>
 </html>
