@@ -105,22 +105,25 @@ def build_survey_mission_items(
     return_lon=None,
     return_alt_m=None,
 ):
-    """Build a PX4 MAVLink mission for an RF scan survey path with return to start.
+    """Build a PX4 MAVLink mission for an RF scan survey path ending at the final survey point.
+
+    Phase 4: RF survey mission sequence is:
+      TAKEOFF -> SURVEY WAYPOINTS -> FINAL SURVEY WAYPOINT -> SCAN COMPLETE.
+      There is NO return to scan-start, NO return home, NO automatic landing, and NO RTL.
+      The UAV holds/hovers at the final survey waypoint.
 
     Constructs a mission with:
       Item 0    — TAKEOFF from home to survey altitude.
       Items 1…N — NAV_WAYPOINT for each survey waypoint (PX4 coordinates).
-      Item N+1  — NAV_WAYPOINT back to original scan-start / home position.
-      Item N+2  — LAND at original scan-start / home position.
 
     Args:
         px4_waypoints (list[dict]): Survey waypoints already converted to PX4
                                     coordinates (seq, lat, lon, alt, line_idx).
         home_lat (float): PX4 home/takeoff latitude.
         home_lon (float): PX4 home/takeoff longitude.
-        return_lat (float, optional): Latitude to return to. Defaults to home_lat.
-        return_lon (float, optional): Longitude to return to. Defaults to home_lon.
-        return_alt_m (float, optional): Altitude for return leg. Defaults to survey alt.
+        return_lat: Unused in Phase 4 (kept for signature compatibility).
+        return_lon: Unused in Phase 4 (kept for signature compatibility).
+        return_alt_m: Unused in Phase 4 (kept for signature compatibility).
 
     Returns:
         list[dict]: Mission items ready for upload_mission().
@@ -140,15 +143,6 @@ def build_survey_mission_items(
             raise InvalidMission(f"Survey waypoint latitude {wp['lat']} out of range.")
         if not (-180 <= wp["lon"] <= 180):
             raise InvalidMission(f"Survey waypoint longitude {wp['lon']} out of range.")
-
-    target_return_lat = return_lat if return_lat is not None else home_lat
-    target_return_lon = return_lon if return_lon is not None else home_lon
-    target_return_alt = return_alt_m if (return_alt_m is not None and return_alt_m > 0) else alt
-
-    if not (-90 <= target_return_lat <= 90):
-        raise InvalidMission(f"Return latitude {target_return_lat} out of range.")
-    if not (-180 <= target_return_lon <= 180):
-        raise InvalidMission(f"Return longitude {target_return_lon} out of range.")
 
     common = dict(
         frame        = _FRAME_GLOBAL_RELATIVE_ALT,
@@ -173,7 +167,7 @@ def build_survey_mission_items(
         "alt"     : alt,
     })
 
-    # Items 1…N: Survey NAV_WAYPOINT items.
+    # Items 1…N: Survey NAV_WAYPOINT items. Ends at final survey waypoint.
     for i, wp in enumerate(px4_waypoints):
         items.append({
             **common,
@@ -186,33 +180,6 @@ def build_survey_mission_items(
             "lon"     : wp["lon"],
             "alt"     : wp["alt"],
         })
-
-    # Item N+1: RETURN to original scan-start / home position at cruise altitude.
-    # The UAV must NOT land at the final scan waypoint.
-    items.append({
-        **common,
-        "seq"     : len(px4_waypoints) + 1,
-        "command" : _CMD_WAYPOINT,
-        "current" : 0,
-        "param1"  : 0.0,   # hold time (s)
-        "param2"  : 2.0,   # acceptance radius (m)
-        "lat"     : target_return_lat,
-        "lon"     : target_return_lon,
-        "alt"     : target_return_alt,
-    })
-
-    # Item N+2: LAND at the original scan-start / home position.
-    items.append({
-        **common,
-        "seq"     : len(px4_waypoints) + 2,
-        "command" : _CMD_LAND,
-        "current" : 0,
-        "param1"  : 0.0,
-        "param2"  : 0.0,
-        "lat"     : target_return_lat,
-        "lon"     : target_return_lon,
-        "alt"     : 0.0,
-    })
 
     # Re-sequence to guarantee contiguous indices after building.
     for idx, item in enumerate(items):

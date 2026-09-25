@@ -15,7 +15,9 @@ import os
 import sys
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+from pymavlink import mavutil
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -53,6 +55,11 @@ class FakeConn:
         if type == "HEARTBEAT" and not self._delivered:
             self._delivered = True
             return self._heartbeat
+        if type == "COMMAND_ACK":
+            ack = Mock()
+            ack.command = mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM
+            ack.result = 0
+            return ack
         return None
 
     def close(self):

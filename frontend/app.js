@@ -221,18 +221,32 @@ const RF_RANGE_SCALE = 0.25;
 
 /**
  * loadNodes — fetches currently deployed node definitions from the backend.
- * If nodes are already registered in the backend, adds them to the map.
+ * Populates frontend state and renders all persisted nodes on the map.
  */
 async function loadNodes() {
   try {
     const nodes = await apiGet(NODES_URL);
     state.availableNodes = nodes || [];
+    if (state.nodeLayerGroup) {
+      state.nodeLayerGroup.clearLayers();
+    }
+    state.deployedNodes = [];
     if (Array.isArray(nodes) && nodes.length > 0) {
-      nodes.forEach((n) => addDeployedNode(n));
+      nodes.forEach((n) => {
+        addDeployedNode(n);
+        const match = (n.id || "").match(/\d+/);
+        if (match) {
+          const seqNum = parseInt(match[0], 10);
+          if (!isNaN(seqNum) && seqNum > _deployNodeSeq) {
+            _deployNodeSeq = seqNum;
+          }
+        }
+      });
     }
   } catch (err) {
     logEvent(`Could not load nodes from ${NODES_URL} (${err.message})`);
     state.availableNodes = [];
+    state.deployedNodes = [];
   }
   updateNodeUI();
   return state.deployedNodes;
@@ -273,15 +287,11 @@ function addDeployedNode(node) {
     dashArray: "4 4",
   }).addTo(state.nodeLayerGroup);
 
+  // Popup provides node information only; deletion is strictly via the Nodes sidebar
   marker.bindPopup(`
-    <div style="font-family: inherit; font-size: 13px; min-width: 150px; line-height: 1.5;">
+    <div style="font-family: inherit; font-size: 13px; min-width: 140px; line-height: 1.5;">
       <strong style="color: #3FDA7F;">${node.id}</strong><br/>
       <span style="color: #aaa; font-size: 11px;">Lat: ${node.lat.toFixed(5)}<br/>Lon: ${node.lon.toFixed(5)}<br/>Coverage: ${Math.round(scaledRadius)} m (scaled 1/4)</span>
-      <div style="margin-top: 8px;">
-        <button class="btn btn-sm btn-danger" style="width: 100%; padding: 4px 8px; font-size: 11px;" onclick="window.deleteDeployedNode('${node.id}')">
-          &#x1F5D1; Delete Node
-        </button>
-      </div>
     </div>
   `);
 
@@ -409,8 +419,8 @@ async function autoDeploy() {
 
   const node = { id: nodeId, lat, lon, coverage_radius_m: 250 };
   try {
-    await apiPost("/api/nodes", node);
-    addDeployedNode(node);
+    const created = await apiPost("/api/nodes", node);
+    addDeployedNode(created || node);
   } catch (err) {
     logEvent(`AUTO DEPLOY failed: ${err.message}`);
     return;
@@ -2016,6 +2026,20 @@ function scheduleRfSurveyReconnect() {
 }
 
 /**
+ * Phase 4 RSSI classification:
+ * GOOD:      RSSI > -60 dBm      (#3FDA7F)
+ * MODERATE:  -75 < RSSI <= -60   (#F5A623)
+ * WEAK:      -85 < RSSI <= -75   (#FF9500)
+ * GAP:       RSSI <= -85 dBm     (#FF5C5C)
+ */
+function getRssiClassification(val) {
+  if (val > -60) return { label: "GOOD", color: "#3FDA7F" };
+  if (val > -75) return { label: "MODERATE", color: "#F5A623" };
+  if (val > -85) return { label: "WEAK", color: "#FF9500" };
+  return { label: "GAP", color: "#FF5C5C" };
+}
+
+/**
  * Render the RF Survey live data panel from a full rf_survey_data message.
  */
 function renderRfSurveyPanel(data) {
@@ -2034,10 +2058,21 @@ function renderRfSurveyPanel(data) {
   const samples = data.samples || [];
   if (samples.length > 0) {
     const last = samples[samples.length - 1];
-    if (rssiEl) rssiEl.textContent = last.best_rssi != null ? `${last.best_rssi} dBm` : "--";
+    if (rssiEl) {
+      if (last.best_rssi != null) {
+        rssiEl.textContent = `${last.best_rssi} dBm`;
+        rssiEl.style.color = getRssiClassification(last.best_rssi).color;
+      } else {
+        rssiEl.textContent = "--";
+        rssiEl.style.color = "";
+      }
+    }
     _renderRssiTable(last.rssi || {});
   } else {
-    if (rssiEl) rssiEl.textContent = "--";
+    if (rssiEl) {
+      rssiEl.textContent = "--";
+      rssiEl.style.color = "";
+    }
   }
 
   // Update hint based on state
@@ -2046,8 +2081,7 @@ function renderRfSurveyPanel(data) {
       IDLE:          "No scan active. Upload and start an RF Scan mission to collect data.",
       SCAN_READY:    "Mission uploaded. Start RF Scan to begin collecting data.",
       SCANNING:      `Collecting samples… ${data.sample_count || 0} samples so far.`,
-      RETURNING:     `Survey complete (${data.sample_count || 0} samples). UAV returning to start.`,
-      SCAN_COMPLETE: `Scan complete — ${data.sample_count || 0} survey samples collected.`,
+      SCAN_COMPLETE: `Scan complete — ${data.sample_count || 0} survey samples collected. UAV hovering at final survey waypoint.`,
       FAILED:        "RF scan failed. Check logs.",
     };
     hintEl.textContent = hints[collectorState] || `State: ${collectorState}`;
@@ -2074,7 +2108,15 @@ function renderRfSurveySample(data) {
 
   if (stateEl)   stateEl.textContent = collectorState;
   if (samplesEl && sample.sample_id) samplesEl.textContent = sample.sample_id;
-  if (rssiEl && sample.best_rssi != null) rssiEl.textContent = `${sample.best_rssi} dBm`;
+  if (rssiEl) {
+    if (sample.best_rssi != null) {
+      rssiEl.textContent = `${sample.best_rssi} dBm`;
+      rssiEl.style.color = getRssiClassification(sample.best_rssi).color;
+    } else {
+      rssiEl.textContent = "--";
+      rssiEl.style.color = "";
+    }
+  }
   if (hintEl) hintEl.textContent = `Collecting… sample #${sample.sample_id || "?"} at WP ${sample.current_waypoint || "?"}`;
 
   _renderRssiTable(sample.rssi || {});
@@ -2103,7 +2145,7 @@ function _renderRssiTable(rssiDict) {
   table.innerHTML = nodeIds.map(id => {
     const val = rssiDict[id];
     const bar = Math.max(0, Math.min(100, Math.round((val + 100) * 2)));
-    const color = val > -70 ? "#3FDA7F" : val > -85 ? "#F5A623" : "#FF5C5C";
+    const { color } = getRssiClassification(val);
     return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px;font-family:var(--font-data);font-size:10px">` +
            `<span style="color:#8A9AB0;min-width:64px">${id}</span>` +
            `<div style="flex:1;background:#1c232b;border-radius:2px;height:6px">` +
@@ -2206,17 +2248,15 @@ function initControls() {
 // ---------------------------------------------------------------------------
 
 async function boot() {
-  // Load node definitions (inventory) so we can centre the map — but
-  // do NOT draw them yet.  The operator must press AUTO DEPLOY INITIAL
-  // NODES to place them on the map (Phase 1 requirement).
-  const nodes = await loadNodes();
-
-  const centerLat = nodes.length ? nodes[0].lat : FALLBACK_CENTER.lat;
-  const centerLon = nodes.length ? nodes[0].lon : FALLBACK_CENTER.lon;
-
-  initMap(centerLat, centerLon);
-  // drawNodes() is intentionally NOT called here — deployedNodes starts empty.
+  // Initialize map first so LayerGroups and markers can attach properly
+  initMap(FALLBACK_CENTER.lat, FALLBACK_CENTER.lon);
   initControls();
+
+  // Load and render all persisted deployed nodes from backend (single source of truth)
+  const nodes = await loadNodes();
+  if (Array.isArray(nodes) && nodes.length > 0) {
+    map.setView([nodes[0].lat, nodes[0].lon], 16);
+  }
 
   connectTelemetry();
   startTelemetryStaleWatch();
@@ -2229,7 +2269,7 @@ async function boot() {
   _updateGamepadStat();
   _updateOverrideStat();
 
-  logEvent("GCS initialized — Phase 8 ready. Press AUTO DEPLOY INITIAL NODES to place communication nodes.");
+  logEvent("GCS initialized — Phase 4 ready.");
 }
 
 boot();

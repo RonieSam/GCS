@@ -133,6 +133,8 @@ _CANDIDATE_MATCH_TOLERANCE_M = 1.0  # treat as "the same point" within this radi
 @app.on_event("startup")
 async def on_startup():
     init_db()
+    # Phase 4 — synchronize RF collector with currently persisted deployed nodes
+    get_rf_collector().update_deployed_nodes(list_nodes())
     # Non-blocking: SITL may not be up yet (or ever, in a pure-API test
     # run), and the rest of the API — area/coverage/candidates/missions —
     # doesn't depend on a vehicle link, so startup must not wait on it.
@@ -785,11 +787,10 @@ def api_rf_scan_upload():
         error=None,
     )
 
-    # Phase 3 — prepare the RF Survey Collector with the scan start position,
+    # Phase 4 — prepare the RF Survey Collector with the scan start position,
     # affected area, deployed nodes, and mission item counts.
-    # survey_wps occupy items 1..waypoint_count; item waypoint_count+1 = RETURN;
-    # item waypoint_count+2 = LAND.  Total items = waypoint_count + 3
-    # (TAKEOFF + survey_wps + RETURN + LAND).
+    # Total items = waypoint_count + 1 (TAKEOFF + survey_wps).
+    # Survey finishes at the final survey waypoint with no return-to-start or landing leg.
     deployed_nodes = list_nodes()
     rf_collector = get_rf_collector()
     rf_collector.prepare_scan(

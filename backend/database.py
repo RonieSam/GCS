@@ -99,6 +99,9 @@ def list_nodes():
     try:
         rows = conn.execute("SELECT id, lat, lon, coverage_radius_m FROM nodes").fetchall()
         return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        init_db()
+        return []
     finally:
         conn.close()
 
@@ -107,11 +110,19 @@ def insert_node(node_id: str, lat: float, lon: float, coverage_radius_m: float =
     """Insert or update a deployed communication node."""
     conn = get_connection()
     try:
-        conn.execute(
-            "INSERT OR REPLACE INTO nodes (id, lat, lon, coverage_radius_m) VALUES (?, ?, ?, ?)",
-            (node_id, lat, lon, coverage_radius_m),
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO nodes (id, lat, lon, coverage_radius_m) VALUES (?, ?, ?, ?)",
+                (node_id, lat, lon, coverage_radius_m),
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            init_db()
+            conn.execute(
+                "INSERT OR REPLACE INTO nodes (id, lat, lon, coverage_radius_m) VALUES (?, ?, ?, ?)",
+                (node_id, lat, lon, coverage_radius_m),
+            )
+            conn.commit()
         row = conn.execute("SELECT id, lat, lon, coverage_radius_m FROM nodes WHERE id = ?", (node_id,)).fetchone()
         return dict(row) if row else None
     finally:
@@ -122,9 +133,13 @@ def delete_node(node_id: str) -> bool:
     """Delete a deployed communication node by ID."""
     conn = get_connection()
     try:
-        cur = conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
-        conn.commit()
-        return cur.rowcount > 0
+        try:
+            cur = conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+            conn.commit()
+            return cur.rowcount > 0
+        except sqlite3.OperationalError:
+            init_db()
+            return False
     finally:
         conn.close()
 
@@ -133,8 +148,11 @@ def clear_nodes():
     """Remove all deployed communication nodes."""
     conn = get_connection()
     try:
-        conn.execute("DELETE FROM nodes")
-        conn.commit()
+        try:
+            conn.execute("DELETE FROM nodes")
+            conn.commit()
+        except sqlite3.OperationalError:
+            init_db()
     finally:
         conn.close()
 

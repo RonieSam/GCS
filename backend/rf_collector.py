@@ -33,10 +33,12 @@ Survey Samples Format:
 
 import copy
 import logging
+import math
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
+import config
 import coordinate_mapper
 from rf_model import calculate_node_rssi_vector
 
@@ -112,10 +114,26 @@ class RFSurveyCollector:
             )
 
     def update_deployed_nodes(self, deployed_nodes: List[Dict]) -> None:
-        """Dynamically update active deployed nodes list (called when nodes are added or deleted)."""
+        """Dynamically update active deployed nodes list.
+        
+        Synchronizes the collector node set with the database single source of truth.
+        Prunes any stale deleted-node RSSI keys from existing accumulated samples.
+        """
         with self._lock:
             self._deployed_nodes = [dict(n) for n in deployed_nodes]
-            logger.info(f"RF Collector deployed nodes updated: {len(self._deployed_nodes)} nodes.")
+            active_ids = {n.get("id") for n in self._deployed_nodes}
+
+            # Invalidate/prune stale deleted nodes from existing survey samples
+            for sample in self._samples:
+                if "rssi" in sample and isinstance(sample["rssi"], dict):
+                    pruned = {k: v for k, v in sample["rssi"].items() if k in active_ids}
+                    sample["rssi"] = pruned
+                    sample["best_rssi"] = round(max(pruned.values()), 2) if pruned else None
+
+            logger.info(
+                f"RF Collector deployed nodes updated: {len(self._deployed_nodes)} nodes. "
+                f"Active node IDs: {active_ids}"
+            )
 
     def start_scan(self) -> None:
         """Called when mission execution begins."""
@@ -125,17 +143,13 @@ class RFSurveyCollector:
             logger.info("RF Collector: SCANNING started.")
 
     def finish_survey_segment(self) -> None:
-        """Called when the last survey waypoint is reached and return leg begins."""
-        with self._lock:
-            if self._state == SCAN_STATE_SCANNING:
-                self._state = SCAN_STATE_RETURNING
-                logger.info(
-                    f"RF Collector: Survey path complete ({len(self._samples)} samples). "
-                    f"Transitioned to RETURNING."
-                )
+        """Called when the final survey waypoint is reached.
+        In Phase 4, scan completes directly without return-to-start leg.
+        """
+        self.complete_scan()
 
     def complete_scan(self) -> None:
-        """Called when UAV lands at original scan-start position."""
+        """Called when UAV completes the final survey waypoint."""
         with self._lock:
             self._state = SCAN_STATE_COMPLETE
             logger.info(
@@ -161,44 +175,36 @@ class RFSurveyCollector:
     def ingest_telemetry(self, vehicle_state: Dict) -> Optional[Dict]:
         """Ingest live vehicle telemetry.
 
-        If in SCANNING state, computes RSSI for all deployed nodes and stores a sample.
-        Also inspects mission progress to trigger RETURNING or SCAN_COMPLETE transitions.
+        If in SCANNING state, computes RSSI for all currently deployed nodes and stores a sample.
+        When the final survey waypoint is reached, transitions directly to SCAN_COMPLETE
+        and stops RSSI collection.
         """
         with self._lock:
             current_state = self._state
             survey_wps = self._survey_waypoint_count
-            total_items = self._total_mission_items
 
         m_reached = vehicle_state.get("mission_item_reached")
         m_current = vehicle_state.get("mission_current")
 
-        # Check for mission segment completion:
+        # Check for survey completion:
         # Survey waypoints occupy items 1 .. survey_wps.
-        # Item survey_wps + 1 is the RETURN waypoint.
-        # Item survey_wps + 2 is the LAND waypoint.
+        # Once item survey_wps is reached, survey is complete.
         if current_state == SCAN_STATE_SCANNING and survey_wps > 0:
-            if m_reached is not None and m_reached >= survey_wps:
-                self.finish_survey_segment()
-                current_state = SCAN_STATE_RETURNING
-            elif m_current is not None and m_current > survey_wps:
-                self.finish_survey_segment()
-                current_state = SCAN_STATE_RETURNING
-
-        if current_state == SCAN_STATE_RETURNING and total_items > 0:
-            if m_reached is not None and m_reached >= total_items - 1:
+            if (m_reached is not None and m_reached >= survey_wps) or \
+               (m_current is not None and m_current > survey_wps):
                 self.complete_scan()
                 current_state = SCAN_STATE_COMPLETE
 
         # ONLY accumulate survey samples while in SCANNING state.
-        # Do not accumulate when IDLE, SCAN_READY, RETURNING, or SCAN_COMPLETE.
+        # Do not accumulate when IDLE, SCAN_READY, SCAN_COMPLETE, or FAILED.
         if current_state != SCAN_STATE_SCANNING:
             return None
 
-        px4_lat = vehicle_state.get("latitude")
-        px4_lon = vehicle_state.get("longitude")
+        raw_lat = vehicle_state.get("latitude")
+        raw_lon = vehicle_state.get("longitude")
         alt = vehicle_state.get("altitude", 0.0)
 
-        if px4_lat is None or px4_lon is None:
+        if raw_lat is None or raw_lon is None:
             return None
 
         now = time.time()
@@ -208,12 +214,39 @@ class RFSurveyCollector:
             self._last_sample_time = now
             nodes = list(self._deployed_nodes)
 
-        # Convert coordinates to GCS reference frame for consistent mapping
+        # Coordinate resolution: ensure coordinates are correctly in GCS space
+        # without double-conversion regardless of whether raw PX4 or remapped GCS
+        # coordinates are supplied in vehicle_state.
         mapper = coordinate_mapper.get_mapper()
-        gcs_lat, gcs_lon = mapper.px4_to_gcs(px4_lat, px4_lon)
+        raw_lat_f = float(raw_lat)
+        raw_lon_f = float(raw_lon)
 
-        # Calculate simulated RSSI for each deployed communication node
-        # Nodes are deployed in GCS map coordinates, so calculate using GCS coords
+        if not config.SIMULATION_MODE:
+            gcs_lat, gcs_lon = raw_lat_f, raw_lon_f
+            px4_lat, px4_lon = raw_lat_f, raw_lon_f
+        else:
+            refs = mapper.get_references()
+            px4_ref = refs.get("px4_reference", {})
+            gcs_ref = refs.get("gcs_reference", {})
+            p_lat = px4_ref.get("latitude", config.PX4_REFERENCE_LAT)
+            p_lon = px4_ref.get("longitude", config.PX4_REFERENCE_LON)
+            g_lat = gcs_ref.get("latitude", config.GCS_REFERENCE_LAT)
+            g_lon = gcs_ref.get("longitude", config.GCS_REFERENCE_LON)
+
+            dist_to_gcs = math.hypot(raw_lat_f - g_lat, raw_lon_f - g_lon)
+            dist_to_px4 = math.hypot(raw_lat_f - p_lat, raw_lon_f - p_lon)
+
+            if dist_to_gcs < dist_to_px4:
+                # Already in GCS coordinate space
+                gcs_lat, gcs_lon = raw_lat_f, raw_lon_f
+                px4_lat, px4_lon = mapper.gcs_to_px4(gcs_lat, gcs_lon)
+            else:
+                # In PX4 simulation coordinate space
+                px4_lat, px4_lon = raw_lat_f, raw_lon_f
+                gcs_lat, gcs_lon = mapper.px4_to_gcs(px4_lat, px4_lon)
+
+        # Calculate simulated RSSI for each currently deployed communication node
+        # Uses strictly horizontal distance without altitude contamination
         rssi_dict = calculate_node_rssi_vector(
             uav_lat=gcs_lat,
             uav_lon=gcs_lon,
@@ -221,7 +254,7 @@ class RFSurveyCollector:
             deployed_nodes=nodes,
         )
 
-        best_rssi = max(rssi_dict.values()) if rssi_dict else -100.0
+        best_rssi = round(max(rssi_dict.values()), 2) if rssi_dict else None
 
         sample = {
             "sample_id": 0,  # assigned below under lock
@@ -232,7 +265,7 @@ class RFSurveyCollector:
             "px4_latitude": round(px4_lat, 7),
             "px4_longitude": round(px4_lon, 7),
             "rssi": rssi_dict,
-            "best_rssi": round(best_rssi, 2),
+            "best_rssi": best_rssi,
             "current_waypoint": m_current if m_current is not None else 0,
         }
 

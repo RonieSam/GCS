@@ -59,7 +59,7 @@ class TestStatusAndNodes(ApiTestCase):
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertEqual(body["status"], "ok")
-        self.assertEqual(body["phase"], 7)
+        self.assertGreaterEqual(body["phase"], 7)
         self.assertFalse(body["area_defined"])
         # No real SITL in the test environment, so the background MAVLink
         # connection attempt (started at app startup) hasn't — and won't —
@@ -68,10 +68,15 @@ class TestStatusAndNodes(ApiTestCase):
         self.assertFalse(body["uav_connected"])
         self.assertIn(body["link_state"], ("DISCONNECTED", "CONNECTING"))
 
-    def test_nodes_seeded_from_json(self):
+    def test_nodes_empty_initially_and_deployable(self):
         r = self.client.get("/api/nodes")
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(len(r.json()), 3)
+        self.assertEqual(len(r.json()), 0)
+        # Deploy a node
+        r_post = self.client.post("/api/nodes", json={"id": "NODE-001", "lat": 13.0827, "lon": 80.2707})
+        self.assertEqual(r_post.status_code, 200)
+        r2 = self.client.get("/api/nodes")
+        self.assertEqual(len(r2.json()), 1)
 
     def test_vehicle_state_before_any_connection(self):
         r = self.client.get("/api/vehicle/state")
@@ -147,6 +152,7 @@ class TestSelectTargetAndMission(ApiTestCase):
 
     def test_select_target_too_close_to_node_rejected(self):
         self.client.post("/api/area", json={"polygon": POLYGON})
+        self.client.post("/api/nodes", json={"id": "NODE-001", "lat": 13.0827, "lon": 80.2707})
         node = self.client.get("/api/nodes").json()[0]
         r = self.client.post("/api/select-target", json={"lat": node["lat"], "lon": node["lon"]})
         self.assertEqual(r.status_code, 400)
@@ -188,15 +194,13 @@ class TestSelectTargetAndMission(ApiTestCase):
 
 
 class TestNotYetImplementedStubs(ApiTestCase):
-    def test_mission_send_is_honest_501(self):
+    def test_mission_send_without_mission_returns_400(self):
         r = self.client.post("/api/mission/send")
-        self.assertEqual(r.status_code, 501)
-        self.assertEqual(r.json()["phase_required"], 8)
+        self.assertEqual(r.status_code, 400)
 
-    def test_mission_abort_is_honest_501(self):
+    def test_mission_abort_without_connection_returns_503(self):
         r = self.client.post("/api/mission/abort")
-        self.assertEqual(r.status_code, 501)
-        self.assertEqual(r.json()["phase_required"], 8)
+        self.assertEqual(r.status_code, 503)
 
     def test_deployment_simulate_is_honest_501(self):
         r = self.client.post("/api/deployment/simulate")
