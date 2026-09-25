@@ -905,7 +905,9 @@ async function startMission() {
   if (!state.missionUploaded) return;
 
   const btn = document.getElementById("btn-start-mission");
-  btn.disabled = true;
+  const rfStartBtn = document.getElementById("btn-start-rf-scan");
+  if (btn) btn.disabled = true;
+  if (rfStartBtn) rfStartBtn.disabled = true;
   document.getElementById("mission-hint").textContent = "Commanding PX4 into mission mode…";
   logEvent("Start Mission commanded.");
 
@@ -917,7 +919,8 @@ async function startMission() {
       const msg = body && body.detail ? body.detail : JSON.stringify(body);
       document.getElementById("mission-hint").textContent = `Start failed: ${msg}`;
       logEvent(`Start Mission failed: ${msg}`);
-      btn.disabled = false;
+      if (btn) btn.disabled = false;
+      if (rfStartBtn) rfStartBtn.disabled = false;
       return;
     }
 
@@ -925,7 +928,8 @@ async function startMission() {
       document.getElementById("mission-hint").textContent =
         `Start failed: ${body.error || "PX4 rejected mode change"}`;
       logEvent(`Start Mission rejected: ${body.error}`);
-      btn.disabled = false;
+      if (btn) btn.disabled = false;
+      if (rfStartBtn) rfStartBtn.disabled = false;
       return;
     }
 
@@ -937,13 +941,15 @@ async function startMission() {
     logEvent("PX4 entered MISSION mode — UAV executing mission.");
 
     // Disable Start while executing; Abort stays enabled.
-    btn.disabled = true;
+    if (btn) btn.disabled = true;
+    if (rfStartBtn) rfStartBtn.disabled = true;
     document.getElementById("btn-abort-mission").disabled = false;
 
   } catch (err) {
     document.getElementById("mission-hint").textContent = `Start error: ${err.message}`;
     logEvent(`Start Mission error: ${err.message}`);
-    btn.disabled = !state.missionUploaded;
+    if (btn) btn.disabled = !state.missionUploaded;
+    if (rfStartBtn) rfStartBtn.disabled = !state.missionUploaded;
   }
 }
 
@@ -1451,6 +1457,13 @@ function renderTelemetryPanel() {
       document.getElementById("stat-mission-state").textContent = "COMPLETED";
       document.getElementById("mission-hint").textContent =
         "Mission complete — UAV landed at target. Ready to Return to Home.";
+      if (state.rfScanState === "MISSION_UPLOADED") {
+        state.rfScanState = "COMPLETED";
+        const rfStateEl = document.getElementById("stat-rf-state");
+        if (rfStateEl) rfStateEl.textContent = "COMPLETED";
+        const rfHintEl = document.getElementById("rf-scan-hint");
+        if (rfHintEl) rfHintEl.textContent = "RF scan survey flight completed.";
+      }
       logEvent(`Mission COMPLETED — waypoint ${mreached} reached.`);
     }
   }
@@ -1614,12 +1627,19 @@ function clearRfScan() {
   if (linesEl) linesEl.textContent = "--";
   const distEl = document.getElementById("stat-rf-distance");
   if (distEl) distEl.textContent = "--";
+  const spacingEl = document.getElementById("stat-rf-spacing");
+  if (spacingEl) spacingEl.textContent = "--";
+  const altEl = document.getElementById("stat-rf-altitude");
+  if (altEl) altEl.textContent = "--";
   const container = document.getElementById("rf-waypoints-container");
   if (container) container.classList.add("hidden");
-  const list = document.getElementById("rf-waypoints-list");
-  if (list) list.innerHTML = "";
   const hintEl = document.getElementById("rf-scan-hint");
   if (hintEl) hintEl.textContent = "Define an affected area, then click RF SCAN to generate a survey path.";
+
+  const uploadBtn = document.getElementById("btn-upload-rf-scan");
+  if (uploadBtn) uploadBtn.disabled = true;
+  const startBtn = document.getElementById("btn-start-rf-scan");
+  if (startBtn) startBtn.disabled = true;
 }
 
 function renderRfScanPath(waypoints) {
@@ -1727,40 +1747,129 @@ async function handleRfScan() {
     if (wpEl) wpEl.textContent = data.waypoint_count;
     const linesEl = document.getElementById("stat-rf-lines");
     if (linesEl) linesEl.textContent = data.line_count;
+    // Format distance: show km when >= 1000 m, otherwise metres.
+    const distM = data.total_distance_m;
+    const distFormatted = distM >= 1000
+      ? `${(distM / 1000).toFixed(2)} km`
+      : `${distM.toFixed(1)} m`;
     const distEl = document.getElementById("stat-rf-distance");
-    if (distEl) distEl.textContent = `${data.total_distance_m} m`;
+    if (distEl) distEl.textContent = distFormatted;
+    const spacingEl = document.getElementById("stat-rf-spacing");
+    if (spacingEl) spacingEl.textContent = `${data.spacing_m} m`;
+    const altEl = document.getElementById("stat-rf-altitude");
+    if (altEl) altEl.textContent = `${data.altitude_m} m`;
 
-    // Render path on map
+    // Render path on map — full path stays visible.
     renderRfScanPath(data.waypoints);
 
-    // Populate waypoint inspection list
+    // Show compact summary card instead of a full waypoint list.
     const container = document.getElementById("rf-waypoints-container");
-    const list = document.getElementById("rf-waypoints-list");
     const summary = document.getElementById("rf-waypoints-summary");
-
-    if (container && list) {
+    if (container) {
       container.classList.remove("hidden");
-      if (summary) summary.textContent = `${data.waypoint_count} waypoints, ${data.line_count} lines`;
-
-      list.innerHTML = data.waypoints.map(wp => `
-        <div class="rf-wp-item">
-          <span class="rf-wp-seq">WP #${wp.seq} (L${wp.line_idx + 1})</span>
-          <span class="rf-wp-coords">${wp.lat.toFixed(5)}, ${wp.lon.toFixed(5)} [${wp.alt}m]</span>
-        </div>
-      `).join("");
+      if (summary) {
+        summary.innerHTML =
+          `<div class="rf-summary-row"><span class="rf-summary-label">Waypoints</span><span class="rf-summary-value">${data.waypoint_count}</span></div>` +
+          `<div class="rf-summary-row"><span class="rf-summary-label">Survey Lines</span><span class="rf-summary-value">${data.line_count}</span></div>` +
+          `<div class="rf-summary-row"><span class="rf-summary-label">Spacing</span><span class="rf-summary-value">${data.spacing_m} m</span></div>` +
+          `<div class="rf-summary-row"><span class="rf-summary-label">Altitude</span><span class="rf-summary-value">${data.altitude_m} m</span></div>` +
+          `<div class="rf-summary-row"><span class="rf-summary-label">Est. Distance</span><span class="rf-summary-value">${distFormatted}</span></div>`;
+      }
     }
+
+    // Enable Upload button now that a valid mission exists.
+    const uploadBtn = document.getElementById("btn-upload-rf-scan");
+    if (uploadBtn) uploadBtn.disabled = false;
+    const startBtn = document.getElementById("btn-start-rf-scan");
+    if (startBtn) startBtn.disabled = true; // stays disabled until uploaded
 
     if (hintEl) {
-      hintEl.textContent = `Survey path generated (${data.waypoint_count} WPs, ${data.line_count} lines, ${data.total_distance_m}m).`;
+      hintEl.textContent =
+        `Survey path generated — ${data.waypoint_count} waypoints, ${data.line_count} lines.` +
+        ` Path visible on map. Click Upload RF Scan to send to PX4.`;
     }
     logEvent(
-      `RF survey mission generated: ${data.waypoint_count} waypoints across ${data.line_count} lines, total dist ${data.total_distance_m}m.`
+      `RF survey mission generated: ${data.waypoint_count} waypoints across ` +
+      `${data.line_count} lines, total dist ${distFormatted}.`
     );
   } catch (err) {
     if (hintEl) hintEl.textContent = `Error: ${err.message}`;
     logEvent(`RF SCAN generation failed: ${err.message}`);
   } finally {
     if (btn) btn.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — RF Scan Upload (reuses existing /api/mission/start via mav_manager)
+// ---------------------------------------------------------------------------
+
+async function uploadRfScanMission() {
+  if (!state.rfScanMission) {
+    logEvent("RF SCAN upload rejected: no mission generated yet.");
+    return;
+  }
+
+  const uploadBtn = document.getElementById("btn-upload-rf-scan");
+  const startBtn  = document.getElementById("btn-start-rf-scan");
+  const hintEl    = document.getElementById("rf-scan-hint");
+  const stateEl   = document.getElementById("stat-rf-state");
+
+  if (uploadBtn) uploadBtn.disabled = true;
+  if (startBtn)  startBtn.disabled  = true;
+  if (stateEl)   stateEl.textContent = "UPLOADING";
+  if (hintEl)    hintEl.textContent  = "Uploading RF scan mission to PX4…";
+  logEvent("RF scan mission upload started.");
+
+  try {
+    const result = await apiPost("/api/rf-scan/upload", {});
+    const body   = result.body;
+
+    if (result.status === 503) {
+      const msg = body && body.detail ? body.detail : "PX4 not connected";
+      if (stateEl) stateEl.textContent = "FAILED";
+      if (hintEl)  hintEl.textContent  = `Upload failed: ${msg}`;
+      logEvent(`RF scan upload failed: ${msg}`);
+      if (uploadBtn) uploadBtn.disabled = false;
+      return;
+    }
+
+    if (!body.success) {
+      if (stateEl) stateEl.textContent = "FAILED";
+      if (hintEl)  hintEl.textContent  = `Upload failed: ${body.error || body.status}`;
+      logEvent(`RF scan upload failed: ${body.error || body.status}`);
+      if (uploadBtn) uploadBtn.disabled = false;
+      return;
+    }
+
+    // PX4 accepted the survey mission.
+    state.rfScanState   = "MISSION_UPLOADED";
+    // Signal the existing startMission() gate (it checks state.missionUploaded).
+    state.missionUploaded   = true;
+    state.missionExecuting  = false;
+    state.lastMissionItems  = body.items;
+
+    if (stateEl) stateEl.textContent = "UPLOADED";
+    if (hintEl)  hintEl.textContent  =
+      `RF scan mission uploaded (${body.items} items). ` +
+      `Arm vehicle then click START RF SCAN.`;
+    logEvent(`RF scan mission uploaded — ${body.items} items accepted by PX4.`);
+
+    // Enable Start; keep Upload enabled (re-upload is allowed).
+    if (uploadBtn) uploadBtn.disabled = false;
+    if (startBtn)  startBtn.disabled  = false;
+
+    // Keep Mission panel upload status in sync so telemetry WP display works.
+    document.getElementById("stat-mission-state").textContent  = "UPLOADED";
+    document.getElementById("stat-upload-status").textContent  = "UPLOADED";
+    document.getElementById("stat-px4-ack").textContent        = "ACCEPTED";
+    document.getElementById("stat-mission-items").textContent  = `${body.items} items`;
+
+  } catch (err) {
+    if (stateEl) stateEl.textContent = "FAILED";
+    if (hintEl)  hintEl.textContent  = `Upload error: ${err.message}`;
+    logEvent(`RF scan upload error: ${err.message}`);
+    if (uploadBtn) uploadBtn.disabled = false;
   }
 }
 
@@ -1797,6 +1906,10 @@ function initControls() {
   // RF Scan Survey (Phase 2)
   const rfScanBtn = document.getElementById("btn-rf-scan");
   if (rfScanBtn) rfScanBtn.addEventListener("click", handleRfScan);
+  const uploadRfBtn = document.getElementById("btn-upload-rf-scan");
+  if (uploadRfBtn) uploadRfBtn.addEventListener("click", uploadRfScanMission);
+  const startRfBtn = document.getElementById("btn-start-rf-scan");
+  if (startRfBtn) startRfBtn.addEventListener("click", startMission);
 }
 
 // ---------------------------------------------------------------------------

@@ -98,7 +98,6 @@
         </div>
       </div>
 
-      <!-- RF Scan Survey panel — Phase 2 -->
       <div class="panel" id="panel-rf-scan">
         <h2 class="panel-title">RF Scan Survey</h2>
 
@@ -133,17 +132,22 @@
             <span class="stat-value" id="stat-rf-lines">--</span>
           </div>
           <div class="stat">
+            <span class="stat-label">Spacing</span>
+            <span class="stat-value" id="stat-rf-spacing">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Altitude</span>
+            <span class="stat-value" id="stat-rf-altitude">--</span>
+          </div>
+          <div class="stat">
             <span class="stat-label">Est. Distance</span>
             <span class="stat-value" id="stat-rf-distance">--</span>
           </div>
         </div>
 
+        <!-- Compact scan summary (replaces the full waypoint list) -->
         <div id="rf-waypoints-container" class="rf-waypoints-container hidden" style="margin-top:10px">
-          <div style="font-size:11px; font-weight:600; color:#8FA0B5; margin-bottom:4px; display:flex; justify-content:space-between;">
-            <span>SURVEY WAYPOINTS</span>
-            <span id="rf-waypoints-summary">0 points</span>
-          </div>
-          <div id="rf-waypoints-list" class="rf-waypoints-scroll"></div>
+          <div id="rf-waypoints-summary"></div>
         </div>
 
         <div class="btn-row" style="margin-top:10px">
@@ -350,6 +354,6 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-<script src="app.js?v=11"></script>
+<script src="app.js?v=12"></script>
 </body>
 </html>
