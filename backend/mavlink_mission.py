@@ -97,6 +97,97 @@ _CMD_WAYPOINT  = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
 _CMD_LAND      = mavutil.mavlink.MAV_CMD_NAV_LAND
 
 
+def build_survey_mission_items(px4_waypoints, home_lat, home_lon):
+    """Build a PX4 MAVLink mission for an RF scan survey path.
+
+    Constructs a mission with:
+      Item 0  — TAKEOFF from home to survey altitude.
+      Items 1…N — NAV_WAYPOINT for each survey waypoint (PX4 coordinates).
+      Item N+1 — LAND at the last survey waypoint.
+
+    Args:
+        px4_waypoints (list[dict]): Survey waypoints already converted to PX4
+                                    coordinates (seq, lat, lon, alt, line_idx).
+        home_lat (float): PX4 home latitude (for TAKEOFF item).
+        home_lon (float): PX4 home longitude (for TAKEOFF item).
+
+    Returns:
+        list[dict]: Mission items ready for upload_mission().
+
+    Raises:
+        InvalidMission: If px4_waypoints is empty or coordinates invalid.
+    """
+    if not px4_waypoints:
+        raise InvalidMission("Cannot build a survey mission with zero waypoints.")
+
+    alt = px4_waypoints[0]["alt"]
+    if alt <= 0:
+        raise InvalidMission(f"Survey altitude must be positive (got {alt}m).")
+
+    for wp in px4_waypoints:
+        if not (-90 <= wp["lat"] <= 90):
+            raise InvalidMission(f"Survey waypoint latitude {wp['lat']} out of range.")
+        if not (-180 <= wp["lon"] <= 180):
+            raise InvalidMission(f"Survey waypoint longitude {wp['lon']} out of range.")
+
+    common = dict(
+        frame        = _FRAME_GLOBAL_RELATIVE_ALT,
+        autocontinue = 1,
+        param1       = 0.0,
+        param2       = 0.0,
+        param3       = 0.0,
+        param4       = 0.0,
+    )
+
+    items = []
+
+    # Item 0: TAKEOFF from PX4 home to survey altitude.
+    items.append({
+        **common,
+        "seq"     : 0,
+        "command" : _CMD_TAKEOFF,
+        "current" : 1,
+        "param1"  : 0.0,
+        "lat"     : home_lat,
+        "lon"     : home_lon,
+        "alt"     : alt,
+    })
+
+    # Items 1…N: Survey NAV_WAYPOINT items.
+    for i, wp in enumerate(px4_waypoints):
+        items.append({
+            **common,
+            "seq"     : i + 1,
+            "command" : _CMD_WAYPOINT,
+            "current" : 0,
+            "param1"  : 0.0,   # hold time (s)
+            "param2"  : 2.0,   # acceptance radius (m)
+            "lat"     : wp["lat"],
+            "lon"     : wp["lon"],
+            "alt"     : wp["alt"],
+        })
+
+    # Last item: LAND at the final survey waypoint position.
+    last_wp = px4_waypoints[-1]
+    items.append({
+        **common,
+        "seq"     : len(px4_waypoints) + 1,
+        "command" : _CMD_LAND,
+        "current" : 0,
+        "param1"  : 0.0,
+        "param2"  : 0.0,
+        "lat"     : last_wp["lat"],
+        "lon"     : last_wp["lon"],
+        "alt"     : 0.0,
+    })
+
+    # Re-sequence to guarantee contiguous indices after building.
+    for idx, item in enumerate(items):
+        item["seq"] = idx
+
+    return items
+
+
 def build_mission_items(target_lat, target_lon, target_alt_m, home_lat, home_lon):
     """Build a minimal two-item MAVLink mission targeting one waypoint.
 

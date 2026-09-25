@@ -582,6 +582,144 @@ def api_rf_scan_state():
     }
 
 
+@app.post("/api/rf-scan/upload", response_model=MissionUploadResponse)
+def api_rf_scan_upload():
+    """Upload the generated RF scan survey mission to PX4 via MAVLink.
+
+    Reuses the identical upload pathway as /api/mission/send. The RF scan
+    waypoints (already in PX4 coordinate space) are assembled into a valid
+    PX4 mission: TAKEOFF → survey waypoints → LAND. On success the
+    mav_manager upload state is set to UPLOADED so /api/mission/start can
+    immediately start the scan without any additional state hacks.
+
+    Prerequisites:
+        - RF scan must have been generated (MISSION_GENERATED state).
+        - PX4 must be connected.
+    """
+    rf_mission = session_state.get("rf_scan_mission")
+    if not rf_mission:
+        raise HTTPException(
+            400,
+            "No RF scan mission has been generated yet. "
+            "POST /api/rf-scan/generate first.",
+        )
+
+    if session_state.get("rf_scan_state") not in (
+        "MISSION_GENERATED", "MISSION_UPLOADED", "FAILED"
+    ):
+        raise HTTPException(
+            400,
+            f"RF scan is in state {session_state['rf_scan_state']!r} — "
+            "generate a scan first.",
+        )
+
+    px4_waypoints = rf_mission.get("px4_waypoints")
+    if not px4_waypoints:
+        raise HTTPException(400, "RF scan mission has no PX4 waypoints.")
+
+    # Obtain the PX4 home position (needed for the TAKEOFF item).
+    mapper = coordinate_mapper.get_mapper()
+    refs = mapper.get_references()
+    px4_ref = refs.get("px4_reference", {})
+    home_lat = px4_ref.get("latitude")
+    home_lon = px4_ref.get("longitude")
+
+    if home_lat is None or home_lon is None:
+        raise HTTPException(
+            400,
+            "PX4 home/reference coordinate is not available. "
+            "Start PX4 SITL and wait for a heartbeat.",
+        )
+
+    # Build the MAVLink mission items (same schema as build_mission_items()).
+    try:
+        items = mavlink_mission.build_survey_mission_items(
+            px4_waypoints=px4_waypoints,
+            home_lat=home_lat,
+            home_lon=home_lon,
+        )
+    except mavlink_mission.InvalidMission as e:
+        raise HTTPException(400, str(e))
+
+    if not mav_manager.is_connected():
+        raise HTTPException(
+            503,
+            "PX4 is not connected. Start PX4 SITL and wait for a heartbeat.",
+        )
+
+    session_state["rf_scan_state"] = "UPLOADING"
+
+    logger.info(
+        f"RF scan upload started: {len(items)} items "
+        f"({rf_mission['waypoint_count']} survey waypoints)"
+    )
+
+    try:
+        result = mav_manager.send_command(
+            "upload_mission",
+            items=items,
+            timeout_s=config.MISSION_UPLOAD_TIMEOUT_S,
+        )
+        n = result["items"]
+
+    except mavlink_mission.MissionTimeout as e:
+        session_state["rf_scan_state"] = "FAILED"
+        return MissionUploadResponse(
+            success=False,
+            status="timeout",
+            items=0,
+            error=str(e),
+        )
+
+    except mavlink_mission.MissionRejected as e:
+        session_state["rf_scan_state"] = "FAILED"
+        return MissionUploadResponse(
+            success=False,
+            status="rejected",
+            items=0,
+            error=str(e),
+        )
+
+    except mavlink_mission.MissionUploadError as e:
+        session_state["rf_scan_state"] = "FAILED"
+        return MissionUploadResponse(
+            success=False,
+            status="failed",
+            items=0,
+            error=str(e),
+        )
+
+    except RuntimeError as e:
+        session_state["rf_scan_state"] = "FAILED"
+        return MissionUploadResponse(
+            success=False,
+            status="disconnected",
+            items=0,
+            error=str(e),
+        )
+
+    # PX4 accepted the survey mission.
+    session_state["rf_scan_state"] = "MISSION_UPLOADED"
+
+    # Set the MAVLink manager's upload state to UPLOADED so the shared
+    # /api/mission/start endpoint (which checks this state) is immediately
+    # usable for starting the RF scan, exactly as it is for normal missions.
+    mav_manager.set_mission_upload_state(
+        status="UPLOADED",
+        mission_id=None,
+        items=n,
+        error=None,
+    )
+
+    logger.info(f"RF scan mission uploaded: {n} items accepted by PX4.")
+
+    return MissionUploadResponse(
+        success=True,
+        status="uploaded",
+        items=n,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Candidate generation + scoring
 # ---------------------------------------------------------------------------
