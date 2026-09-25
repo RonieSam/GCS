@@ -88,3 +88,50 @@ Thumbs.db
 *.db
 *.sqlite
 *.sqlite3
+# MATLAB
+*.asv
+*.autosave
+
+# Simulink cache / generated files
+*.slxc
+*.slxc~
+slprj/
+sccprj/
+codegen/
+*_ert_rtw/
+*_grt_rtw/
+*_model_rtw/
+*_rtw/
+*.mex*
+*.pdb
+
+# MATLAB generated folders
+html/
+private/
+
+# Simulink generated files
+*.log
+*.jou
+
+# MATLAB preferences
+matlab.prf
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / editor files
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+

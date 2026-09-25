@@ -1,0 +1,44 @@
+# Simulink models are binary files
+*.slx binary
+*.mdl binary
+
+# Simulink libraries
+*.slx binary
+
+# MATLAB files are text and should be diffable
+*.m text diff=matlab
+*.mlx binary
+
+# MATLAB data files
+*.mat binary
+
+# MATLAB project files
+*.prj text
+
+# Configuration/code generation files
+*.json text
+*.xml text
+*.yaml text
+*.yml text
+
+# Prevent unwanted line-ending conversion
+*.m text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.csv text eol=lf
+
+# Images / binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.bmp binary
+
+# Archives
+*.zip binary
+*.tar binary
+*.gz binary
+
+# Windows-specific files
+*.exe binary
+*.dll binary
