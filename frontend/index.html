@@ -69,6 +69,91 @@
         </div>
       </div>
 
+      <!-- Node Deployment panel — Phase 1 -->
+      <div class="panel" id="panel-node-deploy">
+        <h2 class="panel-title">Node Deployment</h2>
+
+        <p class="hint" id="deploy-hint">
+          Click the map or select a candidate to set a deployment location.
+        </p>
+
+        <div class="deploy-location-row" id="deploy-location-display">
+          <span class="stat-label">Selected Location</span>
+          <span class="stat-value font-data" id="deploy-location-text">None</span>
+        </div>
+
+        <button id="btn-auto-deploy" class="btn btn-block btn-deploy" disabled>
+          &#x1F4E1; AUTO DEPLOY
+        </button>
+
+        <div class="stat-grid" style="margin-top:10px">
+          <div class="stat">
+            <span class="stat-label">Deployed Nodes</span>
+            <span class="stat-value" id="stat-deployed-count">0</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Source</span>
+            <span class="stat-value" id="stat-deploy-source">--</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- RF Scan Survey panel — Phase 2 -->
+      <div class="panel" id="panel-rf-scan">
+        <h2 class="panel-title">RF Scan Survey</h2>
+
+        <div class="field-row">
+          <label class="field-label" for="scan-spacing">Line Spacing (m)</label>
+          <input type="number" id="scan-spacing" class="field-input" value="25" min="5" max="200" step="5">
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="scan-alt">Survey Altitude (m)</label>
+          <input type="number" id="scan-alt" class="field-input" value="15" min="1" max="100">
+        </div>
+
+        <button id="btn-rf-scan" class="btn btn-block btn-primary">
+          &#x1F4E1; RF SCAN
+        </button>
+
+        <p class="hint" id="rf-scan-hint">
+          Define an affected area, then click RF SCAN to generate a survey path.
+        </p>
+
+        <div class="stat-grid" style="margin-top:10px">
+          <div class="stat">
+            <span class="stat-label">Scan State</span>
+            <span class="stat-value" id="stat-rf-state">IDLE</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Waypoints</span>
+            <span class="stat-value" id="stat-rf-waypoints">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Survey Lines</span>
+            <span class="stat-value" id="stat-rf-lines">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Est. Distance</span>
+            <span class="stat-value" id="stat-rf-distance">--</span>
+          </div>
+        </div>
+
+        <div id="rf-waypoints-container" class="rf-waypoints-container hidden" style="margin-top:10px">
+          <div style="font-size:11px; font-weight:600; color:#8FA0B5; margin-bottom:4px; display:flex; justify-content:space-between;">
+            <span>SURVEY WAYPOINTS</span>
+            <span id="rf-waypoints-summary">0 points</span>
+          </div>
+          <div id="rf-waypoints-list" class="rf-waypoints-scroll"></div>
+        </div>
+
+        <div class="btn-row" style="margin-top:10px">
+          <button id="btn-upload-rf-scan" class="btn btn-block" disabled>Upload RF Scan</button>
+        </div>
+        <div class="btn-row">
+          <button id="btn-start-rf-scan" class="btn btn-block btn-primary" disabled>&#9654; START RF SCAN</button>
+        </div>
+      </div>
+
       <div class="panel" id="panel-recommended">
         <h2 class="panel-title">Recommended Locations</h2>
         <p class="not-yet" id="recommended-empty">Analyze an area to generate and score candidate deployment sites.</p>
@@ -265,6 +350,6 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-<script src="app.js?v=10"></script>
+<script src="app.js?v=11"></script>
 </body>
 </html>

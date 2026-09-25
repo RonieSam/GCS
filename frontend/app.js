@@ -29,7 +29,24 @@ const state = {
   drawLine: null,           // Leaflet polyline connecting points while drawing
   areaPolygon: null,        // Leaflet polygon once the area is finished
   areaClosed: false,        // true once the polygon has been finished
-  nodes: [],                // loaded node data
+
+  // Phase 1 — node state
+  // availableNodes: node definitions loaded from the backend (inventory).
+  //   These are NOT drawn until the operator presses AUTO DEPLOY INITIAL NODES.
+  // deployedNodes:  nodes that have been logically placed on the map.
+  //   Starts empty. Grows when the operator deploys nodes (initial or new).
+  // nodeLayerGroup: Leaflet LayerGroup holding all deployed-node markers/rings.
+  //   Using a LayerGroup means we can add to it later without touching existing
+  //   markers (Node 1-3 stay when Node 4 is added).
+  availableNodes: [],       // node definitions fetched from /api/nodes
+  deployedNodes: [],        // nodes actually rendered on the map
+  nodeLayerGroup: null,     // Leaflet LayerGroup for deployed-node markers
+
+  // Node deployment selection — single source of truth for what AUTO DEPLOY will place.
+  // selectedDeploymentLocation: {lat, lon, source} where source = 'map' | 'candidate'
+  // deploymentSelectionMarker: temporary Leaflet marker shown while location is chosen
+  selectedDeploymentLocation: null,
+  deploymentSelectionMarker: null,
 
   gapLayer: null,           // LayerGroup of (downsampled) gap-point dots
   coveredLayer: null,       // LayerGroup of (downsampled) covered-point dots
@@ -66,6 +83,11 @@ const state = {
     sendTimer: null,        // setInterval handle for 20 Hz velocity loop
     lastLogError: 0,        // throttle console error spam from velocity POST failures
   },
+
+  // Phase 2 — RF scan survey
+  rfScanState: "IDLE",       // IDLE | MISSION_GENERATED | MISSION_UPLOADED | RUNNING | COMPLETED | FAILED
+  rfScanLayer: null,         // Leaflet LayerGroup for the survey path and waypoints
+  rfScanMission: null,       // Last generated survey result object
 };
 
 // A message every ~1/MAVLINK stream rate is expected; if nothing arrives
@@ -184,48 +206,171 @@ function enableFallbackBasemap() {
 // Node display (loaded from the backend, which seeds from data/nodes.json)
 // ---------------------------------------------------------------------------
 
+/**
+ * loadNodes — fetches node definitions from the backend and stores them
+ * in state.availableNodes.  Does NOT draw anything on the map.
+ * Returns the list so boot() can use it to centre the map.
+ */
 async function loadNodes() {
   try {
-    state.nodes = await apiGet(NODES_URL);
+    state.availableNodes = await apiGet(NODES_URL);
   } catch (err) {
     logEvent(`Could not load nodes from ${NODES_URL} (${err.message}) — using built-in fallback nodes.`);
-    state.nodes = [
+    state.availableNodes = [
       { id: "NODE-001", lat: 13.0827, lon: 80.2707, coverage_radius_m: 250 },
       { id: "NODE-002", lat: 13.0891, lon: 80.2785, coverage_radius_m: 250 },
       { id: "NODE-003", lat: 13.0774, lon: 80.2812, coverage_radius_m: 250 },
     ];
   }
-  return state.nodes;
+  return state.availableNodes;
 }
 
-function drawNodes(nodes) {
-  nodes.forEach((node) => {
-    const marker = L.circleMarker([node.lat, node.lon], {
-      radius: 6,
-      color: "#3FDA7F",
-      fillColor: "#3FDA7F",
-      fillOpacity: 0.9,
-      weight: 2,
-    }).addTo(map);
+/**
+ * addDeployedNode — renders a single node onto the shared nodeLayerGroup
+ * and appends it to state.deployedNodes.
+ *
+ * Using this helper (rather than drawing directly to `map`) means:
+ *   - Every deployed node lives in the same LayerGroup, so we can
+ *     add Node 4 later without touching Node 1-3 markers.
+ *   - state.deployedNodes is the single source of truth for what is shown.
+ */
+function addDeployedNode(node) {
+  // Ensure the shared layer group exists
+  if (!state.nodeLayerGroup) {
+    state.nodeLayerGroup = L.layerGroup().addTo(map);
+  }
 
-    marker.bindTooltip(node.id, {
-      permanent: true,
-      direction: "top",
-      offset: [0, -6],
-      className: "node-label",
-    });
+  const marker = L.circleMarker([node.lat, node.lon], {
+    radius: 6,
+    color: "#3FDA7F",
+    fillColor: "#3FDA7F",
+    fillOpacity: 0.9,
+    weight: 2,
+  }).addTo(state.nodeLayerGroup);
 
-    L.circle([node.lat, node.lon], {
-      radius: node.coverage_radius_m,
-      color: "#3FDA7F",
-      weight: 1,
-      fillColor: "#3FDA7F",
-      fillOpacity: 0.08,
-      dashArray: "4 4",
-    }).addTo(map);
+  marker.bindTooltip(node.id, {
+    permanent: true,
+    direction: "top",
+    offset: [0, -6],
+    className: "node-label",
   });
 
-  document.getElementById("stat-nodes").textContent = nodes.length;
+  L.circle([node.lat, node.lon], {
+    radius: node.coverage_radius_m,
+    color: "#3FDA7F",
+    weight: 1,
+    fillColor: "#3FDA7F",
+    fillOpacity: 0.08,
+    dashArray: "4 4",
+  }).addTo(state.nodeLayerGroup);
+
+  state.deployedNodes.push(node);
+}
+
+/**
+ * selectDeploymentLocation — single shared entry point for setting the
+ * pending deployment location, regardless of whether it came from a direct
+ * map click or a candidate selection.
+ *
+ * @param {number} lat
+ * @param {number} lon
+ * @param {'map'|'candidate'} source  - for display/logging only
+ */
+function selectDeploymentLocation(lat, lon, source) {
+  state.selectedDeploymentLocation = { lat, lon, source };
+
+  // Show / move the temporary selection marker (cyan crosshair ring)
+  if (state.deploymentSelectionMarker) {
+    state.deploymentSelectionMarker.setLatLng([lat, lon]);
+  } else {
+    state.deploymentSelectionMarker = L.circleMarker([lat, lon], {
+      radius: 10,
+      color: "#00E5FF",
+      fillColor: "#00E5FF",
+      fillOpacity: 0.18,
+      weight: 2.5,
+      dashArray: "4 3",
+    }).addTo(map);
+  }
+
+  // Bind a tooltip so the operator can see the coords at a glance
+  state.deploymentSelectionMarker.bindTooltip(
+    `Deploy here (${source})`,
+    { direction: "top", offset: [0, -10], className: "node-label" }
+  ).openTooltip();
+
+  // Update the Node Deployment panel
+  const locText = document.getElementById("deploy-location-text");
+  if (locText) locText.textContent = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+
+  const srcEl = document.getElementById("stat-deploy-source");
+  if (srcEl) srcEl.textContent = source.toUpperCase();
+
+  const hintEl = document.getElementById("deploy-hint");
+  if (hintEl) hintEl.textContent = "Location selected — press AUTO DEPLOY to place a node here.";
+
+  const deployBtn = document.getElementById("btn-auto-deploy");
+  if (deployBtn) deployBtn.disabled = false;
+
+  logEvent(`Deployment location selected (${source}): lat=${lat.toFixed(5)}, lon=${lon.toFixed(5)}`);
+}
+
+// Running counter for deployed-node IDs (session-scoped, starts at 1)
+let _deployNodeSeq = 0;
+
+/**
+ * autoDeploy — creates a new logical communication node at
+ * state.selectedDeploymentLocation and renders it on the map.
+ *
+ * This is the single deployment path for both map-click and candidate-select.
+ * It does NOT touch the UAV marker, the mission system, or existing nodes.
+ */
+function autoDeploy() {
+  if (!state.selectedDeploymentLocation) {
+    logEvent("AUTO DEPLOY: no location selected. Click the map or pick a candidate first.");
+    return;
+  }
+
+  const { lat, lon } = state.selectedDeploymentLocation;
+  _deployNodeSeq++;
+  const nodeId = `COMM-${String(_deployNodeSeq).padStart(3, "0")}`;
+
+  // Standard coverage radius — same as existing nodes
+  const node = { id: nodeId, lat, lon, coverage_radius_m: 250 };
+  addDeployedNode(node);
+
+  // Remove the temporary selection marker now that the node is permanent
+  if (state.deploymentSelectionMarker) {
+    map.removeLayer(state.deploymentSelectionMarker);
+    state.deploymentSelectionMarker = null;
+  }
+
+  // Clear the selection state
+  state.selectedDeploymentLocation = null;
+
+  // Update stat counters
+  const countEl = document.getElementById("stat-deployed-count");
+  if (countEl) countEl.textContent = state.deployedNodes.length;
+
+  // Also keep the legacy "Existing Nodes" stat in Area Planning in sync
+  const nodesEl = document.getElementById("stat-nodes");
+  if (nodesEl) nodesEl.textContent = state.deployedNodes.length;
+
+  // Reset the Node Deployment panel
+  const locText = document.getElementById("deploy-location-text");
+  if (locText) locText.textContent = "None";
+  const srcEl = document.getElementById("stat-deploy-source");
+  if (srcEl) srcEl.textContent = "--";
+  const hintEl = document.getElementById("deploy-hint");
+  if (hintEl) hintEl.textContent = "Click the map or select a candidate to set a deployment location.";
+
+  const deployBtn = document.getElementById("btn-auto-deploy");
+  if (deployBtn) deployBtn.disabled = true;
+
+  logEvent(
+    `AUTO DEPLOY: node ${nodeId} deployed at lat=${lat.toFixed(5)}, lon=${lon.toFixed(5)}. ` +
+    `Total deployed: ${state.deployedNodes.length}.`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -233,23 +378,27 @@ function drawNodes(nodes) {
 // ---------------------------------------------------------------------------
 
 function onMapClick(e) {
-  if (!state.drawing) return;
-
   const { lat, lng } = e.latlng;
 
-  // Clicking near the first vertex closes the polygon, same as "Finish Area".
-  if (state.points.length >= 3) {
-    const first = state.vertexMarkers[0];
-    const firstPoint = first.getLatLng();
-    const distPx = map.latLngToContainerPoint(firstPoint)
-      .distanceTo(map.latLngToContainerPoint(e.latlng));
-    if (distPx < 14) {
-      finishArea();
-      return;
+  // ── Drawing mode: add polygon vertex ────────────────────────────────────
+  if (state.drawing) {
+    // Clicking near the first vertex closes the polygon, same as "Finish Area".
+    if (state.points.length >= 3) {
+      const first = state.vertexMarkers[0];
+      const firstPoint = first.getLatLng();
+      const distPx = map.latLngToContainerPoint(firstPoint)
+        .distanceTo(map.latLngToContainerPoint(e.latlng));
+      if (distPx < 14) {
+        finishArea();
+        return;
+      }
     }
+    addVertex(lat, lng);
+    return;
   }
 
-  addVertex(lat, lng);
+  // ── Idle / non-drawing: select a deployment location ───────────────────
+  selectDeploymentLocation(lat, lng, "map");
 }
 
 function addVertex(lat, lng) {
@@ -372,6 +521,7 @@ function clearArea() {
   clearAnalysisOverlays();
   clearRecommendedPanel();
   clearMissionPanel();
+  clearRfScan();
 
   setDrawingState("IDLE");
   logEvent("Affected area cleared.");
@@ -505,6 +655,12 @@ function renderCandidates(candidates, top) {
       className: "node-label",
     });
 
+    // Clicking a candidate marker selects it as a deployment location
+    marker.on("click", (ev) => {
+      L.DomEvent.stopPropagation(ev); // don't also fire onMapClick
+      selectDeploymentLocation(c.lat, c.lon, "candidate");
+    });
+
     if (isTop) {
       state.topMarkers[candidateKey(c)] = marker;
     }
@@ -530,11 +686,22 @@ function renderRecommendedPanel(top) {
         <span>Coverage +${c.coverage_improvement_pct.toFixed(1)}pp</span>
         <span>${c.distance_to_home_m.toFixed(0)}m from home</span>
       </div>
-      <button class="btn btn-block btn-select" data-key="${candidateKey(c)}">Select ${label}</button>
+      <div class="btn-row">
+        <button class="btn btn-select" data-key="${candidateKey(c)}">&#x1F3AF; Select ${label}</button>
+        <button class="btn btn-primary btn-select-mission" data-key="${candidateKey(c)}">Mission</button>
+      </div>
     `;
     list.appendChild(card);
 
-    card.querySelector(".btn-select").addEventListener("click", () => selectLocation(c, label));
+    // "Select" → sets deployment location (does NOT immediately deploy)
+    card.querySelector(".btn-select").addEventListener("click", () =>
+      selectDeploymentLocation(c.lat, c.lon, "candidate")
+    );
+
+    // "Mission" → existing mission-planning workflow (POST /api/select-target)
+    card.querySelector(".btn-select-mission").addEventListener("click", () =>
+      selectLocation(c, label)
+    );
   });
 }
 
@@ -1428,6 +1595,176 @@ function startTelemetryStaleWatch() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2 — RF Scan Survey (Zig-zag / Lawnmower Mission)
+// ---------------------------------------------------------------------------
+
+function clearRfScan() {
+  if (state.rfScanLayer) {
+    map.removeLayer(state.rfScanLayer);
+    state.rfScanLayer = null;
+  }
+  state.rfScanMission = null;
+  state.rfScanState = "IDLE";
+
+  const stateEl = document.getElementById("stat-rf-state");
+  if (stateEl) stateEl.textContent = "IDLE";
+  const wpEl = document.getElementById("stat-rf-waypoints");
+  if (wpEl) wpEl.textContent = "--";
+  const linesEl = document.getElementById("stat-rf-lines");
+  if (linesEl) linesEl.textContent = "--";
+  const distEl = document.getElementById("stat-rf-distance");
+  if (distEl) distEl.textContent = "--";
+  const container = document.getElementById("rf-waypoints-container");
+  if (container) container.classList.add("hidden");
+  const list = document.getElementById("rf-waypoints-list");
+  if (list) list.innerHTML = "";
+  const hintEl = document.getElementById("rf-scan-hint");
+  if (hintEl) hintEl.textContent = "Define an affected area, then click RF SCAN to generate a survey path.";
+}
+
+function renderRfScanPath(waypoints) {
+  if (!waypoints || waypoints.length === 0) return;
+
+  if (state.rfScanLayer) {
+    map.removeLayer(state.rfScanLayer);
+  }
+  state.rfScanLayer = L.layerGroup().addTo(map);
+
+  const latlngs = waypoints.map(wp => [wp.lat, wp.lon]);
+
+  // 1. Draw survey flight path polyline (vibrant cyan dashed line)
+  L.polyline(latlngs, {
+    color: "#00E5FF",
+    weight: 2.5,
+    dashArray: "5 5",
+    opacity: 0.9,
+  }).addTo(state.rfScanLayer);
+
+  // 2. Add waypoint markers along the survey path
+  waypoints.forEach((wp, idx) => {
+    const isFirst = idx === 0;
+    const isLast = idx === waypoints.length - 1;
+
+    let markerColor = "#00E5FF";
+    let markerRadius = 3.5;
+    let weight = 1.5;
+
+    if (isFirst) {
+      markerColor = "#3FDA7F"; // Green start
+      markerRadius = 6;
+      weight = 2.5;
+    } else if (isLast) {
+      markerColor = "#FF5C5C"; // Red end
+      markerRadius = 6;
+      weight = 2.5;
+    }
+
+    const marker = L.circleMarker([wp.lat, wp.lon], {
+      radius: markerRadius,
+      color: markerColor,
+      fillColor: isFirst ? "#3FDA7F" : isLast ? "#FF5C5C" : "#0A0D11",
+      fillOpacity: 0.9,
+      weight: weight,
+    }).addTo(state.rfScanLayer);
+
+    const label = isFirst
+      ? `START WP #0 (Line 1)`
+      : isLast
+      ? `END WP #${wp.seq} (Line ${wp.line_idx + 1})`
+      : `WP #${wp.seq} (Line ${wp.line_idx + 1})`;
+
+    marker.bindTooltip(
+      `<div style="font-family:var(--font-data); font-size:11px;">
+        <strong>${label}</strong><br>
+        Lat: ${wp.lat.toFixed(6)}<br>
+        Lon: ${wp.lon.toFixed(6)}<br>
+        Alt: ${wp.alt}m
+      </div>`,
+      { direction: "top", offset: [0, -5] }
+    );
+  });
+}
+
+async function handleRfScan() {
+  const hintEl = document.getElementById("rf-scan-hint");
+
+  // Step 1 check: valid affected area exists
+  if (!state.areaClosed || !state.points || state.points.length < 3) {
+    if (hintEl) hintEl.textContent = "Define an affected area first.";
+    logEvent("RF SCAN rejected: Define an affected area first.");
+    return;
+  }
+
+  const spacingInput = document.getElementById("scan-spacing");
+  const altInput = document.getElementById("scan-alt");
+  const spacing_m = parseFloat(spacingInput ? spacingInput.value : 25) || 25;
+  const altitude_m = parseFloat(altInput ? altInput.value : 15) || 15;
+
+  const btn = document.getElementById("btn-rf-scan");
+  if (btn) btn.disabled = true;
+  if (hintEl) hintEl.textContent = "Generating zig-zag survey path…";
+  logEvent(`RF SCAN requested — calculating survey path (spacing ${spacing_m}m, alt ${altitude_m}m)…`);
+
+  try {
+    const result = await apiPost("/api/rf-scan/generate", {
+      polygon: state.points,
+      spacing_m: spacing_m,
+      altitude_m: altitude_m,
+    });
+
+    if (result.status !== 200) {
+      throw new Error(result.body && result.body.detail ? result.body.detail : `HTTP ${result.status}`);
+    }
+
+    const data = result.body;
+    state.rfScanState = data.state;
+    state.rfScanMission = data;
+
+    // Update UI stats
+    const stateEl = document.getElementById("stat-rf-state");
+    if (stateEl) stateEl.textContent = data.state;
+    const wpEl = document.getElementById("stat-rf-waypoints");
+    if (wpEl) wpEl.textContent = data.waypoint_count;
+    const linesEl = document.getElementById("stat-rf-lines");
+    if (linesEl) linesEl.textContent = data.line_count;
+    const distEl = document.getElementById("stat-rf-distance");
+    if (distEl) distEl.textContent = `${data.total_distance_m} m`;
+
+    // Render path on map
+    renderRfScanPath(data.waypoints);
+
+    // Populate waypoint inspection list
+    const container = document.getElementById("rf-waypoints-container");
+    const list = document.getElementById("rf-waypoints-list");
+    const summary = document.getElementById("rf-waypoints-summary");
+
+    if (container && list) {
+      container.classList.remove("hidden");
+      if (summary) summary.textContent = `${data.waypoint_count} waypoints, ${data.line_count} lines`;
+
+      list.innerHTML = data.waypoints.map(wp => `
+        <div class="rf-wp-item">
+          <span class="rf-wp-seq">WP #${wp.seq} (L${wp.line_idx + 1})</span>
+          <span class="rf-wp-coords">${wp.lat.toFixed(5)}, ${wp.lon.toFixed(5)} [${wp.alt}m]</span>
+        </div>
+      `).join("");
+    }
+
+    if (hintEl) {
+      hintEl.textContent = `Survey path generated (${data.waypoint_count} WPs, ${data.line_count} lines, ${data.total_distance_m}m).`;
+    }
+    logEvent(
+      `RF survey mission generated: ${data.waypoint_count} waypoints across ${data.line_count} lines, total dist ${data.total_distance_m}m.`
+    );
+  } catch (err) {
+    if (hintEl) hintEl.textContent = `Error: ${err.message}`;
+    logEvent(`RF SCAN generation failed: ${err.message}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Wire up controls
 // ---------------------------------------------------------------------------
 
@@ -1454,6 +1791,12 @@ function initControls() {
   if (manualBtn) manualBtn.addEventListener("click", enterManualControl);
   const resumeBtn = document.getElementById("btn-resume-mission");
   if (resumeBtn) resumeBtn.addEventListener("click", resumeMission);
+  // Node Deployment (Phase 1)
+  const autoDeployBtn = document.getElementById("btn-auto-deploy");
+  if (autoDeployBtn) autoDeployBtn.addEventListener("click", autoDeploy);
+  // RF Scan Survey (Phase 2)
+  const rfScanBtn = document.getElementById("btn-rf-scan");
+  if (rfScanBtn) rfScanBtn.addEventListener("click", handleRfScan);
 }
 
 // ---------------------------------------------------------------------------
@@ -1461,13 +1804,16 @@ function initControls() {
 // ---------------------------------------------------------------------------
 
 async function boot() {
+  // Load node definitions (inventory) so we can centre the map — but
+  // do NOT draw them yet.  The operator must press AUTO DEPLOY INITIAL
+  // NODES to place them on the map (Phase 1 requirement).
   const nodes = await loadNodes();
 
   const centerLat = nodes.length ? nodes[0].lat : FALLBACK_CENTER.lat;
   const centerLon = nodes.length ? nodes[0].lon : FALLBACK_CENTER.lon;
 
   initMap(centerLat, centerLon);
-  drawNodes(nodes);
+  // drawNodes() is intentionally NOT called here — deployedNodes starts empty.
   initControls();
 
   connectTelemetry();
@@ -1478,7 +1824,7 @@ async function boot() {
   _updateGamepadStat();
   _updateOverrideStat();
 
-  logEvent("GCS initialized — Phase 8 (mission upload + execution) ready.");
+  logEvent("GCS initialized — Phase 8 ready. Press AUTO DEPLOY INITIAL NODES to place communication nodes.");
 }
 
 boot();
