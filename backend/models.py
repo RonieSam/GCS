@@ -247,3 +247,36 @@ class ManualControlResponse(BaseModel):
     success: bool
     mode: Optional[str] = None
     error: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — RF Scan survey mission models
+# ---------------------------------------------------------------------------
+
+
+class RFScanWaypoint(BaseModel):
+    seq: int
+    lat: float
+    lon: float
+    alt: float
+    line_idx: Optional[int] = None
+
+
+class RFScanGenerateRequest(BaseModel):
+    polygon: Optional[List[LatLon]] = None
+    spacing_m: Optional[float] = 25.0
+    altitude_m: Optional[float] = 15.0
+
+
+class RFScanGenerateResponse(BaseModel):
+    success: bool
+    state: str
+    total_distance_m: float
+    waypoint_count: int
+    line_count: int
+    spacing_m: float
+    altitude_m: float
+    waypoints: List[RFScanWaypoint]
+    px4_waypoints: List[RFScanWaypoint]
+    error: Optional[str] = None
+

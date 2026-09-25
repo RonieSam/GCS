@@ -20,6 +20,7 @@ import logging
 import mavlink_commands   # NEW import, alongside the mavlink_manager import
 import mavlink_mission    # Phase 8 — MAVLink mission protocol
 import coordinate_mapper  # Phase 9A — simulation coordinate transformation
+import survey_planner    # Phase 2 — RF scan survey path planner
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from typing import List
+from typing import List, Optional
 
 import config
 from candidate_generator import generate_candidates
@@ -66,6 +67,9 @@ from models import (
     MissionUploadResponse,
     NodeOut,
     NotImplementedResponse,
+    RFScanGenerateRequest,
+    RFScanGenerateResponse,
+    RFScanWaypoint,
     ReturnHomeResponse,
     SelectTargetRequest,
     SelectTargetResponse,
@@ -114,6 +118,9 @@ session_state = {
     # Phase 8 — tracks the most recently generated mission row
     "last_mission_id": None,  # SQLite id of last generated mission, or None
     "last_mission": None,     # full MissionOut dict of last generated mission
+    # Phase 2 — RF scan survey state
+    "rf_scan_state": "IDLE",  # IDLE | MISSION_GENERATED | MISSION_UPLOADED | RUNNING | COMPLETED | FAILED
+    "rf_scan_mission": None,  # survey_planner output dict or None
 }
 
 _CANDIDATE_MATCH_TOLERANCE_M = 1.0  # treat as "the same point" within this radius
@@ -475,6 +482,8 @@ def api_area(req: AreaRequest):
     session_state["last_scored"] = None
     session_state["selected_target"] = None
     session_state["mission_state"] = "PLANNING"
+    session_state["rf_scan_state"] = "IDLE"
+    session_state["rf_scan_mission"] = None
 
     return AreaResponse(accepted=True, point_count=len(polygon), polygon=req.polygon)
 
@@ -504,6 +513,73 @@ def api_analyze():
         coverage_percentage=result["coverage_percentage"],
         gap_percentage=result["gap_percentage"],
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — RF Scan survey mission endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/rf-scan/generate", response_model=RFScanGenerateResponse)
+def api_rf_scan_generate(req: Optional[RFScanGenerateRequest] = None):
+    """
+    Generate an RF scan survey mission (zig-zag / lawnmower pattern)
+    covering the user-defined affected area polygon.
+    """
+    polygon = None
+    if req and req.polygon:
+        polygon = [{"lat": p.lat, "lon": p.lon} for p in req.polygon]
+        session_state["polygon"] = polygon
+    else:
+        polygon = session_state.get("polygon")
+
+    if not polygon or len(polygon) < 3:
+        session_state["rf_scan_state"] = "IDLE"
+        session_state["rf_scan_mission"] = None
+        raise HTTPException(400, "Define an affected area first.")
+
+    spacing_m = req.spacing_m if (req and req.spacing_m) else 25.0
+    altitude_m = req.altitude_m if (req and req.altitude_m) else config.DEFAULT_ALTITUDE
+
+    try:
+        result = survey_planner.generate_survey_path(
+            polygon,
+            spacing_m=spacing_m,
+            altitude_m=altitude_m,
+        )
+    except ValueError as e:
+        session_state["rf_scan_state"] = "FAILED"
+        raise HTTPException(400, str(e))
+
+    session_state["rf_scan_state"] = "MISSION_GENERATED"
+    session_state["rf_scan_mission"] = result
+
+    return RFScanGenerateResponse(
+        success=True,
+        state="MISSION_GENERATED",
+        total_distance_m=result["total_distance_m"],
+        waypoint_count=result["waypoint_count"],
+        line_count=result["line_count"],
+        spacing_m=result["spacing_m"],
+        altitude_m=result["altitude_m"],
+        waypoints=[RFScanWaypoint(**wp) for wp in result["waypoints"]],
+        px4_waypoints=[RFScanWaypoint(**wp) for wp in result["px4_waypoints"]],
+    )
+
+
+@app.get("/api/rf-scan/state")
+def api_rf_scan_state():
+    """Return the current RF scan state and summary."""
+    mission = session_state.get("rf_scan_mission")
+    return {
+        "state": session_state.get("rf_scan_state", "IDLE"),
+        "has_mission": mission is not None,
+        "waypoint_count": mission["waypoint_count"] if mission else 0,
+        "line_count": mission["line_count"] if mission else 0,
+        "total_distance_m": mission["total_distance_m"] if mission else 0.0,
+        "spacing_m": mission["spacing_m"] if mission else 25.0,
+        "altitude_m": mission["altitude_m"] if mission else config.DEFAULT_ALTITUDE,
+    }
 
 
 # ---------------------------------------------------------------------------
