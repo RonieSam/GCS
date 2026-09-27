@@ -77,7 +77,7 @@ class TestPhase3RFModel(unittest.TestCase):
 class TestPhase3SurveyMissionReturn(unittest.TestCase):
     """Verify that survey mission generator enforces return to scan-start position."""
 
-    def test_survey_mission_returns_to_scan_start_and_lands(self):
+    def test_survey_mission_ends_at_final_survey_waypoint(self):
         px4_waypoints = [
             {"seq": 0, "lat": 13.0830, "lon": 80.2710, "alt": 25.0},
             {"seq": 1, "lat": 13.0835, "lon": 80.2710, "alt": 25.0},
@@ -86,25 +86,20 @@ class TestPhase3SurveyMissionReturn(unittest.TestCase):
         ]
         home_lat = 13.0820
         home_lon = 80.2700
-        start_lat = 13.0821
-        start_lon = 80.2702
         survey_alt = 25.0
 
         items = mavlink_mission.build_survey_mission_items(
             px4_waypoints=px4_waypoints,
             home_lat=home_lat,
             home_lon=home_lon,
-            return_lat=start_lat,
-            return_lon=start_lon,
-            return_alt_m=survey_alt,
         )
 
-        # Expected items:
+        # Expected items in Phase 4:
         # Item 0: TAKEOFF
         # Items 1..4: Survey waypoints
-        # Item 5: RETURN to start_lat, start_lon at survey_alt
-        # Item 6: LAND at start_lat, start_lon
-        self.assertEqual(len(items), len(px4_waypoints) + 3)
+        # Total items = len(px4_waypoints) + 1
+        # NO return waypoint, NO landing waypoint
+        self.assertEqual(len(items), len(px4_waypoints) + 1)
 
         takeoff_item = items[0]
         self.assertEqual(takeoff_item["command"], mavlink_mission._CMD_TAKEOFF)
@@ -113,20 +108,7 @@ class TestPhase3SurveyMissionReturn(unittest.TestCase):
         last_survey_wp = items[4]
         self.assertEqual(last_survey_wp["lat"], 13.0830)
         self.assertEqual(last_survey_wp["lon"], 80.2720)
-
-        # Item 5 must be RETURN to start_lat / start_lon (NOT last survey wp!)
-        return_item = items[5]
-        self.assertEqual(return_item["command"], mavlink_mission._CMD_WAYPOINT)
-        self.assertAlmostEqual(return_item["lat"], start_lat, places=6)
-        self.assertAlmostEqual(return_item["lon"], start_lon, places=6)
-        self.assertEqual(return_item["alt"], survey_alt)
-
-        # Item 6 must be LAND at start_lat / start_lon
-        land_item = items[6]
-        self.assertEqual(land_item["command"], mavlink_mission._CMD_LAND)
-        self.assertAlmostEqual(land_item["lat"], start_lat, places=6)
-        self.assertAlmostEqual(land_item["lon"], start_lon, places=6)
-        self.assertEqual(land_item["alt"], 0.0)
+        self.assertEqual(last_survey_wp["command"], mavlink_mission._CMD_WAYPOINT)
 
     def test_normal_single_target_mission_remains_unbroken(self):
         """Phase 3 changes must not break the normal single-target mission flow."""
@@ -238,37 +220,26 @@ class TestPhase3RFCollectorStateMachine(unittest.TestCase):
         self.assertEqual(len(survey["samples"]), 2)
 
         # 5. Survey path completion: item 4 (last survey waypoint) reached!
-        # Must transition to RETURNING
+        # In Phase 4, transitions directly to SCAN_COMPLETE (no return-to-start or land leg)
         self.collector.ingest_telemetry({
             "latitude": 13.0840,
             "longitude": 80.2720,
             "altitude": 25.0,
-            "mission_current": 5,
+            "mission_current": 4,
             "mission_item_reached": 4,  # >= survey_waypoint_count
         })
-        self.assertEqual(self.collector.state, SCAN_STATE_RETURNING)
-
-        # 6. During return flight, NO survey samples should be accumulated
-        s_return = self.collector.ingest_telemetry({
-            "latitude": 13.0833,
-            "longitude": 80.2712,
-            "altitude": 25.0,
-            "mission_current": 5,
-            "mission_item_reached": 5,
-        })
-        self.assertIsNone(s_return)
-        # Sample count must remain 2
-        self.assertEqual(self.collector.get_survey_data()["sample_count"], 2)
-
-        # 7. Final landing reached (total_items - 1 reached, i.e. 6)
-        self.collector.ingest_telemetry({
-            "latitude": 13.0827,
-            "longitude": 80.2707,
-            "altitude": 0.0,
-            "mission_current": 6,
-            "mission_item_reached": 6,
-        })
         self.assertEqual(self.collector.state, SCAN_STATE_COMPLETE)
+
+        # 6. After survey completion, NO further survey samples should be accumulated
+        s_after = self.collector.ingest_telemetry({
+            "latitude": 13.0840,
+            "longitude": 80.2720,
+            "altitude": 25.0,
+            "mission_current": 4,
+            "mission_item_reached": 4,
+        })
+        self.assertIsNone(s_after)
+        # Sample count must remain 2 and all collected data preserved
         self.assertEqual(self.collector.get_survey_data()["sample_count"], 2)
 
 

@@ -64,17 +64,22 @@ _MAV_MODE_FLAG_SAFETY_ARMED = 128
 
 
 def _decode_mode(msg, mav_connection=None):
-    """Decode PX4 HEARTBEAT custom_mode into a readable flight mode."""
+    """Decode HEARTBEAT custom_mode into a readable flight mode."""
+    if mav_connection is not None:
+        try:
+            mapping = mav_connection.mode_mapping()
+            if mapping:
+                inv_map = {v: k for k, v in mapping.items()}
+                if msg.custom_mode in inv_map:
+                    return inv_map[msg.custom_mode]
+        except Exception:
+            pass
+
+    custom_mode = int(msg.custom_mode)
 
     # PX4 custom_mode is a 32-bit value:
     #   main_mode  = bits 16-23
     #   sub_mode   = bits 24-31
-    #
-    # The value can also be represented as:
-    #   custom_mode = (sub_mode << 24) | (main_mode << 16)
-
-    custom_mode = int(msg.custom_mode)
-
     main_mode = (custom_mode >> 16) & 0xFF
     sub_mode = (custom_mode >> 24) & 0xFF
 
@@ -107,6 +112,9 @@ def _decode_mode(msg, mav_connection=None):
 
     if mode:
         return mode
+
+    if main_mode == 0 and sub_mode == 0 and custom_mode != 0:
+        return str(custom_mode)
 
     return f"UNKNOWN({main_mode},{sub_mode})"
 

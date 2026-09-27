@@ -19,31 +19,36 @@ from unittest.mock import MagicMock, patch, call
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Stub pymavlink so we can import mavlink_commands without the real library
-mav_stub = types.ModuleType("pymavlink")
-mavutil_stub = types.ModuleType("pymavlink.mavutil")
+try:
+    import pymavlink
+    from pymavlink import mavutil
+    _FakeMavlink = mavutil.mavlink
+except ImportError:
+    # Stub pymavlink only if the library is not installed
+    mav_stub = types.ModuleType("pymavlink")
+    mavutil_stub = types.ModuleType("pymavlink.mavutil")
 
-# Populate the MAVLink enum constants used by send_velocity_setpoint
-class _FakeMavlink:
-    MAV_FRAME_LOCAL_NED = 1
-    POSITION_TARGET_TYPEMASK_X_IGNORE  = 0x0001
-    POSITION_TARGET_TYPEMASK_Y_IGNORE  = 0x0002
-    POSITION_TARGET_TYPEMASK_Z_IGNORE  = 0x0004
-    POSITION_TARGET_TYPEMASK_AX_IGNORE = 0x0040
-    POSITION_TARGET_TYPEMASK_AY_IGNORE = 0x0080
-    POSITION_TARGET_TYPEMASK_AZ_IGNORE = 0x0100
-    POSITION_TARGET_TYPEMASK_YAW_IGNORE = 0x0400
-    MAV_RESULT_ACCEPTED = 0
-    MAV_CMD_DO_SET_MODE = 176
-    MAV_CMD_COMPONENT_ARM_DISARM = 400
-    MAV_DATA_STREAM_ALL = 0
-    enums = {"MAV_RESULT": {}}
+    # Populate the MAVLink enum constants used by send_velocity_setpoint
+    class _FakeMavlink:
+        MAV_FRAME_LOCAL_NED = 1
+        POSITION_TARGET_TYPEMASK_X_IGNORE  = 0x0001
+        POSITION_TARGET_TYPEMASK_Y_IGNORE  = 0x0002
+        POSITION_TARGET_TYPEMASK_Z_IGNORE  = 0x0004
+        POSITION_TARGET_TYPEMASK_AX_IGNORE = 0x0040
+        POSITION_TARGET_TYPEMASK_AY_IGNORE = 0x0080
+        POSITION_TARGET_TYPEMASK_AZ_IGNORE = 0x0100
+        POSITION_TARGET_TYPEMASK_YAW_IGNORE = 0x0400
+        MAV_RESULT_ACCEPTED = 0
+        MAV_CMD_DO_SET_MODE = 176
+        MAV_CMD_COMPONENT_ARM_DISARM = 400
+        MAV_DATA_STREAM_ALL = 0
+        enums = {"MAV_RESULT": {}}
 
-mavutil_stub.mavlink = _FakeMavlink()
-mavutil_stub.mavlink_connection = MagicMock()
-mav_stub.mavutil = mavutil_stub
-sys.modules.setdefault("pymavlink", mav_stub)
-sys.modules.setdefault("pymavlink.mavutil", mavutil_stub)
+    mavutil_stub.mavlink = _FakeMavlink()
+    mavutil_stub.mavlink_connection = MagicMock()
+    mav_stub.mavutil = mavutil_stub
+    sys.modules.setdefault("pymavlink", mav_stub)
+    sys.modules.setdefault("pymavlink.mavutil", mavutil_stub)
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +101,7 @@ class TestSendVelocitySetpoint(unittest.TestCase):
         conn = self._make_conn()
         mavlink_commands.send_velocity_setpoint(conn, vx=0, vy=0, vz=0, yaw_rate=0)
         args = conn.mav.set_position_target_local_ned_send.call_args[0]
-        self.assertEqual(args[3], mavutil_stub.mavlink.MAV_FRAME_LOCAL_NED)
+        self.assertEqual(args[3], _FakeMavlink.MAV_FRAME_LOCAL_NED)
 
     def test_type_mask_ignores_position_and_yaw(self):
         """Type mask must have position-ignore bits set and NOT have velocity bits set."""
@@ -122,94 +127,6 @@ class TestSendVelocitySetpoint(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Test: FastAPI endpoints
 # ---------------------------------------------------------------------------
-
-for mod_name in [
-    "database", "candidate_generator", "coverage", "scoring",
-    "safety_manager", "coordinate_mapper", "config",
-]:
-    if mod_name not in sys.modules:
-        stub = types.ModuleType(mod_name)
-        sys.modules[mod_name] = stub
-
-config_stub = sys.modules["config"]
-config_stub.MAVLINK_CONNECTION = "udp:127.0.0.1:14550"
-config_stub.MAVLINK_CONNECT_TIMEOUT_S = 10
-config_stub.MAVLINK_HEARTBEAT_LOST_S = 5
-config_stub.MAVLINK_RECONNECT_INTERVAL_S = 3
-config_stub.MAVLINK_STREAM_RATE_HZ = 4
-config_stub.MISSION_UPLOAD_TIMEOUT_S = 30
-config_stub.SIMULATION_MODE = False
-config_stub.DEFAULT_ALTITUDE = 15
-config_stub.MIN_NODE_SEPARATION_M = 50
-
-db_stub = sys.modules["database"]
-db_stub.init_db = MagicMock()
-db_stub.get_mission = MagicMock(return_value=None)
-db_stub.insert_mission = MagicMock()
-db_stub.list_deployments = MagicMock(return_value=[])
-db_stub.list_missions = MagicMock(return_value=[])
-db_stub.list_nodes = MagicMock(return_value=[])
-db_stub.update_mission_status = MagicMock()
-
-mapper_mock = MagicMock()
-mapper_mock.get_references.return_value = {
-    "gcs_reference": {"latitude": 13.0, "longitude": 80.0},
-    "px4_reference": {"latitude": 13.0, "longitude": 80.0},
-}
-coord_stub = sys.modules["coordinate_mapper"]
-coord_stub.get_mapper = MagicMock(return_value=mapper_mock)
-
-sys.modules["candidate_generator"].generate_candidates = MagicMock(return_value=[])
-cov_stub = sys.modules["coverage"]
-cov_stub.compute_coverage = MagicMock(return_value={"total_points": 0})
-cov_stub.haversine_distance_m = MagicMock(return_value=9999)
-cov_stub.point_in_polygon = MagicMock(return_value=True)
-sys.modules["scoring"].score_candidates = MagicMock(return_value=[])
-sys.modules["scoring"].top_n = MagicMock(return_value=[])
-
-mav_mission_stub = types.ModuleType("mavlink_mission")
-mav_mission_stub.build_mission_items = MagicMock(return_value=[])
-mav_mission_stub.MissionTimeout = Exception
-mav_mission_stub.MissionRejected = Exception
-mav_mission_stub.MissionUploadError = Exception
-mav_mission_stub.InvalidMission = Exception
-sys.modules.setdefault("mavlink_mission", mav_mission_stub)
-
-mav_tel_stub = types.ModuleType("mavlink_telemetry")
-mav_tel_stub.new_vehicle_state = MagicMock(return_value={
-    "connected": False, "armed": False, "mode": None,
-    "latitude": None, "longitude": None, "altitude": None,
-    "relative_altitude": None, "ground_speed": None, "heading": None,
-    "battery": None, "gps_fix": None, "satellites": None,
-    "last_heartbeat": None, "mission_current": None, "mission_item_reached": None,
-})
-mav_tel_stub.update_from_message = MagicMock()
-sys.modules.setdefault("mavlink_telemetry", mav_tel_stub)
-
-safety_stub = types.ModuleType("safety_manager")
-
-class _SafetyMock:
-    def __init__(self, *a, **kw): self._state = "DISCONNECTED"
-    def connecting(self): pass
-    def disconnect(self): pass
-    def heartbeat_received(self): pass
-    def check_timeout(self): pass
-    def is_connected(self): return False
-    @property
-    def state(self): return self._state
-
-safety_stub.SafetyStateMachine = _SafetyMock
-sys.modules["safety_manager"] = safety_stub
-
-tb_stub = types.ModuleType("telemetry_broadcaster")
-class _TBStub:
-    async def start(self): pass
-    async def stop(self):  pass
-    async def register(self, ws): pass
-    async def unregister(self, ws): pass
-    def build_message(self): return {}
-tb_stub.TelemetryBroadcaster = MagicMock(return_value=_TBStub())
-sys.modules.setdefault("telemetry_broadcaster", tb_stub)
 
 from fastapi.testclient import TestClient
 

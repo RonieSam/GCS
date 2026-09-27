@@ -41,6 +41,10 @@ class TestRequestDataStreams(unittest.TestCase):
 class TestArmDisarm(unittest.TestCase):
     def test_arm_sends_component_arm_disarm_with_param1_one(self):
         conn = fake_connection()
+        ack = Mock()
+        ack.command = mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM
+        ack.result = 0
+        conn.recv_match.return_value = ack
         cmds.arm(conn)
         conn.mav.command_long_send.assert_called_once_with(
             1, 1, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0
@@ -48,6 +52,10 @@ class TestArmDisarm(unittest.TestCase):
 
     def test_disarm_sends_param1_zero(self):
         conn = fake_connection()
+        ack = Mock()
+        ack.command = mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM
+        ack.result = 0
+        conn.recv_match.return_value = ack
         cmds.disarm(conn)
         conn.mav.command_long_send.assert_called_once_with(
             1, 1, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0

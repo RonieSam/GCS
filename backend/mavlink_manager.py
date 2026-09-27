@@ -261,6 +261,9 @@ class MAVLinkManager:
 
     def _send_arm_disarm_and_wait(self, arm, timeout_s=3):
         """Queue an arm/disarm request and wait for PX4's COMMAND_ACK."""
+        if self._thread is None or not self._thread.is_alive():
+            return mavlink_commands.arm(self._conn, timeout_s=timeout_s) if arm else mavlink_commands.disarm(self._conn, timeout_s=timeout_s)
+
         result_box = {}
         done = threading.Event()
 
@@ -291,6 +294,8 @@ class MAVLinkManager:
         """
         Queue a mode-change request and wait for PX4's COMMAND_ACK.
         """
+        if self._thread is None or not self._thread.is_alive():
+            return mavlink_commands.set_mode(self._conn, mode_name, timeout_s=timeout_s)
 
         result_box = {}
         done = threading.Event()

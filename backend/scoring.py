@@ -112,7 +112,7 @@ def _normalize(raw_values):
     max_val = max(raw_values)
     if max_val <= 0:
         return [0.0 for _ in raw_values]
-    return [100.0 * v / max_val for v in raw_values]
+    return [max(0.0, min(100.0, 100.0 * v / max_val)) for v in raw_values]
 
 
 def score_candidates(
@@ -192,7 +192,7 @@ def score_candidates(
     if max_dist <= 0:
         distance_scores = [100.0 for _ in raw_distances]  # all candidates at the same spot as home
     else:
-        distance_scores = [100.0 * (1.0 - d / max_dist) for d in raw_distances]
+        distance_scores = [max(0.0, min(100.0, 100.0 * (1.0 - d / max_dist))) for d in raw_distances]
 
     suitability_scores = _normalize(raw_boundary_dists)
 
