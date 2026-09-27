@@ -16,7 +16,6 @@ classdef EnvironmentVisualizer < matlab.System
     properties
         AreaSize   = [1000 1000]
         NodeLabels = {'Node 1', 'Node 2', 'Node 3'}
-        Buildings  = zeros(0, 4)
     end
 
     properties (Access = private)
@@ -47,13 +46,7 @@ classdef EnvironmentVisualizer < matlab.System
             ylabel(ax, 'Y (metres)');
             title(ax, 'Emergency Network Environment - Coverage Status');
 
-            % --- Buildings (grey rectangles) ---
-            for i = 1:size(obj.Buildings, 1)
-                x = obj.Buildings(i, 1); y = obj.Buildings(i, 2);
-                w = obj.Buildings(i, 3); d = obj.Buildings(i, 4);
-                rectangle(ax, 'Position', [x y w d], ...
-                    'FaceColor', [0.6 0.6 0.6], 'EdgeColor', 'k');
-            end
+            
 
             % --- Status -> color / name lookup (index = status code + 1) ---
             statusColors = {[0.85 0 0], [1 0.55 0], [0.90 0.75 0], [0 0.6 0]}; % GAP WEAK MODERATE GOOD

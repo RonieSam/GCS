@@ -18,7 +18,6 @@ classdef GapVisualizer < matlab.System
 
     properties
         AreaSize  = [1000 1000]
-        Buildings = zeros(0, 4)
     end
 
     properties (Access = private)
@@ -48,13 +47,7 @@ classdef GapVisualizer < matlab.System
             title(ax, sprintf('Gap Analysis - %d gap points, %d candidate(s)', ...
                 gapCount, candidateCount));
 
-            % --- Buildings ---
-            for i = 1:size(obj.Buildings, 1)
-                x = obj.Buildings(i, 1); y = obj.Buildings(i, 2);
-                w = obj.Buildings(i, 3); d = obj.Buildings(i, 4);
-                rectangle(ax, 'Position', [x y w d], ...
-                    'FaceColor', [0.6 0.6 0.6], 'EdgeColor', 'k');
-            end
+            
 
             % --- Existing ground nodes: blue circles ---
             plot(ax, nodePositions(:,1), nodePositions(:,2), 'o', ...

@@ -37,7 +37,6 @@ classdef CandidatePlacement < matlab.System
         MaxCandidates      = 25
         SurveyAltitude     = 30     % metres, Z for every candidate
         AreaSize           = [1000 1000]
-        Buildings          = zeros(0, 4)   % [x y width depth], optional
         GapCountWeight     = 10
         DistanceWeight     = 0.1
         RFRangeScale       = 0.25
@@ -115,14 +114,7 @@ classdef CandidatePlacement < matlab.System
                 cx = min(max(cx, 0), obj.AreaSize(1));   % keep inside the area
                 cy = min(max(cy, 0), obj.AreaSize(2));
 
-                inBuilding = 0;
-                for b = 1:size(obj.Buildings, 1)
-                    bx = obj.Buildings(b, 1); by = obj.Buildings(b, 2);
-                    bw = obj.Buildings(b, 3); bd = obj.Buildings(b, 4);
-                    if cx >= bx && cx <= bx + bw && cy >= by && cy <= by + bd
-                        inBuilding = 1;
-                    end
-                end
+               
 
                 nodeDistances = sqrt((nodePositions(:,1) - cx).^2 + ...
                                       (nodePositions(:,2) - cy).^2);
@@ -137,7 +129,7 @@ classdef CandidatePlacement < matlab.System
                 candidateZ(r)          = obj.SurveyAltitude;
                 candidateGapCount(r)   = gapPointsInRegion;
                 candidateScore(r)      = score;
-                candidateInBuilding(r) = inBuilding;
+                candidateInBuilding(r) = 0;
             end
             candidateCount = numRegions;
 
