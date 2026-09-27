@@ -18,7 +18,7 @@
 
 clear; clc;
 
-%% ---- Determine Script Location and Add functions/ to MATLAB Path ----
+%% ---- Determine Scpt Location and Add functions/ to MATLAB Path ----
 % This MUST happen before any System Object classes are referenced,
 % including EnvironmentVisualizer, SurveyDataLoggerAfter, RFModel, etc.
 projectDir   = fileparts(mfilename('fullpath'));
