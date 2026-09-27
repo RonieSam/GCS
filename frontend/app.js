@@ -216,8 +216,8 @@ function enableFallbackBasemap() {
 // Node display & deployment (Phase 4 — dynamic nodes, deletion & scaled RF range)
 // ---------------------------------------------------------------------------
 
-// Phase 4: calibrate RF range to 1/4 of default range
-const RF_RANGE_SCALE = 0.25;
+// Phase 4 Final: calibrate RF range to 3/10 of default range (0.30)
+const RF_RANGE_SCALE = 0.30;
 
 /**
  * loadNodes — fetches currently deployed node definitions from the backend.
@@ -291,7 +291,7 @@ function addDeployedNode(node) {
   marker.bindPopup(`
     <div style="font-family: inherit; font-size: 13px; min-width: 140px; line-height: 1.5;">
       <strong style="color: #3FDA7F;">${node.id}</strong><br/>
-      <span style="color: #aaa; font-size: 11px;">Lat: ${node.lat.toFixed(5)}<br/>Lon: ${node.lon.toFixed(5)}<br/>Coverage: ${Math.round(scaledRadius)} m (scaled 1/4)</span>
+      <span style="color: #aaa; font-size: 11px;">Lat: ${node.lat.toFixed(5)}<br/>Lon: ${node.lon.toFixed(5)}<br/>Coverage: ${Math.round(scaledRadius)} m (scaled 0.30)</span>
     </div>
   `);
 
@@ -1015,7 +1015,7 @@ async function startMission() {
       "PX4 in mission mode. Watch telemetry for movement.";
     logEvent("PX4 entered MISSION mode — UAV executing mission.");
 
-    // Disable Start while executing; Abort stays enabled.
+    // Disable Start while executing; Abort ENABLED because there's now an active mission.
     if (btn) btn.disabled = true;
     if (rfStartBtn) rfStartBtn.disabled = true;
     document.getElementById("btn-abort-mission").disabled = false;
@@ -1030,9 +1030,17 @@ async function startMission() {
 
 async function abortMission() {
   const btn = document.getElementById("btn-abort-mission");
-  btn.disabled = true;
-  document.getElementById("mission-hint").textContent = "Sending RTL (Return-to-Launch)…";
-  logEvent("Abort (RTL) commanded.");
+
+  // Guard: do not abort if there is no executing mission
+  if (!state.missionExecuting && state.rfScanState !== "RUNNING") {
+    logEvent("ABORT: no active mission to abort — button should be disabled.");
+    btn.disabled = true;
+    return;
+  }
+
+  btn.disabled = true;  // Disable immediately on press — stays disabled after abort
+  document.getElementById("mission-hint").textContent = "Sending abort command…";
+  logEvent("Abort commanded.");
 
   try {
     const result = await apiPost("/api/mission/abort", {});
@@ -1042,31 +1050,50 @@ async function abortMission() {
       const msg = body && body.detail ? body.detail : "PX4 not connected";
       document.getElementById("mission-hint").textContent = `Abort failed: ${msg}`;
       logEvent(`Abort failed: ${msg}`);
-      btn.disabled = false;
+      // Only re-enable if still executing (the mission didn't stop)
+      if (state.missionExecuting) btn.disabled = false;
       return;
     }
 
-    if (!body.success) {
+    if (!body.success && body.error !== "No active mission to abort.") {
       document.getElementById("mission-hint").textContent =
-        `Abort failed: ${body.error || "PX4 rejected RTL"}`;
+        `Abort failed: ${body.error || "PX4 rejected abort"}`;
       logEvent(`Abort rejected: ${body.error}`);
-      btn.disabled = false;
+      if (state.missionExecuting) btn.disabled = false;
       return;
     }
 
+    // Abort succeeded (or there was no active mission — both cases leave btn disabled)
     state.missionExecuting = false;
     document.getElementById("stat-mission-state").textContent = "ABORTED";
-    document.getElementById("mission-hint").textContent =
-      "RTL commanded — PX4 returning to launch point.";
-    logEvent("Mission aborted — PX4 returning to launch (RTL).");
 
-    document.getElementById("btn-start-mission").disabled = false;
-    btn.disabled = false;
+    // Update RF scan state if this was an RF scan abort
+    if (state.rfScanState === "RUNNING" || state.rfScanState === "MISSION_UPLOADED") {
+      state.rfScanState = "ABORTED";
+      const rfStateEl = document.getElementById("stat-rf-state");
+      if (rfStateEl) rfStateEl.textContent = "ABORTED";
+      const rfHintEl = document.getElementById("rf-scan-hint");
+      if (rfHintEl) rfHintEl.textContent = "RF scan aborted — sample collection stopped.";
+      const rfsStateEl = document.getElementById("stat-rfs-state");
+      if (rfsStateEl) rfsStateEl.textContent = "ABORTED";
+      const rfsHintEl = document.getElementById("rf-survey-hint");
+      if (rfsHintEl) rfsHintEl.textContent = "Scan aborted. Partial data preserved. Reset survey to start fresh.";
+      logEvent("RF scan ABORTED — sample collection stopped.");
+    }
+
+    document.getElementById("mission-hint").textContent =
+      "Mission aborted. No active mission.";
+    logEvent("Mission aborted successfully.");
+
+    // btn-abort-mission remains DISABLED — there is no active mission to abort
+    // btn-start-mission also disabled — no uploaded mission anymore
+    document.getElementById("btn-start-mission").disabled = true;
 
   } catch (err) {
     document.getElementById("mission-hint").textContent = `Abort error: ${err.message}`;
     logEvent(`Abort error: ${err.message}`);
-    btn.disabled = false;
+    // Only re-enable if mission may still be active
+    if (state.missionExecuting) btn.disabled = false;
   }
 }
 
@@ -1859,13 +1886,21 @@ async function handleRfScan() {
     if (startBtn) startBtn.disabled = true; // stays disabled until uploaded
 
     if (hintEl) {
+      const startEp = data.start_endpoint;
+      const startDesc = startEp
+        ? ` ● Green start: ${startEp.lat.toFixed(5)}, ${startEp.lon.toFixed(5)} (nearest endpoint to UAV).`
+        : "";
       hintEl.textContent =
         `Survey path generated — ${data.waypoint_count} waypoints, ${data.line_count} lines.` +
-        ` Path visible on map. Click Upload RF Scan to send to PX4.`;
+        startDesc +
+        ` Click Upload RF Scan to send to PX4.`;
     }
+    const startEpLog = data.start_endpoint
+      ? ` | Green start dot: lat=${data.start_endpoint.lat.toFixed(5)}, lon=${data.start_endpoint.lon.toFixed(5)} (first waypoint, nearest to UAV)`
+      : "";
     logEvent(
       `RF survey mission generated: ${data.waypoint_count} waypoints across ` +
-      `${data.line_count} lines, total dist ${distFormatted}.`
+      `${data.line_count} lines, total dist ${distFormatted}.${startEpLog}`
     );
   } catch (err) {
     if (hintEl) hintEl.textContent = `Error: ${err.message}`;
@@ -2082,6 +2117,7 @@ function renderRfSurveyPanel(data) {
       SCAN_READY:    "Mission uploaded. Start RF Scan to begin collecting data.",
       SCANNING:      `Collecting samples… ${data.sample_count || 0} samples so far.`,
       SCAN_COMPLETE: `Scan complete — ${data.sample_count || 0} survey samples collected. UAV hovering at final survey waypoint.`,
+      ABORTED:       `Scan aborted — ${data.sample_count || 0} samples preserved (incomplete dataset). Reset to start a new scan.`,
       FAILED:        "RF scan failed. Check logs.",
     };
     hintEl.textContent = hints[collectorState] || `State: ${collectorState}`;

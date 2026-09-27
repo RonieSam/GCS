@@ -278,5 +278,6 @@ class RFScanGenerateResponse(BaseModel):
     altitude_m: float
     waypoints: List[RFScanWaypoint]
     px4_waypoints: List[RFScanWaypoint]
+    start_endpoint: Optional[dict] = None  # {lat, lon, alt} of nearest-to-UAV start
     error: Optional[str] = None
 

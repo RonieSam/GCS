@@ -21,7 +21,7 @@ import mavlink_commands   # NEW import, alongside the mavlink_manager import
 import mavlink_mission    # Phase 8 — MAVLink mission protocol
 import coordinate_mapper  # Phase 9A — simulation coordinate transformation
 import survey_planner    # Phase 2 — RF scan survey path planner
-from rf_collector import get_rf_collector  # Phase 3 — RF Survey collector
+from rf_collector import get_rf_collector, SCAN_STATE_ABORTED  # Phase 3 — RF Survey collector
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -586,11 +586,37 @@ def api_rf_scan_generate(req: Optional[RFScanGenerateRequest] = None):
     spacing_m = req.spacing_m if (req and req.spacing_m) else 25.0
     altitude_m = req.altitude_m if (req and req.altitude_m) else config.DEFAULT_ALTITUDE
 
+    # Capture UAV current position (GCS frame) for nearest-endpoint selection.
+    # This ensures the green dot (start) is the survey endpoint closest to the UAV.
+    uav_state = mav_manager.get_vehicle_state()
+    raw_uav_lat = uav_state.get("latitude")
+    raw_uav_lon = uav_state.get("longitude")
+
+    # Convert UAV pos to GCS frame if connected (it may be in PX4 space)
+    uav_gcs_lat = None
+    uav_gcs_lon = None
+    if raw_uav_lat is not None and raw_uav_lon is not None:
+        mapper = coordinate_mapper.get_mapper()
+        if config.SIMULATION_MODE:
+            uav_gcs_lat, uav_gcs_lon = mapper.px4_to_gcs(raw_uav_lat, raw_uav_lon)
+        else:
+            uav_gcs_lat, uav_gcs_lon = raw_uav_lat, raw_uav_lon
+        logger.info(
+            f"RF scan generate: UAV GCS pos lat={uav_gcs_lat:.7f}, lon={uav_gcs_lon:.7f} "
+            f"— will select nearest survey endpoint as start."
+        )
+    else:
+        logger.info(
+            "RF scan generate: UAV position unknown — using default path order (endpoint A)."
+        )
+
     try:
         result = survey_planner.generate_survey_path(
             polygon,
             spacing_m=spacing_m,
             altitude_m=altitude_m,
+            uav_lat=uav_gcs_lat,
+            uav_lon=uav_gcs_lon,
         )
     except ValueError as e:
         session_state["rf_scan_state"] = "FAILED"
@@ -598,6 +624,13 @@ def api_rf_scan_generate(req: Optional[RFScanGenerateRequest] = None):
 
     session_state["rf_scan_state"] = "MISSION_GENERATED"
     session_state["rf_scan_mission"] = result
+
+    start_ep = result.get("start_endpoint")
+    logger.info(
+        f"RF scan generated: {result['waypoint_count']} waypoints, "
+        f"start_endpoint=lat={start_ep['lat']:.7f}, lon={start_ep['lon']:.7f} "
+        f"(green dot = first survey waypoint)."
+    )
 
     return RFScanGenerateResponse(
         success=True,
@@ -609,6 +642,7 @@ def api_rf_scan_generate(req: Optional[RFScanGenerateRequest] = None):
         altitude_m=result["altitude_m"],
         waypoints=[RFScanWaypoint(**wp) for wp in result["waypoints"]],
         px4_waypoints=[RFScanWaypoint(**wp) for wp in result["px4_waypoints"]],
+        start_endpoint=start_ep,
     )
 
 
@@ -1147,20 +1181,44 @@ def api_mission_start():
 
 @app.post("/api/mission/abort", response_model=MissionAbortResponse)
 def api_mission_abort():
-    """Abort the active mission by commanding PX4 into Return-to-Launch mode.
+    """Abort the active mission.
 
-    RTL is the safest abort action available: PX4 returns to home and
-    lands. Does not automatically disarm.
+    For RF scan missions: immediately stops RF sample collection (collector
+    transitions to ABORTED) in addition to commanding RTL.
+    Guards against double-abort — if there is no active mission returns a
+    clear status without issuing another PX4 command.
     """
+    # Connection check FIRST — consistent with all other PX4-command endpoints.
     if not mav_manager.is_connected():
         raise HTTPException(
             503,
             "PX4 is not connected. Cannot send abort/RTL command.",
         )
 
+    # Guard: check if there is actually an abortable active mission
+    rf_scan_active = session_state.get("rf_scan_state") in ("RUNNING", "MISSION_UPLOADED")
+    normal_mission_active = session_state.get("mission_state") == "EXECUTING"
+
+    if not rf_scan_active and not normal_mission_active:
+        logger.info("ABORT requested but no active mission to abort.")
+        return MissionAbortResponse(
+            success=False,
+            action="NONE",
+            error="No active mission to abort.",
+        )
+
+    # Immediately abort RF sample collection if RF scan was active.
+    # This MUST happen before the RTL command so samples stop the instant abort is triggered.
+    if rf_scan_active:
+        rf_collector = get_rf_collector()
+        rf_collector.abort_scan(reason="User abort via /api/mission/abort")
+        session_state["rf_scan_state"] = "ABORTED"
+        logger.info("RF scan ABORTED — sample collection stopped immediately.")
+
     try:
         mav_manager.send_command("set_mode", mode="RTL")
         session_state["mission_state"] = "ABORTED"
+        logger.info("Mission aborted — PX4 commanded into RTL mode.")
         return MissionAbortResponse(success=True, action="RTL")
 
     except mavlink_commands.CommandRejected as e:

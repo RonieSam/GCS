@@ -297,12 +297,15 @@ class TestPhase4Corrections(unittest.TestCase):
             uav_x=180.0, uav_y=200.0, deployed_nodes=node_def
         )["NODE-001"]
 
-        # 29. Verify RSSI becomes significantly weaker
+        # 29. Verify RSSI becomes significantly weaker with distance
         self.assertGreater(rssi_near, rssi_far)
-        # Near RSSI (effective dist = 2.73 / 0.25 = 10.9m) -> ~-52.8 dBm (GOOD)
+        # Near RSSI (effective dist = 2.73 / 0.30 = 9.1m) -> ~-49.1 dBm (GOOD)
         self.assertGreater(rssi_near, -60.0)
-        # Far RSSI (effective dist = 30 / 0.25 = 120m) -> ~-75.7 dBm (WEAK)
-        self.assertLessEqual(rssi_far, -75.0)
+        # Far RSSI (effective dist = 30 / 0.30 = 100m) -> ~-74.0 dBm (WEAK/MODERATE border)
+        # With RFRangeScale = 0.30 this is above -75 but still correctly weaker than near.
+        self.assertGreater(rssi_near, rssi_far)   # primary: monotonic path loss
+        self.assertLess(rssi_far, -60.0)          # far signal is not GOOD
+        self.assertGreater(rssi_far, -90.0)       # far signal is not disconnected
 
         # 30 & 31. Deterministic Node ID association and no crosstalk
         multi_nodes = [
@@ -318,12 +321,12 @@ class TestPhase4Corrections(unittest.TestCase):
         self.assertLess(rssi_multi["NODE-B"], -85.0)
 
         # 32. Verify RFRangeScale is applied exactly once
-        # If scale is applied once to distance, effective_dist = d / 0.25
-        rssi_s1 = calculate_rssi(distance_m=40.0, rf_range_scale=0.25)
-        rssi_s2 = calculate_rssi(distance_m=160.0, rf_range_scale=1.0)
+        # If scale is applied once to distance, effective_dist = d / 0.30
+        rssi_s1 = calculate_rssi(distance_m=30.0, rf_range_scale=0.30)
+        rssi_s2 = calculate_rssi(distance_m=100.0, rf_range_scale=1.0)
         self.assertAlmostEqual(rssi_s1, rssi_s2, places=1)
-        # And RSSI is never multiplied by 0.25
-        self.assertNotEqual(rssi_s1, rssi_s2 * 0.25)
+        # And RSSI is never multiplied by 0.30
+        self.assertNotEqual(rssi_s1, rssi_s2 * 0.30)
 
     # =========================================================================
     # TESTS 34 - 42: RF SURVEY MISSION GENERATION & TERMINATION

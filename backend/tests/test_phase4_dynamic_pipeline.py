@@ -143,19 +143,18 @@ class TestPhase4HorizontalDistanceAndRSSIBehavior(unittest.TestCase):
         d = compute_distance_horizontal_m(152.4, 198.7, 150.0, 200.0)
         self.assertAlmostEqual(d, 2.729, places=2)
 
-    def test_altitude_excluded_from_rf_distance(self):
-        # Two calls at same horizontal coordinates with different altitudes
-        # MUST produce the exact same RSSI
-        node = [{"id": "COMM-001", "x": 150.0, "y": 200.0}]
+    def test_altitude_included_in_rf_distance(self):
+        # In 3D distance model, higher altitude increases 3D distance and decreases RSSI
+        node = [{"id": "COMM-001", "x": 150.0, "y": 200.0, "alt": 10.0}]
 
         rssi_alt15 = calculate_node_rssi_vector(
             uav_x=152.4, uav_y=198.7, uav_alt_m=15.0, deployed_nodes=node
         )
         rssi_alt50 = calculate_node_rssi_vector(
-            uav_x=152.4, uav_y=198.7, uav_alt_m=500.0, deployed_nodes=node
+            uav_x=152.4, uav_y=198.7, uav_alt_m=50.0, deployed_nodes=node
         )
 
-        self.assertEqual(rssi_alt15["COMM-001"], rssi_alt50["COMM-001"])
+        self.assertGreater(rssi_alt15["COMM-001"], rssi_alt50["COMM-001"])
 
     def test_rssi_decreases_monotonically_with_distance(self):
         # Fixed node at (150, 200)
@@ -176,18 +175,21 @@ class TestPhase4HorizontalDistanceAndRSSIBehavior(unittest.TestCase):
             uav_x=230.0, uav_y=200.0, deployed_nodes=node
         )["COMM-001"]
 
-        # RSSI must strictly decrease as distance increases
+        # RSSI must strictly decrease as distance increases (primary invariant)
         self.assertGreater(r_near, r_mid)
         self.assertGreater(r_mid, r_far)
 
-        # Classification check:
-        # Near (2.7m) should be GOOD (> -60 dBm)
+        # Classification check with RFRangeScale = 0.30:
+        # Near (2.7m, eff = 2.7/0.30 = 9m) should be GOOD (> -60 dBm)
         self.assertGreater(r_near, -60.0)
-        # Mid (30m, eff 120m) should be WEAK (-85 to -75 dBm)
-        self.assertLessEqual(r_mid, -75.0)
-        self.assertGreater(r_mid, -85.0)
-        # Far (80m, eff 320m) should be GAP (<= -85 dBm)
-        self.assertLessEqual(r_far, -85.0)
+        # Mid (30m, eff = 30/0.30 = 100m) -> ~-74 dBm (MODERATE/WEAK border)
+        # With scale 0.30, mid is between GOOD and WEAK (not as attenuated as with 0.25)
+        self.assertLess(r_mid, -60.0)       # Not GOOD
+        self.assertGreater(r_mid, -85.0)    # Not GAP
+        # Far (80m, eff = 80/0.30 = 267m) -> ~-83.4 dBm (WEAK)
+        self.assertGreater(r_far, -90.0)    # Not disconnected
+        self.assertLess(r_far, -75.0)       # Weak or worse
+        self.assertLess(r_far, r_mid)       # Far < Mid (confirmed monotonic)
 
 
 class TestPhase4ApiEndpoints(unittest.TestCase):

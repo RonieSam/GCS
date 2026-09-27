@@ -34,6 +34,14 @@ from coverage import haversine_distance_m, point_in_polygon
 _METRES_PER_DEG_LAT = 111_320.0
 
 
+def _latlon_dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Approximate planar ENU distance in metres between two GCS lat/lon points."""
+    cos_lat = math.cos(math.radians((lat1 + lat2) / 2.0))
+    dx = (lon2 - lon1) * _METRES_PER_DEG_LAT * cos_lat
+    dy = (lat2 - lat1) * _METRES_PER_DEG_LAT
+    return math.sqrt(dx * dx + dy * dy)
+
+
 def _polygon_bbox(polygon: List[Dict[str, float]]) -> Tuple[float, float, float, float]:
     """Return (min_lat, max_lat, min_lon, max_lon) for the polygon."""
     lats = [p["lat"] for p in polygon]
@@ -76,6 +84,8 @@ def generate_survey_path(
     polygon: List[Dict[str, float]],
     spacing_m: float = 25.0,
     altitude_m: float = config.DEFAULT_ALTITUDE,
+    uav_lat: Optional[float] = None,
+    uav_lon: Optional[float] = None,
 ) -> Dict:
     """Generate a zig-zag lawnmower survey path covering the given polygon.
 
@@ -83,16 +93,21 @@ def generate_survey_path(
         polygon: List of dicts with 'lat' and 'lon' defining the boundary vertices.
         spacing_m: Distance in metres between parallel sweep lines.
         altitude_m: Survey flight altitude in metres.
+        uav_lat: Current UAV latitude (GCS frame). Used to select the nearest
+            candidate start endpoint so the path begins closest to the UAV.
+        uav_lon: Current UAV longitude (GCS frame).
 
     Returns:
         dict containing:
-            waypoints: List of GCS waypoints with seq, lat, lon, alt, line_idx
-            px4_waypoints: List of PX4 waypoints with seq, lat, lon, alt
-            total_distance_m: Total path length in metres
-            waypoint_count: Number of waypoints
-            spacing_m: Configured spacing
-            altitude_m: Configured altitude
-            line_count: Number of survey sweep lines
+            waypoints: List of GCS waypoints with seq, lat, lon, alt, line_idx.
+                       waypoints[0] is guaranteed to be the nearest endpoint to UAV.
+            px4_waypoints: List of PX4 waypoints with seq, lat, lon, alt.
+            total_distance_m: Total path length in metres.
+            waypoint_count: Number of waypoints.
+            spacing_m: Configured spacing.
+            altitude_m: Configured altitude.
+            line_count: Number of survey sweep lines.
+            start_endpoint: {lat, lon, alt} of the selected first waypoint (green dot).
     """
     if not polygon or len(polygon) < 3:
         raise ValueError("Affected area polygon must have at least 3 vertices.")
@@ -186,6 +201,37 @@ def generate_survey_path(
             "line_idx": 0,
         }]
 
+    # ------------------------------------------------------------------
+    # Nearest-start selection
+    # The lawnmower path has two valid starting endpoints:
+    #   Endpoint A = waypoints[0]  (first generated start)
+    #   Endpoint B = waypoints[-1] (last generated point = would be start if reversed)
+    # Select whichever is closer to the UAV's current position.
+    # If UAV position is unknown, default to the generated order (Endpoint A).
+    # ------------------------------------------------------------------
+    endpoint_a = waypoints[0]
+    endpoint_b = waypoints[-1]
+    should_reverse = False
+
+    if uav_lat is not None and uav_lon is not None and len(waypoints) > 1:
+        dist_a = _latlon_dist_m(uav_lat, uav_lon, endpoint_a["lat"], endpoint_a["lon"])
+        dist_b = _latlon_dist_m(uav_lat, uav_lon, endpoint_b["lat"], endpoint_b["lon"])
+        if dist_b < dist_a:
+            should_reverse = True
+
+    if should_reverse:
+        # Reverse the entire path so it starts from endpoint_b
+        waypoints = list(reversed(waypoints))
+        # Re-assign sequential seq numbers
+        for i, wp in enumerate(waypoints):
+            wp["seq"] = i
+
+    start_endpoint = {
+        "lat": waypoints[0]["lat"],
+        "lon": waypoints[0]["lon"],
+        "alt": waypoints[0]["alt"],
+    }
+
     # Compute total distance along the zig-zag path
     total_distance_m = 0.0
     for i in range(len(waypoints) - 1):
@@ -213,4 +259,5 @@ def generate_survey_path(
         "spacing_m": spacing_m,
         "altitude_m": altitude_m,
         "line_count": actual_line_count,
+        "start_endpoint": start_endpoint,
     }

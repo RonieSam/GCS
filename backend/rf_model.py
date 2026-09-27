@@ -2,7 +2,7 @@
 Phase 4 — RF Model for Ground Communication Nodes.
 
 Calculates simulated RSSI values using the log-distance path-loss model
-with configurable RF range scaling (RFRangeScale = 0.25).
+with configurable RF range scaling (RFRangeScale = 0.30).
 
 Model formula:
     d = sqrt((droneX - nodeX)^2 + (droneY - nodeY)^2)   [Horizontal distance ONLY]
@@ -13,7 +13,7 @@ Default parameters match Simulink exactly:
     ReferenceRSSI     = -30 dBm
     PathLossExponent  = 2.2
     ReferenceDistance = 1.0 m
-    RFRangeScale      = 0.25 (effective horizontal coverage ~1/4 range)
+    RFRangeScale      = 0.30 (effective horizontal coverage ~3/10 range)
 """
 
 import logging
@@ -176,9 +176,15 @@ def calculate_node_rssi_vector(
         # Pure horizontal Euclidean distance in metres
         dist_h = compute_distance_horizontal_m(ux, uy, nx, ny)
 
+        # 3D Euclidean distance including altitude
+        n_alt = float(node.get("alt") if node.get("alt") is not None else node.get("altitude", 10.0))
+        u_alt = float(uav_alt_m) if uav_alt_m is not None else n_alt
+        dist_v = abs(u_alt - n_alt)
+        dist_3d = math.sqrt(dist_h ** 2 + dist_v ** 2)
+
         # Calculate effective distance scaled by RFRangeScale (applied exactly once)
         scale = max(rf_range_scale, 1e-6)
-        effective_dist = max(dist_h, reference_distance_m) / scale
+        effective_dist = max(dist_3d, reference_distance_m) / scale
 
         # Calculate log-distance path loss
         rssi = reference_rssi - (10.0 * path_loss_exponent * math.log10(effective_dist / reference_distance_m))
@@ -188,8 +194,8 @@ def calculate_node_rssi_vector(
 
         # Diagnostic output (per user spec)
         logger.info(
-            f"{nid} UAV=({ux:.1f},{uy:.1f}) NODE=({nx:.1f},{ny:.1f}) "
-            f"distance={dist_h:.2f}m effectiveDistance={effective_dist:.2f}m "
+            f"{nid} UAV=({ux:.1f},{uy:.1f},{u_alt:.1f}) NODE=({nx:.1f},{ny:.1f},{n_alt:.1f}) "
+            f"distance={dist_3d:.2f}m (h={dist_h:.2f}m,v={dist_v:.2f}m) effectiveDistance={effective_dist:.2f}m "
             f"P0={reference_rssi:.0f} n={path_loss_exponent:.1f} RSSI={rssi:.2f}dBm"
         )
 

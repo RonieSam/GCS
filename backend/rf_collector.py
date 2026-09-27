@@ -8,9 +8,9 @@ Scan States:
     IDLE           - No survey active; no samples accumulated.
     SCAN_READY     - RF scan generated & uploaded; ready to execute.
     SCANNING       - Actively flying survey path; accumulating GPS + RSSI samples.
-    RETURNING      - Survey path finished; UAV flying back to original start position.
-    SCAN_COMPLETE  - UAV returned and landed at original scan start coordinates.
-    FAILED         - Scan aborted or failed.
+    SCAN_COMPLETE  - Survey path finished at final waypoint. Samples frozen.
+    ABORTED        - Scan aborted mid-flight. Samples frozen. No more sampling.
+    FAILED         - Scan failed due to upload or setup error.
 
 Survey Samples Format:
     {
@@ -48,8 +48,9 @@ logger = logging.getLogger("rf_collector")
 SCAN_STATE_IDLE = "IDLE"
 SCAN_STATE_READY = "SCAN_READY"
 SCAN_STATE_SCANNING = "SCANNING"
-SCAN_STATE_RETURNING = "RETURNING"
+SCAN_STATE_RETURNING = "RETURNING"  # Legacy: kept for import compatibility
 SCAN_STATE_COMPLETE = "SCAN_COMPLETE"
+SCAN_STATE_ABORTED = "ABORTED"
 SCAN_STATE_FAILED = "FAILED"
 
 
@@ -156,6 +157,27 @@ class RFSurveyCollector:
                 f"RF Collector: SCAN_COMPLETE with {len(self._samples)} total survey samples."
             )
 
+    def abort_scan(self, reason: str = "User abort") -> None:
+        """Called when the user explicitly aborts an active RF scan.
+
+        Immediately transitions to ABORTED state.
+        Existing collected samples are preserved but frozen.
+        No further RF samples will be accepted by ingest_telemetry.
+        The dataset is marked incomplete (ABORTED, not SCAN_COMPLETE).
+        """
+        with self._lock:
+            old = self._state
+            if self._state not in (SCAN_STATE_SCANNING, SCAN_STATE_READY):
+                logger.info(
+                    f"RF Collector abort_scan() called but state is {old!r} — no-op."
+                )
+                return
+            self._state = SCAN_STATE_ABORTED
+            logger.warning(
+                f"RF Collector: ABORTED ({reason}) with {len(self._samples)} samples "
+                f"preserved (dataset marked incomplete)."
+            )
+
     def fail_scan(self, reason: str = "") -> None:
         with self._lock:
             self._state = SCAN_STATE_FAILED
@@ -196,13 +218,14 @@ class RFSurveyCollector:
                 current_state = SCAN_STATE_COMPLETE
 
         # ONLY accumulate survey samples while in SCANNING state.
-        # Do not accumulate when IDLE, SCAN_READY, SCAN_COMPLETE, or FAILED.
+        # Do not accumulate when IDLE, SCAN_READY, SCAN_COMPLETE, ABORTED, or FAILED.
         if current_state != SCAN_STATE_SCANNING:
             return None
 
         raw_lat = vehicle_state.get("latitude")
         raw_lon = vehicle_state.get("longitude")
-        alt = vehicle_state.get("altitude", 0.0)
+        rel_alt = vehicle_state.get("relative_altitude")
+        alt = rel_alt if rel_alt is not None else vehicle_state.get("altitude", 0.0)
 
         if raw_lat is None or raw_lon is None:
             return None

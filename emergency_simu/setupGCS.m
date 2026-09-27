@@ -18,6 +18,15 @@
 
 clear; clc;
 
+%% ---- Determine Script Location and Add functions/ to MATLAB Path ----
+% This MUST happen before any System Object classes are referenced,
+% including EnvironmentVisualizer, SurveyDataLoggerAfter, RFModel, etc.
+projectDir   = fileparts(mfilename('fullpath'));
+functionsDir = fullfile(projectDir, 'functions');
+addpath(functionsDir);
+rehash;
+fprintf('MATLAB path augmented: %s\n', functionsDir);
+
 %% ---- Configuration ----
 BACKEND_HOST = '127.0.0.1';
 BACKEND_PORT = 8000;
@@ -25,8 +34,8 @@ BACKEND_URL  = sprintf('http://%s:%d', BACKEND_HOST, BACKEND_PORT);
 SURVEY_DATA_ENDPOINT = [BACKEND_URL '/api/rf-survey/data'];
 NODES_ENDPOINT       = [BACKEND_URL '/api/nodes'];
 
-% Phase 4: Configurable RF range scale (1.0 = normal, 0.25 = 1/4 effective range)
-RFRangeScale = 0.25;
+% Phase 4 Final: Configurable RF range scale (1.0 = normal, 0.30 = 3/10 effective range)
+RFRangeScale = 0.30;
 
 % Local tangent-plane conversion constant (matching backend/coordinate_mapper.py)
 METRES_PER_DEG_LAT = 111320.0;
@@ -38,10 +47,11 @@ WEAK_THRESH     = -85.0;
 % GAP <= -85.0 dBm
 
 fprintf('====================================================================\n');
-fprintf('  Phase 4: Dynamic RF Coverage, Gap Detection & Candidate Placement \n');
+fprintf('  Phase 4 Final: Dynamic RF Coverage, Gap Detection & Candidate Placement \n');
 fprintf('====================================================================\n');
 fprintf('Backend URL:       %s\n', BACKEND_URL);
-fprintf('RF Range Scale:    %.2f (effective horizontal coverage ~1/4)\n', RFRangeScale);
+fprintf('RF Range Scale:    %.2f (effective horizontal coverage ~3/10)\n', RFRangeScale);
+fprintf('Functions Dir:     %s\n', functionsDir);
 
 %% ---- Fetch Survey Data & Deployed Nodes from Backend ----
 options = weboptions('Timeout', 10, 'ContentType', 'json');
@@ -61,6 +71,32 @@ catch ME
         surveyJson = struct('state', 'IDLE', 'sample_count', 0, ...
             'scan_start_position', [], 'affected_area', [], ...
             'deployed_nodes', [], 'samples', []);
+    end
+end
+
+%% ---- Check Backend Survey State (SCAN_COMPLETE required for valid data) ----
+if isfield(surveyJson, 'state')
+    backendState = surveyJson.state;
+    if strcmp(backendState, 'ABORTED')
+        warning('SETUP GCS: Backend reports RF survey state = ABORTED.');
+        fprintf('  The survey was aborted mid-flight. Sample data is INCOMPLETE.\n');
+        fprintf('  Sample count: %d (partial).\n', surveyJson.sample_count);
+        fprintf('  This dataset will NOT be treated as a valid completed survey.\n');
+        fprintf('  Please run a complete RF scan (SCAN_COMPLETE) before analysis.\n');
+        % Allow setup to continue with partial data for inspection, but mark it
+        surveyJson.is_complete = false;
+    elseif strcmp(backendState, 'SCAN_COMPLETE')
+        fprintf('Survey state: SCAN_COMPLETE (%d samples) - Valid completed survey.\n', ...
+            surveyJson.sample_count);
+        surveyJson.is_complete = true;
+    elseif strcmp(backendState, 'SCANNING')
+        fprintf('Survey state: SCANNING (%d samples so far) - Scan still in progress.\n', ...
+            surveyJson.sample_count);
+        surveyJson.is_complete = false;
+    else
+        fprintf('Survey state: %s (%d samples) - No valid survey data yet.\n', ...
+            backendState, surveyJson.sample_count);
+        surveyJson.is_complete = false;
     end
 end
 
@@ -416,13 +452,13 @@ for k = 1:numSamples
         'MarkerEdgeColor', 'k', 'MarkerSize', 10);
 end
 
-% Plot deployed ground nodes with coverage circles
+% Coverage circles use scaled radius consistent with RFRangeScale = 0.30
 for nIdx = 1:numNodesTotal
     plot(axCov, nodePositions(nIdx, 1), nodePositions(nIdx, 2), 'o', ...
         'MarkerFaceColor', 'b', 'MarkerEdgeColor', 'k', 'MarkerSize', 10);
     text(axCov, nodePositions(nIdx, 1) + 12, nodePositions(nIdx, 2), ...
         nodeLabels{nIdx}, 'FontWeight', 'bold', 'Color', 'b');
-    % Scaled coverage radius
+    % Scaled coverage radius = 250 * RFRangeScale = 75 m (for 0.30)
     viscircles(axCov, [nodePositions(nIdx, 1), nodePositions(nIdx, 2)], 250 * RFRangeScale, ...
         'Color', [0 0.5 1], 'LineStyle', '--', 'LineWidth', 1.2);
 end
@@ -494,13 +530,51 @@ save('gcs_survey_data.mat', ...
 fprintf('\nWorkspace variables loaded for EmergencyNetwork.slx:\n');
 fprintf('  areaSize, nodePositions, nodeLabels, dronePosition, surveyPoints, RFRangeScale, simStopTime\n');
 
-% Open the existing EmergencyNetwork.slx model directly
-modelName = 'EmergencyNetwork';
-if exist([modelName '.slx'], 'file')
-    fprintf('Opening %s.slx...\n', modelName);
-    open_system(modelName);
-else
-    fprintf('Note: %s.slx not found in directory.\n', modelName);
+%% ---- Validate Required System Object Classes ----
+% All required .m files must be resolvable on the MATLAB path before
+% EmergencyNetwork.slx is opened. This prevents the
+%   "System object name 'X' cannot be found"
+% error that occurs when the functions/ directory is not on the path.
+requiredClasses = { ...
+    'EnvironmentVisualizer', ...
+    'SurveyDataLoggerAfter', ...
+    'RFModel', ...
+    'CoverageMap', ...
+    'GapDetector', ...
+    'CandidatePlacement', ...
+    'GapVisualizer', ...
+    'DroneSurvey' ...
+};
+
+fprintf('\n---- System Object Class Validation ----\n');
+allFound = true;
+for k = 1:numel(requiredClasses)
+    cname = requiredClasses{k};
+    resolvedPath = which(cname);
+    if isempty(resolvedPath)
+        expected = fullfile(functionsDir, [cname '.m']);
+        fprintf('[MISSING] %s  (expected: %s)\n', cname, expected);
+        allFound = false;
+    else
+        fprintf('[OK]      %s -> %s\n', cname, resolvedPath);
+    end
 end
 
-fprintf('\nPhase 4 setup complete. Ready to run EmergencyNetwork.slx!\n');
+if ~allFound
+    error(['setupGCS: One or more required System Object classes could not be found.\n' ...
+           'Ensure the functions/ directory (%s)\n' ...
+           'is on the MATLAB path and all .m files are present.'], functionsDir);
+end
+fprintf('All required System Object classes resolved successfully.\n');
+
+% Open the existing EmergencyNetwork.slx model directly
+modelName = 'EmergencyNetwork';
+modelPath = fullfile(projectDir, [modelName '.slx']);
+if exist(modelPath, 'file')
+    fprintf('Opening %s.slx...\n', modelName);
+    open_system(modelPath);
+else
+    fprintf('Note: %s.slx not found at: %s\n', modelName, modelPath);
+end
+
+fprintf('\nPhase 4 Final setup complete. Ready to run EmergencyNetwork.slx!\n');
