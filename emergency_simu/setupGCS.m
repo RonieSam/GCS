@@ -452,15 +452,26 @@ for k = 1:numSamples
         'MarkerEdgeColor', 'k', 'MarkerSize', 10);
 end
 
-% Coverage circles use scaled radius consistent with RFRangeScale = 0.30
+% Plot deployed ground nodes with coverage circles
+
 for nIdx = 1:numNodesTotal
     plot(axCov, nodePositions(nIdx, 1), nodePositions(nIdx, 2), 'o', ...
         'MarkerFaceColor', 'b', 'MarkerEdgeColor', 'k', 'MarkerSize', 10);
+
     text(axCov, nodePositions(nIdx, 1) + 12, nodePositions(nIdx, 2), ...
         nodeLabels{nIdx}, 'FontWeight', 'bold', 'Color', 'b');
-    % Scaled coverage radius = 250 * RFRangeScale = 75 m (for 0.30)
-    viscircles(axCov, [nodePositions(nIdx, 1), nodePositions(nIdx, 2)], 250 * RFRangeScale, ...
-        'Color', [0 0.5 1], 'LineStyle', '--', 'LineWidth', 1.2);
+
+    % Scaled coverage radius
+    theta = linspace(0, 2*pi, 200);
+    radius = 250 * RFRangeScale;
+
+    circleX = nodePositions(nIdx, 1) + radius * cos(theta);
+    circleY = nodePositions(nIdx, 2) + radius * sin(theta);
+
+    plot(axCov, circleX, circleY, ...
+        'Color', [0 0.5 1], ...
+        'LineStyle', '--', ...
+        'LineWidth', 1.2);
 end
 
 % 2. Gap Analysis & Candidate Placement Figure
