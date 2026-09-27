@@ -253,12 +253,38 @@ async function loadNodes() {
 }
 
 /**
+ * Canonical helper to normalize and validate geographical coordinates.
+ * Returns { latitude: number, longitude: number } if valid, or null.
+ */
+function normalizeCoordinates(latInput, lonInput) {
+  if (latInput == null || lonInput == null) return null;
+  const lat = typeof latInput === "number" ? latInput : parseFloat(latInput);
+  const lon = typeof lonInput === "number" ? lonInput : parseFloat(lonInput);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return { latitude: lat, longitude: lon };
+}
+
+/**
  * addDeployedNode — renders a single node onto the shared nodeLayerGroup
  * and appends it to state.deployedNodes if not already present.
  */
 function addDeployedNode(node) {
+  if (!node) return;
+  const coords = normalizeCoordinates(node.lat ?? node.latitude, node.lon ?? node.longitude);
+  if (!coords) {
+    console.error("addDeployedNode received invalid coordinates:", node);
+    return;
+  }
+  node.lat = coords.latitude;
+  node.lon = coords.longitude;
+
   if (!state.nodeLayerGroup) {
     state.nodeLayerGroup = L.layerGroup().addTo(map);
+  }
+
+  // Prevent duplicate visual markers
+  if (node._marker && state.nodeLayerGroup.hasLayer(node._marker)) {
+    return;
   }
 
   const marker = L.circleMarker([node.lat, node.lon], {
@@ -315,6 +341,9 @@ function updateNodeUI() {
   const nodesEl = document.getElementById("stat-nodes");
   if (nodesEl) nodesEl.textContent = state.deployedNodes.length;
 
+  const rfsNodesEl = document.getElementById("stat-rfs-nodes");
+  if (rfsNodesEl) rfsNodesEl.textContent = state.deployedNodes.length;
+
   const selectEl = document.getElementById("select-delete-node");
   const deleteBtn = document.getElementById("btn-delete-node");
   if (selectEl) {
@@ -363,14 +392,24 @@ window.deleteDeployedNode = deleteDeployedNode;
  * pending deployment location, regardless of whether it came from a direct
  * map click or a candidate selection.
  */
-function selectDeploymentLocation(lat, lon, source) {
-  state.selectedDeploymentLocation = { lat, lon, source };
+function selectDeploymentLocation(latInput, lonInput, source) {
+  const coords = normalizeCoordinates(latInput, lonInput);
+  if (!coords) {
+    logEvent(`AUTO DEPLOY: rejected invalid selection coordinates (${latInput}, ${lonInput})`);
+    return;
+  }
+  const { latitude, longitude } = coords;
+  const src = source || "map";
+
+  // Single canonical selected location object
+  state.selectedLocation = { latitude, longitude, source: src };
+  state.selectedDeploymentLocation = { lat: latitude, lon: longitude, source: src };
 
   // Show / move the temporary selection marker (cyan crosshair ring)
   if (state.deploymentSelectionMarker) {
-    state.deploymentSelectionMarker.setLatLng([lat, lon]);
+    state.deploymentSelectionMarker.setLatLng([latitude, longitude]);
   } else {
-    state.deploymentSelectionMarker = L.circleMarker([lat, lon], {
+    state.deploymentSelectionMarker = L.circleMarker([latitude, longitude], {
       radius: 10,
       color: "#00E5FF",
       fillColor: "#00E5FF",
@@ -381,15 +420,15 @@ function selectDeploymentLocation(lat, lon, source) {
   }
 
   state.deploymentSelectionMarker.bindTooltip(
-    `Deploy here (${source})`,
+    `Deploy here (${src})`,
     { direction: "top", offset: [0, -10], className: "node-label" }
   ).openTooltip();
 
   const locText = document.getElementById("deploy-location-text");
-  if (locText) locText.textContent = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+  if (locText) locText.textContent = `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
 
   const srcEl = document.getElementById("stat-deploy-source");
-  if (srcEl) srcEl.textContent = source.toUpperCase();
+  if (srcEl) srcEl.textContent = src.toUpperCase();
 
   const hintEl = document.getElementById("deploy-hint");
   if (hintEl) hintEl.textContent = "Location selected — press AUTO DEPLOY to place a node here.";
@@ -397,32 +436,71 @@ function selectDeploymentLocation(lat, lon, source) {
   const deployBtn = document.getElementById("btn-auto-deploy");
   if (deployBtn) deployBtn.disabled = false;
 
-  logEvent(`Deployment location selected (${source}): lat=${lat.toFixed(5)}, lon=${lon.toFixed(5)}`);
+  logEvent(`Deployment location selected (${src}): lat=${latitude.toFixed(5)}, lon=${longitude.toFixed(5)}`);
 }
 
 // Running counter for deployed-node IDs
 let _deployNodeSeq = 0;
+let _deployInProgress = false;
 
 /**
  * autoDeploy — creates a new logical communication node, saves it to the
  * backend, and renders it on the map.
  */
 async function autoDeploy() {
-  if (!state.selectedDeploymentLocation) {
+  if (_deployInProgress) {
+    console.warn("AUTO DEPLOY: deployment already in progress.");
+    return;
+  }
+
+  const sel = state.selectedLocation || state.selectedDeploymentLocation;
+  if (!sel) {
     logEvent("AUTO DEPLOY: no location selected. Click the map or pick a candidate first.");
     return;
   }
 
-  const { lat, lon } = state.selectedDeploymentLocation;
+  const rawLat = sel.latitude != null ? sel.latitude : sel.lat;
+  const rawLon = sel.longitude != null ? sel.longitude : sel.lon;
+  const coords = normalizeCoordinates(rawLat, rawLon);
+
+  if (!coords) {
+    logEvent(`AUTO DEPLOY failed: invalid coordinates (${rawLat}, ${rawLon}).`);
+    const hintEl = document.getElementById("deploy-hint");
+    if (hintEl) hintEl.textContent = "Error: Invalid coordinates selected.";
+    return;
+  }
+
+  const { latitude, longitude } = coords;
+  _deployInProgress = true;
+  const deployBtn = document.getElementById("btn-auto-deploy");
+  if (deployBtn) deployBtn.disabled = true;
+
   _deployNodeSeq++;
   const nodeId = `COMM-${String(_deployNodeSeq).padStart(3, "0")}`;
 
-  const node = { id: nodeId, lat, lon, coverage_radius_m: 250 };
+  const nodePayload = { id: nodeId, lat: latitude, lon: longitude, coverage_radius_m: 250 };
   try {
-    const created = await apiPost("/api/nodes", node);
-    addDeployedNode(created || node);
+    const res = await apiPost("/api/nodes", nodePayload);
+    // apiPost returns { status, body }
+    const created = (res && res.body) ? res.body : nodePayload;
+    if (res && res.status !== 200) {
+      throw new Error((created && created.detail) || `Server error: HTTP ${res.status}`);
+    }
+
+    const createdCoords = normalizeCoordinates(created.lat ?? created.latitude, created.lon ?? created.longitude);
+    if (!createdCoords) {
+      throw new Error(`Server returned invalid coordinates for node ${created.id}`);
+    }
+    created.lat = createdCoords.latitude;
+    created.lon = createdCoords.longitude;
+
+    addDeployedNode(created);
   } catch (err) {
     logEvent(`AUTO DEPLOY failed: ${err.message}`);
+    if (deployBtn && (state.selectedLocation || state.selectedDeploymentLocation)) {
+      deployBtn.disabled = false;
+    }
+    _deployInProgress = false;
     return;
   }
 
@@ -430,6 +508,7 @@ async function autoDeploy() {
     map.removeLayer(state.deploymentSelectionMarker);
     state.deploymentSelectionMarker = null;
   }
+  state.selectedLocation = null;
   state.selectedDeploymentLocation = null;
 
   const locText = document.getElementById("deploy-location-text");
@@ -439,11 +518,11 @@ async function autoDeploy() {
   const hintEl = document.getElementById("deploy-hint");
   if (hintEl) hintEl.textContent = "Click the map or select a candidate to set a deployment location.";
 
-  const deployBtn = document.getElementById("btn-auto-deploy");
   if (deployBtn) deployBtn.disabled = true;
+  _deployInProgress = false;
 
   logEvent(
-    `AUTO DEPLOY: node ${nodeId} deployed at lat=${lat.toFixed(5)}, lon=${lon.toFixed(5)}. ` +
+    `AUTO DEPLOY: node ${nodeId} deployed at lat=${latitude.toFixed(5)}, lon=${longitude.toFixed(5)}. ` +
     `Total active deployed nodes: ${state.deployedNodes.length}.`
   );
 }
@@ -1032,7 +1111,7 @@ async function abortMission() {
   const btn = document.getElementById("btn-abort-mission");
 
   // Guard: do not abort if there is no executing mission
-  if (!state.missionExecuting && state.rfScanState !== "RUNNING") {
+  if (!state.missionExecuting && state.rfScanState !== "RUNNING" && state.rfScanState !== "APPROACHING") {
     logEvent("ABORT: no active mission to abort — button should be disabled.");
     btn.disabled = true;
     return;
@@ -1068,7 +1147,7 @@ async function abortMission() {
     document.getElementById("stat-mission-state").textContent = "ABORTED";
 
     // Update RF scan state if this was an RF scan abort
-    if (state.rfScanState === "RUNNING" || state.rfScanState === "MISSION_UPLOADED") {
+    if (state.rfScanState === "RUNNING" || state.rfScanState === "MISSION_UPLOADED" || state.rfScanState === "APPROACHING") {
       state.rfScanState = "ABORTED";
       const rfStateEl = document.getElementById("stat-rf-state");
       if (rfStateEl) rfStateEl.textContent = "ABORTED";
@@ -2115,6 +2194,7 @@ function renderRfSurveyPanel(data) {
     const hints = {
       IDLE:          "No scan active. Upload and start an RF Scan mission to collect data.",
       SCAN_READY:    "Mission uploaded. Start RF Scan to begin collecting data.",
+      APPROACHING:   "UAV en route to survey start point (Green Dot). Sampling will begin on arrival.",
       SCANNING:      `Collecting samples… ${data.sample_count || 0} samples so far.`,
       SCAN_COMPLETE: `Scan complete — ${data.sample_count || 0} survey samples collected. UAV hovering at final survey waypoint.`,
       ABORTED:       `Scan aborted — ${data.sample_count || 0} samples preserved (incomplete dataset). Reset to start a new scan.`,
@@ -2214,7 +2294,7 @@ async function resetSurveyData() {
     if (stateEl)   stateEl.textContent   = "IDLE";
     if (samplesEl) samplesEl.textContent = "0";
     if (rssiEl)    rssiEl.textContent    = "--";
-    if (nodesEl)   nodesEl.textContent   = "--";
+    if (nodesEl)   nodesEl.textContent   = state.deployedNodes.length;
     if (hintEl)    hintEl.textContent    = "Survey data cleared. Ready for next scan.";
     if (container) container.classList.add("hidden");
     if (rfStateEl) rfStateEl.textContent = "IDLE";
@@ -2284,11 +2364,18 @@ function initControls() {
 // ---------------------------------------------------------------------------
 
 async function boot() {
+  // Phase 4 Final: Fresh session begins with clean state (0 deployed nodes, RF collector IDLE)
+  try {
+    await apiPost("/api/session/init", {});
+  } catch (err) {
+    console.warn("Session init notice:", err.message);
+  }
+
   // Initialize map first so LayerGroups and markers can attach properly
   initMap(FALLBACK_CENTER.lat, FALLBACK_CENTER.lon);
   initControls();
 
-  // Load and render all persisted deployed nodes from backend (single source of truth)
+  // Load and render active deployed nodes (clean session = 0 nodes)
   const nodes = await loadNodes();
   if (Array.isArray(nodes) && nodes.length > 0) {
     map.setView([nodes[0].lat, nodes[0].lon], 16);

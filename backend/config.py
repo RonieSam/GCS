@@ -62,6 +62,7 @@ MISSION_ITEM_TIMEOUT_S = 5
 RF_RANGE_SCALE = 0.30  # Phase 4 Final: 1.0 = current range, 0.30 = approx 3/10 range
 COVERAGE_RADIUS_DEFAULT_M = 250 * RF_RANGE_SCALE  # scaled coverage radius (75 m)
 GRID_RESOLUTION_M = 20  # spacing between coverage-grid sample points
+RF_SCAN_START_TOLERANCE_M = 15.0  # Arrival tolerance (metres) before RF sampling begins at green dot
 
 # --- Scoring weights (used from Phase 4 onward) ---
 COVERAGE_WEIGHT = 0.60

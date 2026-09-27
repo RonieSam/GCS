@@ -98,13 +98,13 @@
         </div>
 
         <div id="deployed-nodes-container" style="margin-top:12px;border-top:1px solid #232c37;padding-top:10px;">
-          <label class="field-label" style="margin-bottom:4px;display:block;">Delete Deployed Node</label>
-          <div style="display:flex;gap:6px;">
-            <select id="select-delete-node" class="field-input" style="flex:1;">
+          <label class="field-label" style="margin-bottom:6px;display:block;">Delete Deployed Node</label>
+          <div style="display:flex;flex-direction:column;gap:6px;width:100%;box-sizing:border-box;">
+            <select id="select-delete-node" class="field-input" style="width:100%;min-width:0;box-sizing:border-box;">
               <option value="">(No nodes deployed)</option>
             </select>
-            <button id="btn-delete-node" class="btn btn-danger" style="padding:4px 12px;font-size:12px;" disabled>
-              Delete
+            <button id="btn-delete-node" class="btn btn-danger" style="width:100%;box-sizing:border-box;padding:6px 12px;font-size:12px;" disabled>
+              Delete Node
             </button>
           </div>
           <p class="hint" style="margin-top:4px;font-size:11px;">
@@ -196,7 +196,7 @@
           </div>
           <div class="stat">
             <span class="stat-label">Nodes Tracked</span>
-            <span class="stat-value" id="stat-rfs-nodes">--</span>
+            <span class="stat-value" id="stat-rfs-nodes">0</span>
           </div>
         </div>
 

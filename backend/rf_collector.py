@@ -40,6 +40,7 @@ from typing import Dict, List, Optional, Tuple
 
 import config
 import coordinate_mapper
+from coverage import haversine_distance_m
 from rf_model import calculate_node_rssi_vector
 
 logger = logging.getLogger("rf_collector")
@@ -47,6 +48,7 @@ logger = logging.getLogger("rf_collector")
 # Scan states
 SCAN_STATE_IDLE = "IDLE"
 SCAN_STATE_READY = "SCAN_READY"
+SCAN_STATE_APPROACHING = "APPROACHING"
 SCAN_STATE_SCANNING = "SCANNING"
 SCAN_STATE_RETURNING = "RETURNING"  # Legacy: kept for import compatibility
 SCAN_STATE_COMPLETE = "SCAN_COMPLETE"
@@ -66,6 +68,8 @@ class RFSurveyCollector:
         self._deployed_nodes: List[Dict] = []
         self._survey_waypoint_count: int = 0
         self._total_mission_items: int = 0
+        self._first_survey_waypoint: Optional[Dict] = None  # {latitude, longitude} in GCS coords
+        self._arrival_tolerance_m: float = getattr(config, "RF_SCAN_START_TOLERANCE_M", 15.0)
         self._last_sample_time: float = 0.0
         self._min_sample_interval_s: float = 0.25  # up to 4 Hz collection
         self._last_uav_pos: Optional[Tuple[float, float]] = None
@@ -97,6 +101,7 @@ class RFSurveyCollector:
         deployed_nodes: List[Dict],
         survey_waypoint_count: int,
         total_mission_items: int,
+        first_survey_waypoint: Optional[Dict] = None,
     ) -> None:
         """Called when RF scan is generated/uploaded and ready."""
         with self._lock:
@@ -106,11 +111,13 @@ class RFSurveyCollector:
             self._deployed_nodes = [dict(n) for n in deployed_nodes]
             self._survey_waypoint_count = survey_waypoint_count
             self._total_mission_items = total_mission_items
+            self._first_survey_waypoint = dict(first_survey_waypoint) if first_survey_waypoint else None
             self._state = SCAN_STATE_READY
             self._last_sample_time = 0.0
             self._last_uav_pos = None
             logger.info(
                 f"RF Collector prepared: start_pos={start_position}, "
+                f"first_wp={self._first_survey_waypoint}, "
                 f"nodes={len(deployed_nodes)}, survey_wps={survey_waypoint_count}"
             )
 
@@ -137,11 +144,22 @@ class RFSurveyCollector:
             )
 
     def start_scan(self) -> None:
-        """Called when mission execution begins."""
+        """Called when mission execution begins.
+        
+        If a first survey waypoint (green dot) is designated, the collector enters
+        APPROACHING state and waits until telemetry confirms arrival before recording samples.
+        """
         with self._lock:
-            self._state = SCAN_STATE_SCANNING
+            if self._first_survey_waypoint:
+                self._state = SCAN_STATE_APPROACHING
+                logger.info(
+                    f"RF Collector: state APPROACHING — waiting for UAV arrival at "
+                    f"green dot ({self._first_survey_waypoint}) before sampling."
+                )
+            else:
+                self._state = SCAN_STATE_SCANNING
+                logger.info("RF Collector: SCANNING started directly.")
             self._last_sample_time = 0.0
-            logger.info("RF Collector: SCANNING started.")
 
     def finish_survey_segment(self) -> None:
         """Called when the final survey waypoint is reached.
@@ -167,7 +185,7 @@ class RFSurveyCollector:
         """
         with self._lock:
             old = self._state
-            if self._state not in (SCAN_STATE_SCANNING, SCAN_STATE_READY):
+            if self._state not in (SCAN_STATE_SCANNING, SCAN_STATE_READY, SCAN_STATE_APPROACHING):
                 logger.info(
                     f"RF Collector abort_scan() called but state is {old!r} — no-op."
                 )
@@ -188,14 +206,50 @@ class RFSurveyCollector:
             self._state = SCAN_STATE_IDLE
             self._samples.clear()
             self._scan_start_position = None
-            logger.info("RF Collector reset to IDLE.")
+            self._affected_area = None
+            self._deployed_nodes.clear()
+            self._survey_waypoint_count = 0
+            self._total_mission_items = 0
+            self._first_survey_waypoint = None
+            self._last_sample_time = 0.0
+            self._last_uav_pos = None
+            logger.info("RF Collector reset to IDLE (all samples, nodes, and start state cleared).")
 
     # ------------------------------------------------------------------
     # Telemetry ingestion & RSSI computation
     # ------------------------------------------------------------------
 
+    def _resolve_coords(self, raw_lat_f: float, raw_lon_f: float) -> Tuple[float, float, float, float]:
+        """Resolve raw telemetry coordinates into (gcs_lat, gcs_lon, px4_lat, px4_lon)."""
+        mapper = coordinate_mapper.get_mapper()
+        if not config.SIMULATION_MODE:
+            return raw_lat_f, raw_lon_f, raw_lat_f, raw_lon_f
+
+        refs = mapper.get_references()
+        px4_ref = refs.get("px4_reference", {})
+        gcs_ref = refs.get("gcs_reference", {})
+        p_lat = px4_ref.get("latitude", config.PX4_REFERENCE_LAT)
+        p_lon = px4_ref.get("longitude", config.PX4_REFERENCE_LON)
+        g_lat = gcs_ref.get("latitude", config.GCS_REFERENCE_LAT)
+        g_lon = gcs_ref.get("longitude", config.GCS_REFERENCE_LON)
+
+        dist_to_gcs = math.hypot(raw_lat_f - g_lat, raw_lon_f - g_lon)
+        dist_to_px4 = math.hypot(raw_lat_f - p_lat, raw_lon_f - p_lon)
+
+        if dist_to_gcs < dist_to_px4:
+            gcs_lat, gcs_lon = raw_lat_f, raw_lon_f
+            px4_lat, px4_lon = mapper.gcs_to_px4(gcs_lat, gcs_lon)
+        else:
+            px4_lat, px4_lon = raw_lat_f, raw_lon_f
+            gcs_lat, gcs_lon = mapper.px4_to_gcs(px4_lat, px4_lon)
+
+        return gcs_lat, gcs_lon, px4_lat, px4_lon
+
     def ingest_telemetry(self, vehicle_state: Dict) -> Optional[Dict]:
         """Ingest live vehicle telemetry.
+
+        If in APPROACHING state, monitors UAV arrival at first survey waypoint (green dot).
+        Only upon arrival (distance <= arrival_tolerance) does it transition to SCANNING.
 
         If in SCANNING state, computes RSSI for all currently deployed nodes and stores a sample.
         When the final survey waypoint is reached, transitions directly to SCAN_COMPLETE
@@ -204,6 +258,36 @@ class RFSurveyCollector:
         with self._lock:
             current_state = self._state
             survey_wps = self._survey_waypoint_count
+            first_wp = dict(self._first_survey_waypoint) if self._first_survey_waypoint else None
+
+        raw_lat = vehicle_state.get("latitude")
+        raw_lon = vehicle_state.get("longitude")
+
+        # Arrival verification: wait for UAV to arrive at the green start dot
+        if current_state == SCAN_STATE_APPROACHING:
+            if not first_wp:
+                with self._lock:
+                    self._state = SCAN_STATE_SCANNING
+                    current_state = SCAN_STATE_SCANNING
+            else:
+                if raw_lat is None or raw_lon is None:
+                    return None
+                gcs_lat, gcs_lon, _, _ = self._resolve_coords(float(raw_lat), float(raw_lon))
+                dist_to_start = haversine_distance_m(
+                    gcs_lat, gcs_lon, first_wp["latitude"], first_wp["longitude"]
+                )
+                if dist_to_start <= self._arrival_tolerance_m:
+                    with self._lock:
+                        self._state = SCAN_STATE_SCANNING
+                        current_state = SCAN_STATE_SCANNING
+                    logger.info(
+                        f"RF Collector: UAV reached green start point "
+                        f"(dist={dist_to_start:.1f}m <= {self._arrival_tolerance_m}m). "
+                        "Transitioned APPROACHING -> SCANNING. RF sampling begins."
+                    )
+                else:
+                    # Still en route to green dot — DO NOT sample yet!
+                    return None
 
         m_reached = vehicle_state.get("mission_item_reached")
         m_current = vehicle_state.get("mission_current")
@@ -218,17 +302,15 @@ class RFSurveyCollector:
                 current_state = SCAN_STATE_COMPLETE
 
         # ONLY accumulate survey samples while in SCANNING state.
-        # Do not accumulate when IDLE, SCAN_READY, SCAN_COMPLETE, ABORTED, or FAILED.
+        # Do not accumulate when IDLE, SCAN_READY, APPROACHING, SCAN_COMPLETE, ABORTED, or FAILED.
         if current_state != SCAN_STATE_SCANNING:
             return None
 
-        raw_lat = vehicle_state.get("latitude")
-        raw_lon = vehicle_state.get("longitude")
-        rel_alt = vehicle_state.get("relative_altitude")
-        alt = rel_alt if rel_alt is not None else vehicle_state.get("altitude", 0.0)
-
         if raw_lat is None or raw_lon is None:
             return None
+
+        rel_alt = vehicle_state.get("relative_altitude")
+        alt = rel_alt if rel_alt is not None else vehicle_state.get("altitude", 0.0)
 
         now = time.time()
         with self._lock:
@@ -238,35 +320,7 @@ class RFSurveyCollector:
             nodes = list(self._deployed_nodes)
 
         # Coordinate resolution: ensure coordinates are correctly in GCS space
-        # without double-conversion regardless of whether raw PX4 or remapped GCS
-        # coordinates are supplied in vehicle_state.
-        mapper = coordinate_mapper.get_mapper()
-        raw_lat_f = float(raw_lat)
-        raw_lon_f = float(raw_lon)
-
-        if not config.SIMULATION_MODE:
-            gcs_lat, gcs_lon = raw_lat_f, raw_lon_f
-            px4_lat, px4_lon = raw_lat_f, raw_lon_f
-        else:
-            refs = mapper.get_references()
-            px4_ref = refs.get("px4_reference", {})
-            gcs_ref = refs.get("gcs_reference", {})
-            p_lat = px4_ref.get("latitude", config.PX4_REFERENCE_LAT)
-            p_lon = px4_ref.get("longitude", config.PX4_REFERENCE_LON)
-            g_lat = gcs_ref.get("latitude", config.GCS_REFERENCE_LAT)
-            g_lon = gcs_ref.get("longitude", config.GCS_REFERENCE_LON)
-
-            dist_to_gcs = math.hypot(raw_lat_f - g_lat, raw_lon_f - g_lon)
-            dist_to_px4 = math.hypot(raw_lat_f - p_lat, raw_lon_f - p_lon)
-
-            if dist_to_gcs < dist_to_px4:
-                # Already in GCS coordinate space
-                gcs_lat, gcs_lon = raw_lat_f, raw_lon_f
-                px4_lat, px4_lon = mapper.gcs_to_px4(gcs_lat, gcs_lon)
-            else:
-                # In PX4 simulation coordinate space
-                px4_lat, px4_lon = raw_lat_f, raw_lon_f
-                gcs_lat, gcs_lon = mapper.px4_to_gcs(px4_lat, px4_lon)
+        gcs_lat, gcs_lon, px4_lat, px4_lon = self._resolve_coords(float(raw_lat), float(raw_lon))
 
         # Calculate simulated RSSI for each currently deployed communication node
         # Uses strictly horizontal distance without altitude contamination
@@ -309,14 +363,16 @@ class RFSurveyCollector:
         with self._lock:
             samples_copy = [dict(s) for s in self._samples]
             nodes_copy = [dict(n) for n in self._deployed_nodes]
-            area_copy = [dict(p) for p in self._affected_area] if self._affected_area else None
             start_pos_copy = dict(self._scan_start_position) if self._scan_start_position else None
+            area_copy = [dict(p) for p in self._affected_area] if self._affected_area else None
+            first_wp_copy = dict(self._first_survey_waypoint) if self._first_survey_waypoint else None
             state_copy = self._state
 
         return {
             "state": state_copy,
             "sample_count": len(samples_copy),
             "scan_start_position": start_pos_copy,
+            "first_survey_waypoint": first_wp_copy,
             "affected_area": area_copy,
             "deployed_nodes": nodes_copy,
             "samples": samples_copy,

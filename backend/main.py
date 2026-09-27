@@ -133,8 +133,14 @@ _CANDIDATE_MATCH_TOLERANCE_M = 1.0  # treat as "the same point" within this radi
 @app.on_event("startup")
 async def on_startup():
     init_db()
-    # Phase 4 — synchronize RF collector with currently persisted deployed nodes
-    get_rf_collector().update_deployed_nodes(list_nodes())
+    # Phase 4 Final — fresh GCS session starts with 0 deployed nodes and clean RF collector
+    clear_nodes()
+    rf_collector = get_rf_collector()
+    rf_collector.reset()
+    rf_collector.update_deployed_nodes([])
+    session_state["rf_scan_state"] = "IDLE"
+    session_state["rf_scan_mission"] = None
+    session_state["mission_state"] = "IDLE"
     # Non-blocking: SITL may not be up yet (or ever, in a pure-API test
     # run), and the rest of the API — area/coverage/candidates/missions —
     # doesn't depend on a vehicle link, so startup must not wait on it.
@@ -510,6 +516,20 @@ def api_clear_nodes():
     return {"success": True, "count": 0}
 
 
+@app.post("/api/session/init")
+def api_session_init():
+    """Initialize a fresh clean GCS session: clear active nodes and reset RF collector."""
+    clear_nodes()
+    rf_collector = get_rf_collector()
+    rf_collector.reset()
+    rf_collector.update_deployed_nodes([])
+    session_state["rf_scan_state"] = "IDLE"
+    session_state["rf_scan_mission"] = None
+    session_state["mission_state"] = "IDLE"
+    logger.info("Fresh GCS session initialized: 0 deployed nodes, RF collector IDLE.")
+    return {"success": True, "active_nodes": 0, "rf_state": "IDLE"}
+
+
 # ---------------------------------------------------------------------------
 # Area + coverage analysis
 # ---------------------------------------------------------------------------
@@ -592,15 +612,27 @@ def api_rf_scan_generate(req: Optional[RFScanGenerateRequest] = None):
     raw_uav_lat = uav_state.get("latitude")
     raw_uav_lon = uav_state.get("longitude")
 
-    # Convert UAV pos to GCS frame if connected (it may be in PX4 space)
+    # Convert UAV pos to GCS frame if connected (handles both PX4 and GCS raw frames)
     uav_gcs_lat = None
     uav_gcs_lon = None
     if raw_uav_lat is not None and raw_uav_lon is not None:
         mapper = coordinate_mapper.get_mapper()
         if config.SIMULATION_MODE:
-            uav_gcs_lat, uav_gcs_lon = mapper.px4_to_gcs(raw_uav_lat, raw_uav_lon)
+            refs = mapper.get_references()
+            px4_ref = refs.get("px4_reference", {})
+            gcs_ref = refs.get("gcs_reference", {})
+            p_lat = px4_ref.get("latitude", config.PX4_REFERENCE_LAT)
+            p_lon = px4_ref.get("longitude", config.PX4_REFERENCE_LON)
+            g_lat = gcs_ref.get("latitude", config.GCS_REFERENCE_LAT)
+            g_lon = gcs_ref.get("longitude", config.GCS_REFERENCE_LON)
+            raw_lat_f = float(raw_uav_lat)
+            raw_lon_f = float(raw_uav_lon)
+            if math.hypot(raw_lat_f - g_lat, raw_lon_f - g_lon) < math.hypot(raw_lat_f - p_lat, raw_lon_f - p_lon):
+                uav_gcs_lat, uav_gcs_lon = raw_lat_f, raw_lon_f
+            else:
+                uav_gcs_lat, uav_gcs_lon = mapper.px4_to_gcs(raw_lat_f, raw_lon_f)
         else:
-            uav_gcs_lat, uav_gcs_lon = raw_uav_lat, raw_uav_lon
+            uav_gcs_lat, uav_gcs_lon = float(raw_uav_lat), float(raw_uav_lon)
         logger.info(
             f"RF scan generate: UAV GCS pos lat={uav_gcs_lat:.7f}, lon={uav_gcs_lon:.7f} "
             f"— will select nearest survey endpoint as start."
@@ -827,12 +859,17 @@ def api_rf_scan_upload():
     # Survey finishes at the final survey waypoint with no return-to-start or landing leg.
     deployed_nodes = list_nodes()
     rf_collector = get_rf_collector()
+    first_wp = rf_mission["waypoints"][0] if rf_mission.get("waypoints") else None
+    first_survey_wp = (
+        {"latitude": first_wp["lat"], "longitude": first_wp["lon"]} if first_wp else None
+    )
     rf_collector.prepare_scan(
         start_position=scan_start_pos,
         affected_area=session_state.get("polygon"),
         deployed_nodes=deployed_nodes,
         survey_waypoint_count=rf_mission["waypoint_count"],
         total_mission_items=n,
+        first_survey_waypoint=first_survey_wp,
     )
     logger.info(
         f"RF scan mission uploaded: {n} items accepted by PX4. "
@@ -1160,7 +1197,7 @@ def api_mission_start():
             rf_collector = get_rf_collector()
             rf_collector.start_scan()
             session_state["rf_scan_state"] = "RUNNING"
-            logger.info("RF Scan mission started — collector now SCANNING.")
+            logger.info(f"RF Scan mission started — collector state: {rf_collector.state}.")
 
         return MissionStartResponse(success=True, mode="MISSION")
 
@@ -1195,12 +1232,9 @@ def api_mission_abort():
             "PX4 is not connected. Cannot send abort/RTL command.",
         )
 
-    # Guard: check if there is actually an abortable active mission
-    rf_scan_active = session_state.get("rf_scan_state") in ("RUNNING", "MISSION_UPLOADED")
-    normal_mission_active = session_state.get("mission_state") == "EXECUTING"
-
-    if not rf_scan_active and not normal_mission_active:
-        logger.info("ABORT requested but no active mission to abort.")
+    # Guard against double-abort: if already aborted, reject subsequent abort attempts
+    if session_state.get("mission_state") == "ABORTED" and session_state.get("rf_scan_state") in ("ABORTED", "IDLE"):
+        logger.info("ABORT requested but mission already aborted — no active mission.")
         return MissionAbortResponse(
             success=False,
             action="NONE",
@@ -1209,6 +1243,7 @@ def api_mission_abort():
 
     # Immediately abort RF sample collection if RF scan was active.
     # This MUST happen before the RTL command so samples stop the instant abort is triggered.
+    rf_scan_active = session_state.get("rf_scan_state") in ("RUNNING", "MISSION_UPLOADED", "APPROACHING")
     if rf_scan_active:
         rf_collector = get_rf_collector()
         rf_collector.abort_scan(reason="User abort via /api/mission/abort")
@@ -1374,9 +1409,12 @@ def api_rf_survey_reset():
     """
     rf_collector = get_rf_collector()
     rf_collector.reset()
+    active_nodes = list_nodes()
+    rf_collector.update_deployed_nodes(active_nodes)
     session_state["rf_scan_state"] = "IDLE"
-    logger.info("RF Survey collector reset to IDLE.")
-    return {"success": True, "state": "IDLE"}
+    session_state["rf_scan_mission"] = None
+    logger.info(f"RF Survey collector reset to IDLE with {len(active_nodes)} active nodes.")
+    return {"success": True, "state": "IDLE", "active_nodes": len(active_nodes)}
 
 
 @app.websocket("/ws/rf-survey")

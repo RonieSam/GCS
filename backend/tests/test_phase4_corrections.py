@@ -17,15 +17,18 @@ import math
 import os
 import sys
 import unittest
+from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from fastapi.testclient import TestClient
 
 import config
+from coverage import haversine_distance_m
 from database import clear_nodes, delete_node, init_db, insert_node, list_nodes
-from main import app, session_state
+from main import app, mav_manager, session_state
 import mavlink_mission
+import survey_planner
 from rf_collector import (
     SCAN_STATE_COMPLETE,
     SCAN_STATE_IDLE,
@@ -449,6 +452,161 @@ class TestPhase4Corrections(unittest.TestCase):
         # Land coordinates match target
         self.assertEqual(items[2]["lat"], 13.085)
         self.assertEqual(items[2]["lon"], 80.275)
+
+
+class TestPhase4FinalSessionAndSamplingFixes(unittest.TestCase):
+    """Regression tests for clean session startup, RF sampling start at green dot,
+    start endpoint selection, and abort idempotency."""
+
+    def setUp(self):
+        self.client = TestClient(app)
+        self.client.__enter__()
+        clear_nodes()
+        self.collector = get_rf_collector()
+        self.collector.reset()
+
+    def tearDown(self):
+        clear_nodes()
+        self.collector.reset()
+
+    def test_fresh_session_starts_zero_nodes(self):
+        """A new session begins with 0 deployed nodes and clean RF collector."""
+        # Insert a node
+        insert_node("TEMP-001", 13.0827, 80.2707)
+        self.assertEqual(len(list_nodes()), 1)
+
+        # Initialize session (simulates fresh GCS boot)
+        r = self.client.post("/api/session/init")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["active_nodes"], 0)
+        self.assertEqual(body["rf_state"], "IDLE")
+
+        # Verify DB and collector are both clean 0 nodes
+        self.assertEqual(len(list_nodes()), 0)
+        survey_data = self.collector.get_survey_data()
+        self.assertEqual(len(survey_data["deployed_nodes"]), 0)
+        self.assertEqual(survey_data["sample_count"], 0)
+        self.assertEqual(survey_data["state"], "IDLE")
+
+    def test_rf_sampling_delayed_until_green_dot_arrival(self):
+        """RF sampling does NOT begin when mission starts; it begins only when UAV reaches green dot."""
+        green_dot = {"latitude": 13.0830, "longitude": 80.2710}
+        self.collector.prepare_scan(
+            start_position={"latitude": 13.0800, "longitude": 80.2680, "altitude": 20.0},
+            affected_area=None,
+            deployed_nodes=[{"id": "COMM-001", "lat": 13.0835, "lon": 80.2715}],
+            survey_waypoint_count=4,
+            total_mission_items=5,
+            first_survey_waypoint=green_dot,
+        )
+        self.assertEqual(self.collector.state, "SCAN_READY")
+
+        # 1. Mission starts -> collector enters APPROACHING (not SCANNING)
+        self.collector.start_scan()
+        self.assertEqual(self.collector.state, "APPROACHING")
+
+        # 2. UAV is en route (500m away) -> NO samples recorded, state remains APPROACHING
+        sample_far = self.collector.ingest_telemetry({
+            "latitude": 13.0800,
+            "longitude": 80.2680,
+            "altitude": 20.0,
+            "mission_current": 1,
+        })
+        self.assertIsNone(sample_far)
+        self.assertEqual(len(self.collector._samples), 0)
+        self.assertEqual(self.collector.state, "APPROACHING")
+
+        # 3. UAV reaches green dot (within arrival tolerance of 15m) -> transitions to SCANNING and collects sample 1
+        sample_at_dot = self.collector.ingest_telemetry({
+            "latitude": 13.0830,
+            "longitude": 80.2710,
+            "altitude": 20.0,
+            "mission_current": 1,
+        })
+        self.assertIsNotNone(sample_at_dot)
+        self.assertEqual(self.collector.state, "SCANNING")
+        self.assertEqual(len(self.collector._samples), 1)
+        self.assertEqual(sample_at_dot["sample_id"], 1)
+        self.assertAlmostEqual(sample_at_dot["latitude"], green_dot["latitude"], places=4)
+        self.assertAlmostEqual(sample_at_dot["longitude"], green_dot["longitude"], places=4)
+
+    def test_start_point_nearest_selection_cases(self):
+        """Start endpoint selects whichever survey endpoint is closer to the UAV."""
+        polygon = [
+            {"lat": 13.081, "lon": 80.270},
+            {"lat": 13.085, "lon": 80.270},
+            {"lat": 13.085, "lon": 80.274},
+            {"lat": 13.081, "lon": 80.274},
+        ]
+
+        # Case A: UAV positioned near the south-west endpoint (13.081, 80.270)
+        res_a = survey_planner.generate_survey_path(
+            polygon, spacing_m=30.0, altitude_m=15.0,
+            uav_lat=13.081, uav_lon=80.270,
+        )
+        wp_first_a = res_a["waypoints"][0]
+        self.assertEqual(res_a["start_endpoint"]["lat"], wp_first_a["lat"])
+        self.assertEqual(res_a["start_endpoint"]["lon"], wp_first_a["lon"])
+
+        # Case B: UAV positioned near the opposite endpoint (13.085, 80.274)
+        res_b = survey_planner.generate_survey_path(
+            polygon, spacing_m=30.0, altitude_m=15.0,
+            uav_lat=13.085, uav_lon=80.274,
+        )
+        wp_first_b = res_b["waypoints"][0]
+        self.assertEqual(res_b["start_endpoint"]["lat"], wp_first_b["lat"])
+        self.assertEqual(res_b["start_endpoint"]["lon"], wp_first_b["lon"])
+
+        # Endpoints selected in Case A and Case B are opposite endpoints
+        dist_between_starts = haversine_distance_m(
+            wp_first_a["lat"], wp_first_a["lon"],
+            wp_first_b["lat"], wp_first_b["lon"],
+        )
+        self.assertGreater(dist_between_starts, 50.0)
+
+    def test_abort_stops_sampling_and_guards_second_abort(self):
+        """Abort halts sample collection immediately and rejects duplicate abort commands."""
+        with patch.object(mav_manager, "is_connected", return_value=True):
+            with patch.object(mav_manager, "send_command", return_value={"success": True}):
+                # Simulate active RF scan
+                self.collector.prepare_scan(
+                    start_position={"latitude": 13.080, "longitude": 80.268, "altitude": 20.0},
+                    affected_area=None,
+                    deployed_nodes=[{"id": "NODE-1", "lat": 13.083, "lon": 80.271}],
+                    survey_waypoint_count=4,
+                    total_mission_items=5,
+                )
+                self.collector.start_scan()
+                self.collector.ingest_telemetry({
+                    "latitude": 13.083, "longitude": 80.271, "altitude": 20.0,
+                })
+                self.assertEqual(len(self.collector._samples), 1)
+
+                # Set session state to running
+                session_state["rf_scan_state"] = "RUNNING"
+                session_state["mission_state"] = "EXECUTING"
+
+                # 1. First abort succeeds
+                r1 = self.client.post("/api/mission/abort")
+                self.assertEqual(r1.status_code, 200)
+                self.assertTrue(r1.json()["success"])
+                self.assertEqual(self.collector.state, "ABORTED")
+
+                # Sample collection is completely halted
+                s_after = self.collector.ingest_telemetry({
+                    "latitude": 13.083, "longitude": 80.271, "altitude": 20.0,
+                })
+                self.assertIsNone(s_after)
+                self.assertEqual(len(self.collector._samples), 1)
+
+                # 2. Second abort is rejected as 'No active mission to abort.'
+                r2 = self.client.post("/api/mission/abort")
+                self.assertEqual(r2.status_code, 200)
+                self.assertFalse(r2.json()["success"])
+                self.assertIn("No active mission", r2.json()["error"])
+                self.assertEqual(len(self.collector._samples), 1)
 
 
 if __name__ == "__main__":
