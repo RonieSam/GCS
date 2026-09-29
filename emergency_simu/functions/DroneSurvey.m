@@ -72,7 +72,15 @@ classdef DroneSurvey < matlab.System
         function resetImpl(obj)
             obj.Index = 1;
         end
-
+        function [sz, dt, cp] = getDiscreteStateSpecificationImpl(~, name)
+            if strcmp(name, 'Index')
+                sz = [1 1];
+                dt = 'double';
+                cp = false;
+            else
+                error('Unknown discrete state: %s', name);
+            end
+        end
         function sts = getSampleTimeImpl(obj)
             sts = createSampleTime(obj, ...
                 'Type', 'Discrete', ...
