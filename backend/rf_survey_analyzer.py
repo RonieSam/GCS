@@ -387,3 +387,187 @@ def analyze_rf_survey(
         "gap_points": gap_point_list,
         "candidates": candidates,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Re-Scan & Before/After Verification
+# ---------------------------------------------------------------------------
+
+
+def calculate_coverage_percentages(result: Dict) -> Dict:
+    """Calculate exact coverage percentages from analysis counts."""
+    total = result.get("survey_samples", 0)
+    if total <= 0:
+        return {
+            "good_pct": 0.0,
+            "moderate_pct": 0.0,
+            "weak_pct": 0.0,
+            "gap_pct": 0.0,
+            "unmeasured_pct": 0.0,
+        }
+    return {
+        "good_pct": round((result.get("good_count", 0) / total) * 100.0, 1),
+        "moderate_pct": round((result.get("moderate_count", 0) / total) * 100.0, 1),
+        "weak_pct": round((result.get("weak_count", 0) / total) * 100.0, 1),
+        "gap_pct": round((result.get("gap_count", 0) / total) * 100.0, 1),
+        "unmeasured_pct": round((result.get("unmeasured_count", 0) / total) * 100.0, 1),
+    }
+
+
+def package_analysis_snapshot(
+    analysis_result: Dict,
+    deployed_nodes: List[Dict],
+    affected_area: Optional[List[Dict]] = None,
+) -> Dict:
+    """
+    Phase 6 Requirement 2 & 7: Package an immutable snapshot of an RF survey.
+    Preserves:
+      - survey sample count
+      - active node count
+      - node positions
+      - coverage counts
+      - coverage percentages
+      - gap count
+      - gap percentage
+      - gap clusters
+      - gap points
+      - candidates
+      - heatmap data
+      - affected area polygon
+    """
+    percentages = calculate_coverage_percentages(analysis_result)
+    node_positions = [
+        {
+            "id": str(n.get("id", "")),
+            "lat": float(n.get("lat", 0.0)),
+            "lon": float(n.get("lon", 0.0)),
+        }
+        for n in deployed_nodes
+    ]
+    total_samples = analysis_result.get("survey_samples", 0)
+    gap_count = analysis_result.get("gap_count", 0)
+    gap_pct = percentages["gap_pct"]
+
+    return {
+        "survey_sample_count": total_samples,
+        "survey_samples": total_samples,
+        "active_node_count": len(deployed_nodes),
+        "node_positions": node_positions,
+        "coverage_counts": {
+            "good": analysis_result.get("good_count", 0),
+            "moderate": analysis_result.get("moderate_count", 0),
+            "weak": analysis_result.get("weak_count", 0),
+            "gap": gap_count,
+            "unmeasured": analysis_result.get("unmeasured_count", 0),
+        },
+        "coverage_percentages": percentages,
+        "gap_count": gap_count,
+        "gap_percentage": gap_pct,
+        "gap_cluster_count": analysis_result.get("gap_cluster_count", 0),
+        "gap_points": list(analysis_result.get("gap_points", [])),
+        "candidates": list(analysis_result.get("candidates", [])),
+        "heatmap": list(analysis_result.get("heatmap", [])),
+        "samples": list(analysis_result.get("heatmap", [])),
+        "affected_area": [dict(p) for p in affected_area] if affected_area else None,
+    }
+
+
+def are_polygons_equivalent(
+    poly1: Optional[List[Dict]],
+    poly2: Optional[List[Dict]],
+    tol: float = 1e-4,
+) -> bool:
+    """Requirement 9: Verify that two affected areas are identical within tolerance."""
+    if poly1 is None and poly2 is None:
+        return True
+    if poly1 is None or poly2 is None:
+        return False
+    if len(poly1) != len(poly2):
+        return False
+    for p1, p2 in zip(poly1, poly2):
+        lat1 = p1.get("lat") or p1.get("latitude", 0.0)
+        lon1 = p1.get("lon") or p1.get("longitude", 0.0)
+        lat2 = p2.get("lat") or p2.get("latitude", 0.0)
+        lon2 = p2.get("lon") or p2.get("longitude", 0.0)
+        if abs(lat1 - lat2) > tol or abs(lon1 - lon2) > tol:
+            return False
+    return True
+
+
+def compare_before_after(before_data: Optional[Dict], after_data: Optional[Dict]) -> Dict:
+    """
+    Phase 6 Requirement 8 & 9: Compute objective before-vs-after comparison.
+    Never hardcodes improvement values — calculates exact differences.
+    """
+    if not before_data or not after_data:
+        return {
+            "comparable": False,
+            "invalidation_reason": "Both BEFORE and AFTER survey datasets are required for comparison.",
+            "before": before_data,
+            "after": after_data,
+            "changes": {},
+            "remaining_gaps": None,
+            "remaining_gap_clusters": None,
+        }
+
+    # Requirement 9: Comparability check on affected area
+    if not are_polygons_equivalent(before_data.get("affected_area"), after_data.get("affected_area")):
+        return {
+            "comparable": False,
+            "invalidation_reason": "Affected area changed between BEFORE and AFTER surveys. Comparison is invalid.",
+            "before": before_data,
+            "after": after_data,
+            "changes": {},
+            "remaining_gaps": after_data.get("gap_count"),
+            "remaining_gap_clusters": after_data.get("gap_cluster_count"),
+        }
+
+    before_counts = before_data.get("coverage_counts", {})
+    after_counts  = after_data.get("coverage_counts", {})
+    before_pcts   = before_data.get("coverage_percentages", {})
+    after_pcts    = after_data.get("coverage_percentages", {})
+
+    b_nodes = before_data.get("active_node_count", 0)
+    a_nodes = after_data.get("active_node_count", 0)
+
+    b_gaps = before_data.get("gap_count", 0)
+    a_gaps = after_data.get("gap_count", 0)
+
+    b_clusters = before_data.get("gap_cluster_count", 0)
+    a_clusters = after_data.get("gap_cluster_count", 0)
+
+    changes = {
+        "node_count_change": a_nodes - b_nodes,
+        "good_change_percentage_points": round(after_pcts.get("good_pct", 0.0) - before_pcts.get("good_pct", 0.0), 1),
+        "moderate_change_percentage_points": round(after_pcts.get("moderate_pct", 0.0) - before_pcts.get("moderate_pct", 0.0), 1),
+        "weak_change_percentage_points": round(after_pcts.get("weak_pct", 0.0) - before_pcts.get("weak_pct", 0.0), 1),
+        "gap_change_percentage_points": round(after_pcts.get("gap_pct", 0.0) - before_pcts.get("gap_pct", 0.0), 1),
+        "gap_point_change": a_gaps - b_gaps,
+        "gap_cluster_change": a_clusters - b_clusters,
+    }
+
+    return {
+        "comparable": True,
+        "invalidation_reason": None,
+        "before": {
+            "survey_samples": before_data.get("survey_sample_count", 0),
+            "active_node_count": b_nodes,
+            "coverage_counts": before_counts,
+            "coverage_percentages": before_pcts,
+            "gap_count": b_gaps,
+            "gap_cluster_count": b_clusters,
+            "node_positions": before_data.get("node_positions", []),
+        },
+        "after": {
+            "survey_samples": after_data.get("survey_sample_count", 0),
+            "active_node_count": a_nodes,
+            "coverage_counts": after_counts,
+            "coverage_percentages": after_pcts,
+            "gap_count": a_gaps,
+            "gap_cluster_count": a_clusters,
+            "node_positions": after_data.get("node_positions", []),
+        },
+        "changes": changes,
+        "remaining_gaps": a_gaps,
+        "remaining_gap_clusters": a_clusters,
+    }

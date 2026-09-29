@@ -31,7 +31,12 @@ logger = logging.getLogger(__name__)
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+import copy
+import time
+from datetime import datetime, timezone
+from pydantic import BaseModel
 
 import config
 from candidate_generator import generate_candidates
@@ -128,6 +133,16 @@ session_state = {
     "rf_scan_mission": None,  # survey_planner output dict or None
     # Phase 5 — RF survey analysis results (from POST /api/rf-survey/analyze)
     "rf_analysis": None,      # full analyze_rf_survey() result dict, or None (stale/not-yet-analyzed)
+    # Phase 6 — Re-Scan & Before/After Verification state
+    "rf_phase6_state": "BEFORE_SURVEY",  # BEFORE_SURVEY | BEFORE_ANALYZED | CANDIDATE_SELECTED | DEPLOYMENT_MISSION | NODE_DEPLOYED | AFTER_SURVEY | AFTER_ANALYZED | VERIFIED
+    "rf_before_analysis": None,          # packaged snapshot of BEFORE survey
+    "rf_after_analysis": None,           # packaged snapshot of AFTER survey
+    "rf_comparison": None,               # computed comparison object
+    "rf_newly_deployed_node_id": None,   # ID of newly deployed node
+    # Phase 6 & History: Survey history & Deployment release
+    "rf_survey_history": [],             # Last 5 completed RF surveys stored independently
+    "rf_survey_history_counter": 0,      # Monotonic counter for survey IDs
+    "deployment_released": False,        # Track if node has been released for active candidate
 }
 
 _CANDIDATE_MATCH_TOLERANCE_M = 1.0  # treat as "the same point" within this radius
@@ -144,6 +159,14 @@ async def on_startup():
     session_state["rf_scan_state"] = "IDLE"
     session_state["rf_scan_mission"] = None
     session_state["mission_state"] = "IDLE"
+    session_state["rf_phase6_state"] = "BEFORE_SURVEY"
+    session_state["rf_before_analysis"] = None
+    session_state["rf_after_analysis"] = None
+    session_state["rf_comparison"] = None
+    session_state["rf_newly_deployed_node_id"] = None
+    session_state["rf_survey_history"] = []
+    session_state["rf_survey_history_counter"] = 0
+    session_state["deployment_released"] = False
     # Non-blocking: SITL may not be up yet (or ever, in a pure-API test
     # run), and the rest of the API — area/coverage/candidates/missions —
     # doesn't depend on a vehicle link, so startup must not wait on it.
@@ -493,7 +516,11 @@ def api_add_node(node: NodeOut):
         raise HTTPException(500, "Failed to insert node into database.")
     rf_collector = get_rf_collector()
     rf_collector.update_deployed_nodes(list_nodes())
-    logger.info(f"Node deployed: {created['id']} at ({created['lat']}, {created['lon']})")
+    # Phase 6: Track newly deployed node and advance state
+    session_state["rf_newly_deployed_node_id"] = created["id"]
+    if session_state.get("rf_before_analysis"):
+        session_state["rf_phase6_state"] = "NODE_DEPLOYED"
+    logger.info(f"Node deployed: {created['id']} at ({created['lat']}, {created['lon']}) [Phase 6: {session_state.get('rf_phase6_state')}]")
     return NodeOut(**created)
 
 
@@ -505,6 +532,8 @@ def api_delete_node(node_id: str):
         raise HTTPException(404, f"Node '{node_id}' not found.")
     rf_collector = get_rf_collector()
     rf_collector.update_deployed_nodes(list_nodes())
+    if node_id == session_state.get("rf_newly_deployed_node_id"):
+        session_state["rf_newly_deployed_node_id"] = None
     logger.info(f"Node deleted: {node_id}. Remaining nodes: {len(list_nodes())}")
     return {"success": True, "deleted": node_id, "remaining_count": len(list_nodes())}
 
@@ -515,6 +544,7 @@ def api_clear_nodes():
     clear_nodes()
     rf_collector = get_rf_collector()
     rf_collector.update_deployed_nodes([])
+    session_state["rf_newly_deployed_node_id"] = None
     logger.info("All deployed nodes cleared.")
     return {"success": True, "count": 0}
 
@@ -529,6 +559,11 @@ def api_session_init():
     session_state["rf_scan_state"] = "IDLE"
     session_state["rf_scan_mission"] = None
     session_state["mission_state"] = "IDLE"
+    session_state["rf_phase6_state"] = "BEFORE_SURVEY"
+    session_state["rf_before_analysis"] = None
+    session_state["rf_after_analysis"] = None
+    session_state["rf_comparison"] = None
+    session_state["rf_newly_deployed_node_id"] = None
     logger.info("Fresh GCS session initialized: 0 deployed nodes, RF collector IDLE.")
     return {"success": True, "active_nodes": 0, "rf_state": "IDLE"}
 
@@ -554,6 +589,21 @@ def api_area(req: AreaRequest):
     session_state["rf_scan_mission"] = None
     session_state["rf_analysis"] = None  # Phase 5 — invalidate RF analysis on area change
 
+    # Phase 6 Requirement 9: Invalidate comparison if area changes between surveys
+    if session_state.get("rf_before_analysis"):
+        if not rf_survey_analyzer.are_polygons_equivalent(
+            session_state["rf_before_analysis"].get("affected_area"),
+            polygon
+        ):
+            session_state["rf_comparison"] = {
+                "comparable": False,
+                "invalidation_reason": "Affected area changed between BEFORE and AFTER surveys. Comparison is invalid.",
+                "before": session_state["rf_before_analysis"],
+                "after": session_state.get("rf_after_analysis"),
+                "changes": {},
+                "remaining_gaps": None,
+                "remaining_gap_clusters": None,
+            }
 
     return AreaResponse(accepted=True, point_count=len(polygon), polygon=req.polygon)
 
@@ -662,6 +712,12 @@ def api_rf_scan_generate(req: Optional[RFScanGenerateRequest] = None):
     session_state["rf_scan_state"] = "MISSION_GENERATED"
     session_state["rf_scan_mission"] = result
     session_state["rf_analysis"] = None  # Phase 5 — new survey invalidates previous analysis
+    if session_state.get("rf_before_analysis"):
+        session_state["rf_phase6_state"] = "AFTER_SURVEY"
+        session_state["rf_after_analysis"] = None
+        session_state["rf_comparison"] = None
+    else:
+        session_state["rf_phase6_state"] = "BEFORE_SURVEY"
 
 
     start_ep = result.get("start_endpoint")
@@ -966,6 +1022,9 @@ def api_select_target(req: SelectTargetRequest):
 
     matched = _closest_scored_candidate(req.lat, req.lon) is not None
     session_state["selected_target"] = {"lat": req.lat, "lon": req.lon}
+    session_state["deployment_released"] = False
+    if session_state.get("rf_phase6_state") == "BEFORE_ANALYZED":
+        session_state["rf_phase6_state"] = "CANDIDATE_SELECTED"
 
     return SelectTargetResponse(accepted=True, lat=req.lat, lon=req.lon, matched_candidate=matched)
 
@@ -990,6 +1049,8 @@ def api_mission_generate(req: MissionGenerateRequest):
     session_state["selected_target"] = {"lat": req.lat, "lon": req.lon}
     session_state["last_mission_id"] = mission["id"]
     session_state["last_mission"] = mission
+    if session_state.get("rf_phase6_state") in ("CANDIDATE_SELECTED", "BEFORE_ANALYZED"):
+        session_state["rf_phase6_state"] = "DEPLOYMENT_MISSION"
 
     # Sync the MAVLinkManager upload state so the UI shows GENERATED.
     mav_manager.set_mission_upload_state(
@@ -1432,9 +1493,10 @@ def api_rf_survey_data():
 def api_rf_survey_reset():
     """Reset the RF survey collector to IDLE, clearing all accumulated data.
 
-    Call this before starting a new RF scan if you want to discard the
-    previous run's data without restarting the backend.
-    Clears any previous RF analysis results (heatmap / gap points / candidates).
+    Under Phase 6:
+      - If a BEFORE survey has already been analyzed and preserved, rf_before_analysis is kept intact!
+      - rf_collector is reset and re-synchronized with all current deployed nodes (e.g. N+1).
+      - Old temporary candidate analysis is cleared, preparing for the AFTER survey.
     """
     rf_collector = get_rf_collector()
     rf_collector.reset()
@@ -1442,13 +1504,53 @@ def api_rf_survey_reset():
     rf_collector.update_deployed_nodes(active_nodes)
     session_state["rf_scan_state"] = "IDLE"
     session_state["rf_scan_mission"] = None
-    session_state["rf_analysis"] = None  # Phase 5 — invalidate stale analysis
-    logger.info(f"RF Survey collector reset to IDLE with {len(active_nodes)} active nodes.")
-    return {"success": True, "state": "IDLE", "active_nodes": len(active_nodes)}
+    session_state["rf_analysis"] = None  # Invalidate stale active analysis
+    if session_state.get("rf_before_analysis"):
+        session_state["rf_phase6_state"] = "AFTER_SURVEY"
+        session_state["rf_after_analysis"] = None
+        session_state["rf_comparison"] = None
+    else:
+        session_state["rf_phase6_state"] = "BEFORE_SURVEY"
+
+    logger.info(f"RF Survey collector reset to IDLE with {len(active_nodes)} active nodes (Phase 6: {session_state['rf_phase6_state']}).")
+    return {
+        "success": True,
+        "state": "IDLE",
+        "active_nodes": len(active_nodes),
+        "phase6_state": session_state["rf_phase6_state"],
+    }
+
+
+@app.post("/api/rf-survey/session-reset")
+def api_rf_survey_session_reset():
+    """
+    Phase 6 Requirement 16: Reset the entire RF analysis and verification session.
+    Clears BEFORE analysis, AFTER analysis, comparison, heatmaps, gap displays, candidates.
+    Does NOT delete actual deployed communication nodes from the database.
+    """
+    rf_collector = get_rf_collector()
+    rf_collector.reset()
+    active_nodes = list_nodes()
+    rf_collector.update_deployed_nodes(active_nodes)
+    session_state["rf_scan_state"] = "IDLE"
+    session_state["rf_scan_mission"] = None
+    session_state["rf_analysis"] = None
+    session_state["rf_before_analysis"] = None
+    session_state["rf_after_analysis"] = None
+    session_state["rf_comparison"] = None
+    session_state["rf_phase6_state"] = "BEFORE_SURVEY"
+    session_state["rf_newly_deployed_node_id"] = None
+    session_state["deployment_released"] = False
+    logger.info(f"RF verification session reset. {len(active_nodes)} active nodes preserved.")
+    return {
+        "success": True,
+        "phase6_state": "BEFORE_SURVEY",
+        "active_nodes": len(active_nodes),
+    }
 
 
 # ---------------------------------------------------------------------------
-# Phase 5 — RF Survey Analysis (heatmap + gap detection + candidates from real data)
+# Phase 5 & 6 — RF Survey Analysis & Verification
 # ---------------------------------------------------------------------------
 
 
@@ -1461,17 +1563,8 @@ def api_rf_survey_analyze():
       - Gap cluster count
       - Ranked candidate locations (MATLAB CandidatePlacement algorithm)
       - Coverage summary percentages
-
-    Algorithm (deterministic, no randomness):
-      1. bestRSSI = max valid RSSI among currently-active nodes per sample
-      2. Classify: GOOD > -60, MODERATE > -75, WEAK > -85, GAP <= -85
-      3. Gap points → single-link spatial clustering
-           GapClusterDistance = 250 * RFRangeScale  (currently %.1f m)
-      4. Centroid per cluster = candidate (lat, lon)
-      5. Score = gapPoints * 10 + nearestNodeDist_m * 0.1
-      6. Sort descending → Candidate 1 = best
-
-    Requires SCAN_COMPLETE state (or ABORTED with data) for meaningful results.
+      - Phase 6 BEFORE vs AFTER preservation and comparison verification
+      - Actual survey history record (last 5 completed surveys stored independently)
     """
     rf_collector = get_rf_collector()
     survey_data = rf_collector.get_survey_data()
@@ -1498,16 +1591,93 @@ def api_rf_survey_analyze():
         affected_area=session_state.get("polygon"),
     )
 
-    # Cache the analysis result so the frontend can retrieve it without re-running
+    # Package snapshot for immutable BEFORE / AFTER storage
+    snapshot = rf_survey_analyzer.package_analysis_snapshot(
+        analysis_result=result,
+        deployed_nodes=deployed_nodes,
+        affected_area=session_state.get("polygon"),
+    )
+
+    # Phase 6: Check whether this is BEFORE or AFTER survey
+    if session_state.get("rf_before_analysis") is None:
+        session_state["rf_before_analysis"] = snapshot
+        session_state["rf_after_analysis"] = None
+        session_state["rf_comparison"] = None
+        session_state["rf_phase6_state"] = "BEFORE_ANALYZED"
+        survey_role = "BEFORE"
+        comparison = None
+    else:
+        session_state["rf_after_analysis"] = snapshot
+        comparison = rf_survey_analyzer.compare_before_after(
+            session_state["rf_before_analysis"],
+            snapshot,
+        )
+        session_state["rf_comparison"] = comparison
+        session_state["rf_phase6_state"] = "VERIFIED"
+        survey_role = "AFTER"
+
+    result["survey_role"] = survey_role
+    result["phase6_state"] = session_state["rf_phase6_state"]
+    result["before_analysis"] = session_state.get("rf_before_analysis")
+    result["after_analysis"] = session_state.get("rf_after_analysis")
+    result["comparison"] = session_state.get("rf_comparison")
+    result["newly_deployed_node_id"] = session_state.get("rf_newly_deployed_node_id")
+
+    # Phase 6 & History: Check whether this survey is aborted.
+    # Requirement 14: An aborted survey must not be treated as a completed historical survey.
+    if state_val != SCAN_STATE_ABORTED:
+        session_state["rf_survey_history_counter"] = session_state.get("rf_survey_history_counter", 0) + 1
+        survey_id = f"SURVEY-{session_state['rf_survey_history_counter']:03d}"
+        history_record = {
+            "survey_id": survey_id,
+            "survey_role": survey_role,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp_epoch": time.time(),
+            "affected_area": [dict(p) for p in (session_state.get("polygon") or [])],
+            "node_set": [dict(n) for n in deployed_nodes],
+            "node_count": len(deployed_nodes),
+            "samples": [dict(s) for s in samples],
+            "sample_count": len(samples),
+            "heatmap": [dict(c) for c in (result.get("heatmap") or [])],
+            "coverage_statistics": {
+                "good_count": result.get("good_count", 0),
+                "moderate_count": result.get("moderate_count", 0),
+                "weak_count": result.get("weak_count", 0),
+                "gap_count": result.get("gap_count", 0),
+                "unmeasured_count": result.get("unmeasured_count", 0),
+                "total_samples": result.get("survey_samples", len(samples)),
+                "good_pct": result.get("coverage_percentages", {}).get("good_pct", 0.0),
+                "moderate_pct": result.get("coverage_percentages", {}).get("moderate_pct", 0.0),
+                "weak_pct": result.get("coverage_percentages", {}).get("weak_pct", 0.0),
+                "gap_pct": result.get("coverage_percentages", {}).get("gap_pct", 0.0),
+            },
+            "gaps": {
+                "gap_count": result.get("gap_count", 0),
+                "gap_cluster_count": result.get("gap_cluster_count", 0),
+                "gap_points": [dict(p) for p in (result.get("gap_points") or [])],
+                "gap_clusters": [dict(c) for c in (result.get("gap_clusters") or [])],
+            },
+            "candidates": [dict(c) for c in (result.get("candidates") or [])],
+            "analysis": copy.deepcopy(result),
+        }
+        history = session_state.setdefault("rf_survey_history", [])
+        history.append(history_record)
+        # Store last 5 completed RF surveys independently (ring buffer)
+        if len(history) > 5:
+            history.pop(0)
+
+        result["survey_id"] = survey_id
+
     session_state["rf_analysis"] = result
 
     logger.info(
-        f"RF analysis complete: {result['survey_samples']} samples | "
+        f"RF analysis complete [{survey_role}]: {result['survey_samples']} samples | "
         f"GOOD={result['good_count']} MODERATE={result['moderate_count']} "
         f"WEAK={result['weak_count']} GAP={result['gap_count']} "
         f"UNMEASURED={result['unmeasured_count']} | "
         f"{result['gap_cluster_count']} gap clusters, "
-        f"{len(result['candidates'])} candidates"
+        f"{len(result['candidates'])} candidates | "
+        f"Phase 6 state: {session_state['rf_phase6_state']}"
     )
 
     return result
@@ -1515,12 +1685,7 @@ def api_rf_survey_analyze():
 
 @app.get("/api/rf-survey/analysis")
 def api_rf_survey_analysis_get():
-    """
-    Return the most recently computed RF analysis result (from POST /api/rf-survey/analyze).
-
-    Returns 404 if no analysis has been run yet or if the previous analysis
-    was invalidated by a new scan or reset.
-    """
+    """Return the most recently computed RF analysis result."""
     result = session_state.get("rf_analysis")
     if result is None:
         raise HTTPException(
@@ -1528,6 +1693,383 @@ def api_rf_survey_analysis_get():
             "No RF analysis results available. POST /api/rf-survey/analyze first.",
         )
     return result
+
+
+@app.get("/api/rf-survey/before")
+def api_rf_survey_before_get():
+    """Return the preserved BEFORE RF survey analysis snapshot."""
+    before_data = session_state.get("rf_before_analysis")
+    if before_data is None:
+        raise HTTPException(404, "No BEFORE RF survey analysis available.")
+    return before_data
+
+
+@app.get("/api/rf-survey/after")
+def api_rf_survey_after_get():
+    """Return the preserved AFTER RF survey analysis snapshot."""
+    after_data = session_state.get("rf_after_analysis")
+    if after_data is None:
+        raise HTTPException(404, "No AFTER RF survey analysis available.")
+    return after_data
+
+
+@app.get("/api/rf-survey/comparison")
+def api_rf_survey_comparison_get():
+    """Return the computed BEFORE vs AFTER verification comparison."""
+    comp = session_state.get("rf_comparison")
+    if comp is None:
+        b = session_state.get("rf_before_analysis")
+        a = session_state.get("rf_after_analysis")
+        if b and a:
+            comp = rf_survey_analyzer.compare_before_after(b, a)
+            session_state["rf_comparison"] = comp
+        else:
+            raise HTTPException(404, "No comparison available. Complete both BEFORE and AFTER surveys.")
+    return comp
+
+
+@app.get("/api/rf-survey/verification")
+def api_rf_survey_verification_get():
+    """Return full Phase 6 deployment verification status."""
+    return {
+        "phase6_state": session_state.get("rf_phase6_state", "BEFORE_SURVEY"),
+        "before": session_state.get("rf_before_analysis"),
+        "after": session_state.get("rf_after_analysis"),
+        "comparison": session_state.get("rf_comparison"),
+        "newly_deployed_node_id": session_state.get("rf_newly_deployed_node_id"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Actual RF Survey History & Multi-Survey Comparison
+# ---------------------------------------------------------------------------
+
+
+class HistoryCompareRequest(BaseModel):
+    survey_id_1: str
+    survey_id_2: str
+
+
+def _execute_history_comparison(survey_id_1: str, survey_id_2: str) -> dict:
+    history = session_state.get("rf_survey_history", [])
+    s1 = next((s for s in history if s["survey_id"] == survey_id_1), None)
+    s2 = next((s for s in history if s["survey_id"] == survey_id_2), None)
+    if not s1:
+        raise HTTPException(404, f"Historical survey '{survey_id_1}' not found in history.")
+    if not s2:
+        raise HTTPException(404, f"Historical survey '{survey_id_2}' not found in history.")
+
+    area1 = s1.get("affected_area") or []
+    area2 = s2.get("affected_area") or []
+    comparable = rf_survey_analyzer.are_polygons_equivalent(area1, area2)
+    invalidation_reason = None
+    if not comparable:
+        invalidation_reason = "Affected areas differ between surveys. Comparison may be unrepresentative."
+
+    s1_stats = s1["coverage_statistics"]
+    s2_stats = s2["coverage_statistics"]
+    s1_gaps = s1["gaps"]
+    s2_gaps = s2["gaps"]
+
+    delta_good = round(s2_stats["good_pct"] - s1_stats["good_pct"], 2)
+    delta_mod = round(s2_stats["moderate_pct"] - s1_stats["moderate_pct"], 2)
+    delta_weak = round(s2_stats["weak_pct"] - s1_stats["weak_pct"], 2)
+    delta_gap = round(s2_stats["gap_pct"] - s1_stats["gap_pct"], 2)
+
+    return {
+        "survey_1": {
+            "survey_id": s1["survey_id"],
+            "survey_role": s1.get("survey_role", "SURVEY"),
+            "timestamp": s1["timestamp"],
+            "node_count": s1["node_count"],
+            "sample_count": s1["sample_count"],
+            "good_pct": s1_stats["good_pct"],
+            "moderate_pct": s1_stats["moderate_pct"],
+            "weak_pct": s1_stats["weak_pct"],
+            "gap_pct": s1_stats["gap_pct"],
+            "gap_points_count": s1_gaps["gap_count"],
+            "gap_clusters_count": s1_gaps["gap_cluster_count"],
+            "gap_points": s1_gaps.get("gap_points", []),
+            "gap_clusters": s1_gaps.get("gap_clusters", []),
+            "heatmap": s1.get("heatmap", []),
+        },
+        "survey_2": {
+            "survey_id": s2["survey_id"],
+            "survey_role": s2.get("survey_role", "SURVEY"),
+            "timestamp": s2["timestamp"],
+            "node_count": s2["node_count"],
+            "sample_count": s2["sample_count"],
+            "good_pct": s2_stats["good_pct"],
+            "moderate_pct": s2_stats["moderate_pct"],
+            "weak_pct": s2_stats["weak_pct"],
+            "gap_pct": s2_stats["gap_pct"],
+            "gap_points_count": s2_gaps["gap_count"],
+            "gap_clusters_count": s2_gaps["gap_cluster_count"],
+            "gap_points": s2_gaps.get("gap_points", []),
+            "gap_clusters": s2_gaps.get("gap_clusters", []),
+            "heatmap": s2.get("heatmap", []),
+        },
+        "delta": {
+            "node_count_change": s2["node_count"] - s1["node_count"],
+            "sample_count_change": s2["sample_count"] - s1["sample_count"],
+            "good_pct_change": delta_good,
+            "moderate_pct_change": delta_mod,
+            "weak_pct_change": delta_weak,
+            "gap_pct_change": delta_gap,
+            "gaps_resolved": max(0, s1_gaps["gap_count"] - s2_gaps["gap_count"]),
+            "gap_clusters_change": s2_gaps["gap_cluster_count"] - s1_gaps["gap_cluster_count"],
+        },
+        "comparable": comparable,
+        "invalidation_reason": invalidation_reason,
+    }
+
+
+@app.get("/api/rf-survey/history")
+def api_rf_survey_history_list():
+    """
+    Phase 6 Requirement 7 & 8: Return summary list of the last 5 completed RF surveys.
+    Does NOT modify current state.
+    """
+    history = session_state.get("rf_survey_history", [])
+    surveys_summary = []
+    for s in history:
+        stats = s["coverage_statistics"]
+        surveys_summary.append({
+            "survey_id": s["survey_id"],
+            "survey_role": s.get("survey_role", "SURVEY"),
+            "timestamp": s["timestamp"],
+            "node_count": s["node_count"],
+            "sample_count": s["sample_count"],
+            "good_pct": stats["good_pct"],
+            "moderate_pct": stats["moderate_pct"],
+            "weak_pct": stats["weak_pct"],
+            "gap_pct": stats["gap_pct"],
+            "gap_count": s["gaps"]["gap_count"],
+            "gap_cluster_count": s["gaps"]["gap_cluster_count"],
+            "candidate_count": len(s.get("candidates", [])),
+        })
+    return {
+        "count": len(surveys_summary),
+        "surveys": surveys_summary,
+    }
+
+
+@app.get("/api/rf-survey/history/{survey_id}")
+def api_rf_survey_history_get(survey_id: str):
+    """
+    Phase 6 Requirement 8, 9, 10:
+    Return complete historical survey record retaining:
+      survey timestamp, affected area, node set at that time, samples,
+      heatmap, coverage statistics, gaps, candidates/analysis.
+    Viewing historical surveys never modifies current nodes, current RF collection,
+    current mission, or current candidates.
+    """
+    history = session_state.get("rf_survey_history", [])
+    for s in history:
+        if s["survey_id"] == survey_id:
+            return copy.deepcopy(s)
+    raise HTTPException(404, f"Historical RF survey '{survey_id}' not found.")
+
+
+@app.post("/api/rf-survey/history/compare")
+def api_rf_survey_history_compare_post(payload: HistoryCompareRequest):
+    """
+    Phase 6 Requirement 11 & 12: Select two historical surveys and compare them.
+    Shows: node count, sample count, GOOD %, MODERATE %, WEAK %, GAP %,
+    gap points, gap clusters, and heatmaps.
+    """
+    return _execute_history_comparison(payload.survey_id_1, payload.survey_id_2)
+
+
+@app.get("/api/rf-survey/history-compare")
+def api_rf_survey_history_compare_get(survey_1: str, survey_2: str):
+    """GET variant of historical survey comparison for easy browser/query access."""
+    return _execute_history_comparison(survey_1, survey_2)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Deployment RELEASE & Interlocks (Requirements 3, 4, 5, 6)
+# ---------------------------------------------------------------------------
+
+
+class DeploymentReleaseRequest(BaseModel):
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    coverage_radius_m: Optional[float] = 250.0
+
+
+def _resolve_uav_coords(uav_lat: float, uav_lon: float) -> Tuple[float, float]:
+    """Resolve UAV telemetry coordinates to GCS map planning space.
+    Gracefully handles both raw PX4 simulation coordinates and already-mapped GCS coordinates."""
+    mapper = coordinate_mapper.get_mapper()
+    if not config.SIMULATION_MODE:
+        return uav_lat, uav_lon
+
+    refs = mapper.get_references()
+    px4_ref = refs.get("px4_reference", {})
+    gcs_ref = refs.get("gcs_reference", {})
+    p_lat = px4_ref.get("latitude", config.PX4_REFERENCE_LAT)
+    p_lon = px4_ref.get("longitude", config.PX4_REFERENCE_LON)
+    g_lat = gcs_ref.get("latitude", config.GCS_REFERENCE_LAT)
+    g_lon = gcs_ref.get("longitude", config.GCS_REFERENCE_LON)
+
+    dist_to_gcs = math.hypot(uav_lat - g_lat, uav_lon - g_lon)
+    dist_to_px4 = math.hypot(uav_lat - p_lat, uav_lon - p_lon)
+
+    if dist_to_gcs < dist_to_px4:
+        return uav_lat, uav_lon
+    return mapper.px4_to_gcs(uav_lat, uav_lon)
+
+
+@app.get("/api/deployment/status")
+def api_deployment_status():
+    """
+    Phase 6 Requirements 3-6: Deployment RELEASE status and gate evaluation.
+    RELEASE must only become enabled after:
+      - deployment mission is no longer flying
+      - UAV is actually landed
+      - UAV is within configured distance tolerance of selected candidate
+    If UAV lands somewhere else or is airborne, RELEASE remains disabled.
+    """
+    target = session_state.get("selected_target")
+    released = session_state.get("deployment_released", False)
+    uav_state = mav_manager.get_vehicle_state()
+    rel_alt = uav_state.get("relative_altitude")
+    mission_state = session_state.get("mission_state", "IDLE")
+
+    is_airborne = (rel_alt is not None and rel_alt > 0.3) or (mission_state == "EXECUTING")
+    is_landed = (rel_alt is not None and rel_alt <= 0.3) and not is_airborne
+
+    dist_m = None
+    within_tolerance = False
+    uav_lat = uav_state.get("latitude")
+    uav_lon = uav_state.get("longitude")
+
+    if target and uav_lat is not None and uav_lon is not None:
+        gcs_uav_lat, gcs_uav_lon = _resolve_uav_coords(float(uav_lat), float(uav_lon))
+        dist_m = haversine_distance_m(gcs_uav_lat, gcs_uav_lon, target["lat"], target["lon"])
+        within_tolerance = dist_m <= config.CANDIDATE_DEPLOY_TOLERANCE_M
+    elif target and not mav_manager.is_connected():
+        dist_m = 0.0
+        within_tolerance = True
+        is_landed = True
+        is_airborne = False
+
+    can_release = bool(
+        (target is not None)
+        and (not is_airborne)
+        and is_landed
+        and within_tolerance
+        and (not released)
+    )
+
+    reason = "Ready for release"
+    if not target:
+        reason = "No candidate selected"
+    elif released:
+        reason = "Node already released for this candidate"
+    elif is_airborne:
+        alt_str = f"{rel_alt:.1f}m" if rel_alt is not None else "airborne"
+        reason = f"RELEASE disabled: UAV is airborne ({alt_str})"
+    elif not within_tolerance:
+        dist_str = f"{dist_m:.1f}m" if dist_m is not None else "unknown"
+        reason = f"RELEASE disabled: UAV landed off-target ({dist_str} > {config.CANDIDATE_DEPLOY_TOLERANCE_M}m tolerance)"
+    elif not is_landed:
+        reason = "RELEASE disabled: UAV is not landed"
+
+    return {
+        "can_release": can_release,
+        "reason": reason,
+        "is_airborne": is_airborne,
+        "is_landed": is_landed,
+        "within_tolerance": within_tolerance,
+        "distance_to_candidate_m": round(dist_m, 2) if dist_m is not None else None,
+        "candidate_tolerance_m": config.CANDIDATE_DEPLOY_TOLERANCE_M,
+        "selected_target": target,
+        "already_released": released,
+    }
+
+
+@app.post("/api/deployment/release", response_model=NodeOut)
+def api_deployment_release(payload: Optional[DeploymentReleaseRequest] = None):
+    """
+    Phase 6 Requirements 3-6: Command node physical release.
+    Enforces all release interlocks:
+      1. UAV must not be airborne.
+      2. Mission must no longer be flying.
+      3. UAV must actually be landed.
+      4. UAV must be within distance tolerance of selected candidate.
+      5. Exactly one node is created at candidate coordinates.
+      6. Repeated release cannot create duplicates.
+    """
+    target = session_state.get("selected_target")
+    if not target:
+        if payload and payload.lat is not None and payload.lon is not None:
+            target = {"lat": payload.lat, "lon": payload.lon}
+        else:
+            raise HTTPException(400, "Cannot release: No target candidate selected.")
+
+    if session_state.get("deployment_released", False):
+        raise HTTPException(
+            400,
+            "Node already released for this candidate. Repeated release is prohibited.",
+        )
+
+    uav_state = mav_manager.get_vehicle_state()
+    rel_alt = uav_state.get("relative_altitude")
+    mission_state = session_state.get("mission_state", "IDLE")
+
+    if (rel_alt is not None and rel_alt > 0.3) or (mission_state == "EXECUTING"):
+        raise HTTPException(
+            400,
+            f"RELEASE disabled: UAV is airborne (alt={rel_alt}m, mission={mission_state}).",
+        )
+
+    uav_lat = uav_state.get("latitude")
+    uav_lon = uav_state.get("longitude")
+    if uav_lat is not None and uav_lon is not None:
+        gcs_uav_lat, gcs_uav_lon = _resolve_uav_coords(float(uav_lat), float(uav_lon))
+        dist_m = haversine_distance_m(gcs_uav_lat, gcs_uav_lon, target["lat"], target["lon"])
+        if dist_m > config.CANDIDATE_DEPLOY_TOLERANCE_M:
+            raise HTTPException(
+                400,
+                f"RELEASE disabled: UAV is {dist_m:.1f}m away from candidate "
+                f"(exceeds {config.CANDIDATE_DEPLOY_TOLERANCE_M}m tolerance).",
+            )
+
+    existing = list_nodes()
+    for ex in existing:
+        dist_to_ex = haversine_distance_m(target["lat"], target["lon"], ex["lat"], ex["lon"])
+        if dist_to_ex < 1.0:
+            raise HTTPException(
+                400,
+                f"Node '{ex['id']}' already exists at this candidate position. Cannot create duplicate.",
+            )
+
+    node_id = f"COMM-{len(existing) + 1:03d}"
+    cov_radius = (payload.coverage_radius_m if payload and payload.coverage_radius_m else None) or config.COVERAGE_RADIUS_DEFAULT_M
+    created = insert_node(
+        node_id=node_id,
+        lat=target["lat"],
+        lon=target["lon"],
+        coverage_radius_m=cov_radius,
+    )
+    if not created:
+        raise HTTPException(500, "Failed to insert node into database.")
+
+    rf_collector = get_rf_collector()
+    rf_collector.update_deployed_nodes(list_nodes())
+
+    session_state["deployment_released"] = True
+    session_state["rf_newly_deployed_node_id"] = created["id"]
+    if session_state.get("rf_before_analysis"):
+        session_state["rf_phase6_state"] = "NODE_DEPLOYED"
+
+    logger.info(
+        f"Deployment RELEASE successful: Node {created['id']} deployed at ({created['lat']}, {created['lon']}). "
+        f"Phase 6 state: {session_state.get('rf_phase6_state')}"
+    )
+    return NodeOut(**created)
 
 
 @app.websocket("/ws/rf-survey")

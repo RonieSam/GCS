@@ -592,3 +592,117 @@ body {
   flex: 1;
 }
 
+/* ================================================================
+   Phase 6 — Deployment Verification Styles
+   ================================================================ */
+
+.verification-table {
+  width: 100%;
+  font-size: 11px;
+  border-collapse: collapse;
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+.verification-table th {
+  background: rgba(255, 255, 255, 0.03);
+  padding: 6px 8px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--border);
+}
+
+.verification-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  font-family: var(--font-data);
+}
+
+.verification-table tr:hover td {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.verification-badge {
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-weight: 700;
+  font-size: 12px;
+  text-align: center;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-top: 6px;
+  margin-bottom: 8px;
+}
+
+.verification-badge.gaps-resolved {
+  background: rgba(63, 218, 127, 0.15);
+  border: 1px solid #3FDA7F;
+  color: #3FDA7F;
+}
+
+.verification-badge.gaps-remaining {
+  background: rgba(245, 166, 35, 0.15);
+  border: 1px solid #F5A623;
+  color: #F5A623;
+}
+
+.verification-badge.gaps-severe {
+  background: rgba(255, 92, 92, 0.15);
+  border: 1px solid #FF5C5C;
+  color: #FF5C5C;
+}
+
+.change-positive {
+  color: #3FDA7F;
+  font-weight: 600;
+}
+
+.change-neutral {
+  color: var(--text-muted);
+}
+
+.change-negative {
+  color: #FF5C5C;
+  font-weight: 600;
+}
+
+/* Button toggle group for Heatmap switcher */
+.btn-toggle-group {
+  display: flex;
+  gap: 4px;
+  background: var(--panel-alt);
+  padding: 3px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+
+.btn-toggle-group .btn-toggle {
+  flex: 1;
+  padding: 5px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: transparent;
+  color: var(--text-muted);
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-toggle-group .btn-toggle.active {
+  background: #00E5FF;
+  color: #0A0D11;
+  font-weight: 700;
+}
+
+/* Newly deployed node badge/styling */
+.node-label-new {
+  background: rgba(0, 229, 255, 0.25) !important;
+  border: 1px solid #00E5FF !important;
+  color: #00E5FF !important;
+  font-weight: 700 !important;
+  box-shadow: 0 0 8px rgba(0, 229, 255, 0.5) !important;
+}
+

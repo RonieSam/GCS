@@ -18,7 +18,7 @@
     </div>
     <div class="topbar-phase">
       <span class="phase-dot"></span>
-      PHASE 5 — RF COVERAGE HEATMAP + CANDIDATE GENERATION
+      PHASE 6 — RE-SCAN, BEFORE/AFTER RF COVERAGE VERIFICATION
     </div>
   </header>
 
@@ -85,6 +85,9 @@
         <button id="btn-auto-deploy" class="btn btn-block btn-deploy" disabled>
           &#x1F4E1; AUTO DEPLOY
         </button>
+        <div id="deploy-interlock-status" class="hint" style="margin-top:4px;font-size:11px;color:#8A9AB0">
+          Select target location and land UAV to enable release.
+        </div>
 
         <div class="stat-grid" style="margin-top:10px">
           <div class="stat">
@@ -293,6 +296,197 @@
             <div class="legend-row"><span class="legend-dot" style="background:#F5A623"></span><span class="legend-label">MODERATE &nbsp; -75 to -60 dBm</span></div>
             <div class="legend-row"><span class="legend-dot" style="background:#FF9500"></span><span class="legend-label">WEAK &nbsp; -85 to -75 dBm</span></div>
             <div class="legend-row"><span class="legend-dot" style="background:#FF5C5C"></span><span class="legend-label">GAP &nbsp; &le; -85 dBm</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ================================================================
+           Phase 6 — Deployment Verification (BEFORE vs AFTER)
+           ================================================================ -->
+      <div class="panel" id="panel-rf-verification">
+        <h2 class="panel-title">Deployment Verification</h2>
+
+        <p class="hint" id="rf-verification-hint">
+          Deploy a communication node at a candidate site, then complete and analyze an AFTER survey to verify coverage impact.
+        </p>
+
+        <!-- Invalidation Warning (hidden by default) -->
+        <div id="verif-invalidation-warning" class="hidden" style="margin-bottom:8px;padding:8px 10px;background:rgba(255,92,92,0.15);border:1px solid #FF5C5C;border-radius:4px;color:#FF5C5C;font-size:11px;line-height:1.4">
+          <strong>Cannot Compare:</strong> <span id="verif-invalidation-reason">Affected area changed between surveys.</span>
+        </div>
+
+        <!-- Heatmap View Selector (shown when both BEFORE and AFTER exist) -->
+        <div id="heatmap-view-selector-container" class="hidden" style="margin-bottom:10px">
+          <div style="font-size:10px;font-weight:600;color:var(--text-muted);margin-bottom:4px;letter-spacing:0.04em">HEATMAP VIEW:</div>
+          <div class="btn-toggle-group">
+            <button id="btn-view-after-heatmap" class="btn-toggle active" title="Show AFTER deployment survey heatmap">AFTER</button>
+            <button id="btn-view-before-heatmap" class="btn-toggle" title="Show BEFORE deployment survey heatmap">BEFORE</button>
+            <button id="btn-view-overlay-heatmap" class="btn-toggle" title="Show both heatmaps for comparison">OVERLAY</button>
+          </div>
+        </div>
+
+        <!-- Verification Results Table -->
+        <div id="verification-results" class="hidden">
+          <!-- Remaining Gaps Banner -->
+          <div id="remaining-gaps-banner" class="verification-badge gaps-remaining">
+            Remaining Coverage Gaps: <span id="remaining-gaps-count">--</span>
+          </div>
+
+          <table class="verification-table">
+            <thead>
+              <tr>
+                <th style="text-align:left">METRIC</th>
+                <th style="text-align:right">BEFORE</th>
+                <th style="text-align:right">AFTER</th>
+                <th style="text-align:right">CHANGE</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Active Nodes</td>
+                <td style="text-align:right" id="verif-nodes-before">--</td>
+                <td style="text-align:right" id="verif-nodes-after">--</td>
+                <td style="text-align:right" id="verif-nodes-change">--</td>
+              </tr>
+              <tr>
+                <td style="color:#3FDA7F">GOOD (&gt;-60 dBm)</td>
+                <td style="text-align:right" id="verif-good-before">--</td>
+                <td style="text-align:right" id="verif-good-after">--</td>
+                <td style="text-align:right" id="verif-good-change">--</td>
+              </tr>
+              <tr>
+                <td style="color:#F5A623">MODERATE</td>
+                <td style="text-align:right" id="verif-mod-before">--</td>
+                <td style="text-align:right" id="verif-mod-after">--</td>
+                <td style="text-align:right" id="verif-mod-change">--</td>
+              </tr>
+              <tr>
+                <td style="color:#FF9500">WEAK</td>
+                <td style="text-align:right" id="verif-weak-before">--</td>
+                <td style="text-align:right" id="verif-weak-after">--</td>
+                <td style="text-align:right" id="verif-weak-change">--</td>
+              </tr>
+              <tr>
+                <td style="color:#FF5C5C">GAP (&le;-85 dBm)</td>
+                <td style="text-align:right" id="verif-gap-before">--</td>
+                <td style="text-align:right" id="verif-gap-after">--</td>
+                <td style="text-align:right" id="verif-gap-change">--</td>
+              </tr>
+              <tr>
+                <td>Gap Points</td>
+                <td style="text-align:right" id="verif-gappoints-before">--</td>
+                <td style="text-align:right" id="verif-gappoints-after">--</td>
+                <td style="text-align:right" id="verif-gappoints-change">--</td>
+              </tr>
+              <tr>
+                <td>Gap Regions</td>
+                <td style="text-align:right" id="verif-gapclusters-before">--</td>
+                <td style="text-align:right" id="verif-gapclusters-after">--</td>
+                <td style="text-align:right" id="verif-gapclusters-change">--</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <button id="btn-reset-verification" class="btn btn-block btn-secondary" style="font-size:11px;margin-top:6px">
+          Reset Verification Session
+        </button>
+
+        <!-- RF Survey History & Multi-Survey Comparison (Requirements 7-12) -->
+        <div id="survey-history-section" style="margin-top:14px;border-top:1px solid #232c37;padding-top:10px">
+          <div style="font-size:11px;font-weight:700;color:var(--text);margin-bottom:6px;letter-spacing:0.04em">
+            &#x1F4DC; RF SURVEY HISTORY (LAST 5)
+          </div>
+          
+          <div class="field-row">
+            <select id="select-history-survey" class="field-input" style="font-size:11px;width:100%">
+              <option value="">(No historical surveys yet)</option>
+            </select>
+          </div>
+          <div class="btn-row" style="margin-bottom:10px">
+            <button id="btn-view-history-survey" class="btn btn-secondary btn-block" style="font-size:11px" disabled>
+              View Historical Heatmap
+            </button>
+          </div>
+
+          <div style="font-size:10px;font-weight:600;color:var(--text-muted);margin-bottom:4px;letter-spacing:0.04em">
+            COMPARE TWO SURVEYS:
+          </div>
+          <div style="display:flex;gap:6px;margin-bottom:6px">
+            <select id="select-compare-a" class="field-input" style="font-size:11px;flex:1">
+              <option value="">Survey A...</option>
+            </select>
+            <select id="select-compare-b" class="field-input" style="font-size:11px;flex:1">
+              <option value="">Survey B...</option>
+            </select>
+          </div>
+          <button id="btn-run-history-compare" class="btn btn-block" style="font-size:11px" disabled>
+            Compare Surveys A &amp; B
+          </button>
+
+          <!-- History Comparison Results Table -->
+          <div id="history-compare-results" class="hidden" style="margin-top:10px">
+            <div id="history-compare-badge" class="verification-badge" style="margin-bottom:6px"></div>
+            <table class="verification-table" id="history-compare-table">
+              <thead>
+                <tr>
+                  <th style="text-align:left">METRIC</th>
+                  <th style="text-align:right" id="hist-th-a">SURVEY A</th>
+                  <th style="text-align:right" id="hist-th-b">SURVEY B</th>
+                  <th style="text-align:right">DELTA</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Nodes</td>
+                  <td style="text-align:right" id="hist-nodes-a">--</td>
+                  <td style="text-align:right" id="hist-nodes-b">--</td>
+                  <td style="text-align:right" id="hist-nodes-delta">--</td>
+                </tr>
+                <tr>
+                  <td>Samples</td>
+                  <td style="text-align:right" id="hist-samples-a">--</td>
+                  <td style="text-align:right" id="hist-samples-b">--</td>
+                  <td style="text-align:right" id="hist-samples-delta">--</td>
+                </tr>
+                <tr>
+                  <td style="color:#3FDA7F">GOOD %</td>
+                  <td style="text-align:right" id="hist-good-a">--</td>
+                  <td style="text-align:right" id="hist-good-b">--</td>
+                  <td style="text-align:right" id="hist-good-delta">--</td>
+                </tr>
+                <tr>
+                  <td style="color:#F5A623">MODERATE %</td>
+                  <td style="text-align:right" id="hist-mod-a">--</td>
+                  <td style="text-align:right" id="hist-mod-b">--</td>
+                  <td style="text-align:right" id="hist-mod-delta">--</td>
+                </tr>
+                <tr>
+                  <td style="color:#FF9500">WEAK %</td>
+                  <td style="text-align:right" id="hist-weak-a">--</td>
+                  <td style="text-align:right" id="hist-weak-b">--</td>
+                  <td style="text-align:right" id="hist-weak-delta">--</td>
+                </tr>
+                <tr>
+                  <td style="color:#FF5C5C">GAP %</td>
+                  <td style="text-align:right" id="hist-gap-a">--</td>
+                  <td style="text-align:right" id="hist-gap-b">--</td>
+                  <td style="text-align:right" id="hist-gap-delta">--</td>
+                </tr>
+                <tr>
+                  <td>Gap Points</td>
+                  <td style="text-align:right" id="hist-gappoints-a">--</td>
+                  <td style="text-align:right" id="hist-gappoints-b">--</td>
+                  <td style="text-align:right" id="hist-gappoints-delta">--</td>
+                </tr>
+                <tr>
+                  <td>Gap Clusters</td>
+                  <td style="text-align:right" id="hist-gapclusters-a">--</td>
+                  <td style="text-align:right" id="hist-gapclusters-b">--</td>
+                  <td style="text-align:right" id="hist-gapclusters-delta">--</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
       </div>

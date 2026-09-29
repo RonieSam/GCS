@@ -75,6 +75,7 @@ MIN_CANDIDATES = 5    # prototype should surface at least this many candidates
 
 # --- Target validation (used from Phase 5 onward) ---
 MIN_NODE_SEPARATION_M = 30  # reject a target this close to an existing node
+CANDIDATE_DEPLOY_TOLERANCE_M = 10.0  # max allowable distance (metres) for landed deployment release
 
 # --- UAV home / launch point (used from Phase 6 onward) ---
 # NOTE: In simulation mode this is the GCS map home, not the PX4 home.

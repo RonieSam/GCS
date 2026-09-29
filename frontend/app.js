@@ -99,6 +99,18 @@ const state = {
   rfCandidatesVisible: true,
   rfHeatmapOpacity: 0.55,    // 0.10 – 0.90
   rfAnalysisAutoTriggered: false,
+
+  // Phase 6 — Re-Scan & Before/After Verification
+  rfPhase6State: "BEFORE_SURVEY",
+  rfBeforeAnalysis: null,
+  rfAfterAnalysis: null,
+  rfComparison: null,
+  newlyDeployedNodeId: null,
+  activeHeatmapView: "AFTER",
+  rfBeforeHeatmapLayer: null,
+  deploymentReleased: false,
+  surveyHistory: [],
+  rfHistoricalLayer: null,
 };
 
 // A message every ~1/MAVLINK stream rate is expected; if nothing arrives
@@ -298,36 +310,43 @@ function addDeployedNode(node) {
     return;
   }
 
+  const isNewlyDeployed = Boolean(state.newlyDeployedNodeId && node.id === state.newlyDeployedNodeId);
+  const nodeColor = isNewlyDeployed ? "#00E5FF" : "#3FDA7F";
+  const markerRadius = isNewlyDeployed ? 9 : 7;
+  const markerWeight = isNewlyDeployed ? 3 : 2;
+  const labelClass = isNewlyDeployed ? "node-label node-label-new" : "node-label";
+  const tooltipText = isNewlyDeployed ? `${node.id} [NEWLY DEPLOYED]` : node.id;
+
   const marker = L.circleMarker([node.lat, node.lon], {
-    radius: 7,
-    color: "#3FDA7F",
-    fillColor: "#3FDA7F",
-    fillOpacity: 0.9,
-    weight: 2,
+    radius: markerRadius,
+    color: nodeColor,
+    fillColor: nodeColor,
+    fillOpacity: 0.95,
+    weight: markerWeight,
   }).addTo(state.nodeLayerGroup);
 
-  marker.bindTooltip(node.id, {
+  marker.bindTooltip(tooltipText, {
     permanent: true,
     direction: "top",
     offset: [0, -7],
-    className: "node-label",
+    className: labelClass,
   });
 
   const scaledRadius = (node.coverage_radius_m || 250) * RF_RANGE_SCALE;
 
   const circle = L.circle([node.lat, node.lon], {
     radius: scaledRadius,
-    color: "#3FDA7F",
-    weight: 1.5,
-    fillColor: "#3FDA7F",
-    fillOpacity: 0.08,
-    dashArray: "4 4",
+    color: nodeColor,
+    weight: isNewlyDeployed ? 2 : 1.5,
+    fillColor: nodeColor,
+    fillOpacity: isNewlyDeployed ? 0.12 : 0.08,
+    dashArray: isNewlyDeployed ? "6 3" : "4 4",
   }).addTo(state.nodeLayerGroup);
 
   // Popup provides node information only; deletion is strictly via the Nodes sidebar
   marker.bindPopup(`
-    <div style="font-family: inherit; font-size: 13px; min-width: 140px; line-height: 1.5;">
-      <strong style="color: #3FDA7F;">${node.id}</strong><br/>
+    <div style="font-family: inherit; font-size: 13px; min-width: 150px; line-height: 1.5;">
+      <strong style="color: ${nodeColor};">${node.id}${isNewlyDeployed ? " [NEWLY DEPLOYED]" : ""}</strong><br/>
       <span style="color: #aaa; font-size: 11px;">Lat: ${node.lat.toFixed(5)}<br/>Lon: ${node.lon.toFixed(5)}<br/>Coverage: ${Math.round(scaledRadius)} m (scaled 0.30)</span>
     </div>
   `);
@@ -340,6 +359,22 @@ function addDeployedNode(node) {
   }
 
   updateNodeUI();
+}
+
+/**
+ * Re-render all deployed nodes (e.g. when newlyDeployedNodeId changes).
+ */
+function renderAllDeployedNodes() {
+  if (state.nodeLayerGroup) {
+    state.nodeLayerGroup.clearLayers();
+  }
+  const nodes = [...state.deployedNodes];
+  state.deployedNodes = [];
+  nodes.forEach((n) => {
+    n._marker = null;
+    n._circle = null;
+    addDeployedNode(n);
+  });
 }
 
 /**
@@ -441,11 +476,8 @@ function selectDeploymentLocation(latInput, lonInput, source) {
   const srcEl = document.getElementById("stat-deploy-source");
   if (srcEl) srcEl.textContent = src.toUpperCase();
 
-  const hintEl = document.getElementById("deploy-hint");
-  if (hintEl) hintEl.textContent = "Location selected — press AUTO DEPLOY to place a node here.";
-
-  const deployBtn = document.getElementById("btn-auto-deploy");
-  if (deployBtn) deployBtn.disabled = false;
+  state.deploymentReleased = false;
+  updateDeploymentReleaseButton();
 
   logEvent(`Deployment location selected (${src}): lat=${latitude.toFixed(5)}, lon=${longitude.toFixed(5)}`);
 }
@@ -454,17 +486,100 @@ function selectDeploymentLocation(latInput, lonInput, source) {
 let _deployNodeSeq = 0;
 let _deployInProgress = false;
 
+function haversineDistanceM(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+            Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
 /**
- * autoDeploy — creates a new logical communication node, saves it to the
- * backend, and renders it on the map.
+ * Phase 6 Requirements 3-6: Deployment RELEASE interlock evaluation.
+ * RELEASE must only become enabled after:
+ *   - deployment mission is no longer flying
+ *   - UAV is actually landed
+ *   - UAV is within configured distance tolerance (10m) of selected candidate
+ * If UAV lands somewhere else or is airborne, RELEASE remains disabled.
  */
-async function autoDeploy() {
-  if (_deployInProgress) {
-    console.warn("AUTO DEPLOY: deployment already in progress.");
+function updateDeploymentReleaseButton() {
+  const deployBtn = document.getElementById("btn-auto-deploy");
+  const interlockEl = document.getElementById("deploy-interlock-status");
+  const hintEl = document.getElementById("deploy-hint");
+  if (!deployBtn) return;
+
+  const target = state.selectedLocation || state.selectedDeploymentLocation || state.selectedTarget;
+  if (!target) {
+    deployBtn.disabled = true;
+    if (interlockEl) interlockEl.textContent = "Select target location and land UAV to enable release.";
     return;
   }
 
-  const sel = state.selectedLocation || state.selectedDeploymentLocation;
+  if (state.deploymentReleased || _deployInProgress) {
+    deployBtn.disabled = true;
+    if (interlockEl) interlockEl.textContent = "Node already released at target. Duplicate release blocked.";
+    return;
+  }
+
+  const v = state.vehicle;
+  // If telemetry vehicle is connected:
+  if (v && v.connected) {
+    const relAlt = v.relative_altitude;
+    const isAirborne = (relAlt != null && relAlt > 0.3) || state.missionExecuting;
+    const isLanded = (relAlt != null && relAlt <= 0.3) && !isAirborne;
+
+    const targetLat = target.latitude != null ? target.latitude : target.lat;
+    const targetLon = target.longitude != null ? target.longitude : target.lon;
+    let distM = null;
+    let withinTolerance = false;
+
+    if (v.latitude != null && v.longitude != null && targetLat != null && targetLon != null) {
+      distM = haversineDistanceM(v.latitude, v.longitude, targetLat, targetLon);
+      withinTolerance = distM <= 10.0; // 10 metre candidate tolerance
+    }
+
+    if (isAirborne) {
+      deployBtn.disabled = true;
+      const altStr = relAlt != null ? `${relAlt.toFixed(1)}m` : "airborne";
+      if (interlockEl) interlockEl.textContent = `RELEASE DISABLED: UAV is airborne (alt ${altStr}).`;
+      if (hintEl) hintEl.textContent = `Release disabled: UAV is airborne (${altStr}).`;
+    } else if (!isLanded) {
+      deployBtn.disabled = true;
+      if (interlockEl) interlockEl.textContent = "RELEASE DISABLED: UAV is not landed.";
+      if (hintEl) hintEl.textContent = "Release disabled: UAV is not landed.";
+    } else if (!withinTolerance) {
+      deployBtn.disabled = true;
+      const distStr = distM != null ? `${distM.toFixed(1)}m` : "unknown";
+      if (interlockEl) interlockEl.textContent = `RELEASE DISABLED: UAV landed off-target (${distStr} > 10m tolerance).`;
+      if (hintEl) hintEl.textContent = `UAV landed off-target (${distStr}). Release disabled.`;
+    } else {
+      deployBtn.disabled = false;
+      const distStr = distM != null ? `${distM.toFixed(1)}m` : "0m";
+      if (interlockEl) interlockEl.textContent = `RELEASE ENABLED: UAV landed on target (dist ${distStr}).`;
+      if (hintEl) hintEl.textContent = `Landed within tolerance (${distStr}). Press AUTO DEPLOY to release communication node.`;
+    }
+  } else {
+    // Standalone test/offline mode without live PX4 telemetry
+    deployBtn.disabled = false;
+    if (interlockEl) interlockEl.textContent = "Direct placement ready (offline mode).";
+  }
+}
+
+/**
+ * autoDeploy — releases a communication node at the selected candidate coordinates.
+ * Enforces server-side interlocks via POST /api/deployment/release.
+ * Guarantees exactly one node is created, and repeated release cannot create duplicates.
+ */
+async function autoDeploy() {
+  if (_deployInProgress || state.deploymentReleased) {
+    logEvent("AUTO DEPLOY blocked: node already released or release in progress.");
+    return;
+  }
+
+  const sel = state.selectedLocation || state.selectedDeploymentLocation || state.selectedTarget;
   if (!sel) {
     logEvent("AUTO DEPLOY: no location selected. Click the map or pick a candidate first.");
     return;
@@ -486,56 +601,62 @@ async function autoDeploy() {
   const deployBtn = document.getElementById("btn-auto-deploy");
   if (deployBtn) deployBtn.disabled = true;
 
-  _deployNodeSeq++;
-  const nodeId = `COMM-${String(_deployNodeSeq).padStart(3, "0")}`;
-
-  const nodePayload = { id: nodeId, lat: latitude, lon: longitude, coverage_radius_m: 250 };
   try {
-    const res = await apiPost("/api/nodes", nodePayload);
-    // apiPost returns { status, body }
-    const created = (res && res.body) ? res.body : nodePayload;
+    const res = await apiPost("/api/deployment/release", {
+      lat: latitude,
+      lon: longitude,
+      coverage_radius_m: 250,
+    });
+    const created = res && res.body ? res.body : null;
     if (res && res.status !== 200) {
       throw new Error((created && created.detail) || `Server error: HTTP ${res.status}`);
     }
 
-    const createdCoords = normalizeCoordinates(created.lat ?? created.latitude, created.lon ?? created.longitude);
-    if (!createdCoords) {
-      throw new Error(`Server returned invalid coordinates for node ${created.id}`);
+    state.deploymentReleased = true;
+    state.newlyDeployedNodeId = created.id;
+    if (state.rfBeforeAnalysis) {
+      state.rfPhase6State = "NODE_DEPLOYED";
     }
-    created.lat = createdCoords.latitude;
-    created.lon = createdCoords.longitude;
 
     addDeployedNode(created);
-  } catch (err) {
-    logEvent(`AUTO DEPLOY failed: ${err.message}`);
-    if (deployBtn && (state.selectedLocation || state.selectedDeploymentLocation)) {
-      deployBtn.disabled = false;
+    renderAllDeployedNodes();
+
+    if (state.deploymentSelectionMarker) {
+      map.removeLayer(state.deploymentSelectionMarker);
+      state.deploymentSelectionMarker = null;
     }
+    state.selectedLocation = null;
+    state.selectedDeploymentLocation = null;
+
+    const locText = document.getElementById("deploy-location-text");
+    if (locText) locText.textContent = "None";
+    const srcEl = document.getElementById("stat-deploy-source");
+    if (srcEl) srcEl.textContent = "--";
+    const hintEl = document.getElementById("deploy-hint");
+    if (hintEl) hintEl.textContent = `Node ${created.id} released at target! Duplicate release blocked.`;
+    const interlockEl = document.getElementById("deploy-interlock-status");
+    if (interlockEl) interlockEl.textContent = `Node ${created.id} successfully released.`;
+
+    const verifHint = document.getElementById("rf-verification-hint");
+    if (verifHint) {
+      verifHint.textContent = `Node ${created.id} deployed! Start a NEW RF survey (AFTER survey) to verify coverage improvement.`;
+    }
+
+    logEvent(
+      `AUTO DEPLOY SUCCESS: Node ${created.id} deployed at lat=${latitude.toFixed(5)}, lon=${longitude.toFixed(5)}. ` +
+      `Total active deployed nodes: ${state.deployedNodes.length}. Repeated release blocked.`
+    );
+  } catch (err) {
+    logEvent(`AUTO DEPLOY rejected: ${err.message}`);
+    const interlockEl = document.getElementById("deploy-interlock-status");
+    if (interlockEl) interlockEl.textContent = `Release rejected: ${err.message}`;
     _deployInProgress = false;
+    updateDeploymentReleaseButton();
     return;
+  } finally {
+    _deployInProgress = false;
+    if (deployBtn) deployBtn.disabled = true;
   }
-
-  if (state.deploymentSelectionMarker) {
-    map.removeLayer(state.deploymentSelectionMarker);
-    state.deploymentSelectionMarker = null;
-  }
-  state.selectedLocation = null;
-  state.selectedDeploymentLocation = null;
-
-  const locText = document.getElementById("deploy-location-text");
-  if (locText) locText.textContent = "None";
-  const srcEl = document.getElementById("stat-deploy-source");
-  if (srcEl) srcEl.textContent = "--";
-  const hintEl = document.getElementById("deploy-hint");
-  if (hintEl) hintEl.textContent = "Click the map or select a candidate to set a deployment location.";
-
-  if (deployBtn) deployBtn.disabled = true;
-  _deployInProgress = false;
-
-  logEvent(
-    `AUTO DEPLOY: node ${nodeId} deployed at lat=${latitude.toFixed(5)}, lon=${longitude.toFixed(5)}. ` +
-    `Total active deployed nodes: ${state.deployedNodes.length}.`
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1661,6 +1782,7 @@ function renderTelemetryPanel() {
   // Update Manual Override button gating whenever telemetry refreshes
   _updateManualButtons();
   _updateOverrideStat();
+  updateDeploymentReleaseButton();
 
   setStat("tel-mode", v.mode || "--");
   setStat("tel-gps-fix", v.gps_fix || "--");
@@ -2174,14 +2296,11 @@ function resetRfAnalysisState(hintMessage) {
 }
 
 /**
- * Render the RF coverage heatmap from heatmap_points array.
- * Each point: {latitude, longitude, best_rssi, status}
+ * Helper to build a Leaflet LayerGroup for an RF coverage heatmap dataset.
  */
-function renderRfHeatmap(heatmapPoints, opacity) {
-  if (state.rfHeatmapLayer) { map.removeLayer(state.rfHeatmapLayer); state.rfHeatmapLayer = null; }
-  if (!heatmapPoints || heatmapPoints.length === 0) return;
-
-  state.rfHeatmapLayer = L.layerGroup().addTo(map);
+function createHeatmapLayer(heatmapPoints, opacity, radius = 5) {
+  const layer = L.layerGroup();
+  if (!heatmapPoints || heatmapPoints.length === 0) return layer;
 
   const fillOpacity = Math.max(0.05, Math.min(0.95, opacity));
   const strokeOpacity = Math.min(1, fillOpacity * 1.4);
@@ -2191,7 +2310,7 @@ function renderRfHeatmap(heatmapPoints, opacity) {
     const rssiText = pt.best_rssi != null ? `${pt.best_rssi} dBm` : "--";
 
     L.circleMarker([pt.latitude, pt.longitude], {
-      radius: 5,
+      radius: radius,
       color: color,
       fillColor: color,
       fillOpacity,
@@ -2205,11 +2324,23 @@ function renderRfHeatmap(heatmapPoints, opacity) {
         + `${pt.latitude.toFixed(6)}, ${pt.longitude.toFixed(6)}</div>`,
         { direction: "top", offset: [0, -4] }
       )
-      .addTo(state.rfHeatmapLayer);
+      .addTo(layer);
   }
+  return layer;
+}
 
-  if (!state.rfHeatmapVisible) {
-    map.removeLayer(state.rfHeatmapLayer);
+/**
+ * Render the RF coverage heatmap from heatmap_points array.
+ * Each point: {latitude, longitude, best_rssi, status}
+ */
+function renderRfHeatmap(heatmapPoints, opacity) {
+  if (state.rfHeatmapLayer) { map.removeLayer(state.rfHeatmapLayer); state.rfHeatmapLayer = null; }
+  if (!heatmapPoints || heatmapPoints.length === 0) return;
+
+  state.rfHeatmapLayer = createHeatmapLayer(heatmapPoints, opacity);
+
+  if (state.rfHeatmapVisible) {
+    state.rfHeatmapLayer.addTo(map);
   }
 }
 
@@ -2380,6 +2511,31 @@ async function analyzeRfSurvey() {
 
     const data = result.body;
     state.rfAnalysis = data;
+    state.rfPhase6State = data.phase6_state || state.rfPhase6State;
+
+    if (data.survey_role === "BEFORE") {
+      state.rfBeforeAnalysis = data.before_analysis || data;
+      state.activeHeatmapView = "BEFORE";
+      const verifHint = document.getElementById("rf-verification-hint");
+      if (verifHint) {
+        verifHint.textContent = "BEFORE survey complete & preserved! Select candidate, deploy node, then run AFTER survey.";
+      }
+      const viewSel = document.getElementById("heatmap-view-selector-container");
+      if (viewSel) viewSel.classList.add("hidden");
+      const verifResults = document.getElementById("verification-results");
+      if (verifResults) verifResults.classList.add("hidden");
+    } else if (data.survey_role === "AFTER") {
+      state.rfAfterAnalysis = data.after_analysis || data;
+      state.rfComparison = data.comparison;
+      state.activeHeatmapView = "AFTER";
+      const viewSel = document.getElementById("heatmap-view-selector-container");
+      if (viewSel) viewSel.classList.remove("hidden");
+      renderVerificationPanel(data.comparison, data.before_analysis, data.after_analysis);
+      const verifHint = document.getElementById("rf-verification-hint");
+      if (verifHint) {
+        verifHint.textContent = "Deployment verification complete. See comparison metrics below.";
+      }
+    }
 
     // --- Update coverage summary ---
     updateRfCoverageSummary(data);
@@ -2400,14 +2556,17 @@ async function analyzeRfSurvey() {
     const gapPct = total > 0 ? ((data.gap_count / total) * 100).toFixed(0) : 0;
     if (hintEl) {
       hintEl.textContent =
-        `${total} samples analyzed. Gap coverage: ${gapPct}%. `
+        `${total} samples analyzed [${data.survey_role || "SURVEY"}]. Gap coverage: ${gapPct}%. `
         + `${data.gap_cluster_count} gap cluster(s) → ${data.candidates.length} candidate(s).`;
     }
     logEvent(
-      `RF analysis done: ${total} samples | GOOD=${data.good_count} MODERATE=${data.moderate_count} `
+      `RF analysis done [${data.survey_role || "SURVEY"}]: ${total} samples | GOOD=${data.good_count} MODERATE=${data.moderate_count} `
       + `WEAK=${data.weak_count} GAP=${data.gap_count} | `
       + `${data.gap_cluster_count} clusters → ${data.candidates.length} candidates.`
     );
+
+    // Refresh RF survey history dropdown (Requirements 7, 8, 13)
+    await fetchSurveyHistory();
 
   } catch (err) {
     if (hintEl) hintEl.textContent = `Analysis error: ${err.message}`;
@@ -2415,6 +2574,446 @@ async function analyzeRfSurvey() {
   } finally {
     if (btn) btn.disabled = false;
   }
+}
+
+/**
+ * Phase 6 Requirement 8, 13, 14: Populate Deployment Verification panel.
+ */
+function renderVerificationPanel(comp, beforeData, afterData) {
+  const container = document.getElementById("verification-results");
+  const warnEl = document.getElementById("verif-invalidation-warning");
+  const warnReason = document.getElementById("verif-invalidation-reason");
+  const gapsBanner = document.getElementById("remaining-gaps-banner");
+  const gapsCount = document.getElementById("remaining-gaps-count");
+
+  if (!comp || !beforeData || !afterData) {
+    if (container) container.classList.add("hidden");
+    return;
+  }
+
+  if (comp.comparable === false) {
+    if (warnEl) warnEl.classList.remove("hidden");
+    if (warnReason) warnReason.textContent = comp.invalidation_reason || "Surveys cannot be compared.";
+    if (container) container.classList.remove("hidden");
+    const remGaps = comp.remaining_gaps != null ? comp.remaining_gaps : (afterData.gap_count ?? 0);
+    if (gapsCount) gapsCount.textContent = remGaps;
+    if (gapsBanner) {
+      gapsBanner.className = "verification-badge " + (remGaps === 0 ? "gaps-resolved" : "gaps-remaining");
+    }
+    return;
+  } else {
+    if (warnEl) warnEl.classList.add("hidden");
+  }
+
+  if (container) container.classList.remove("hidden");
+
+  const remGaps = comp.remaining_gaps != null ? comp.remaining_gaps : (afterData.gap_count ?? 0);
+  if (gapsCount) gapsCount.textContent = remGaps;
+  if (gapsBanner) {
+    gapsBanner.className = "verification-badge " + (remGaps === 0 ? "gaps-resolved" : (remGaps < (beforeData.gap_count || 1) ? "gaps-remaining" : "gaps-severe"));
+  }
+
+  const bPcts = beforeData.coverage_percentages || {};
+  const aPcts = afterData.coverage_percentages || {};
+  const chg = comp.changes || {};
+
+  function fmtChg(val, isPercentagePoints = false, invertSign = false) {
+    if (val == null || isNaN(val)) return "--";
+    const sign = val > 0 ? "+" : "";
+    const suffix = isPercentagePoints ? " pp" : "";
+    const text = `${sign}${val}${suffix}`;
+    let cls = "change-neutral";
+    if (invertSign) {
+      if (val < 0) cls = "change-positive";
+      else if (val > 0) cls = "change-negative";
+    } else {
+      if (val > 0) cls = "change-positive";
+      else if (val < 0) cls = "change-negative";
+    }
+    return `<span class="${cls}">${text}</span>`;
+  }
+
+  const setHtml = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
+  const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+
+  setText("verif-nodes-before", beforeData.active_node_count ?? beforeData.node_positions?.length ?? "--");
+  setText("verif-nodes-after", afterData.active_node_count ?? afterData.node_positions?.length ?? "--");
+  setHtml("verif-nodes-change", fmtChg(chg.node_count_change, false, false));
+
+  setText("verif-good-before", `${bPcts.good_pct ?? 0}%`);
+  setText("verif-good-after", `${aPcts.good_pct ?? 0}%`);
+  setHtml("verif-good-change", fmtChg(chg.good_change_percentage_points, true, false));
+
+  setText("verif-mod-before", `${bPcts.moderate_pct ?? 0}%`);
+  setText("verif-mod-after", `${aPcts.moderate_pct ?? 0}%`);
+  setHtml("verif-mod-change", fmtChg(chg.moderate_change_percentage_points, true, false));
+
+  setText("verif-weak-before", `${bPcts.weak_pct ?? 0}%`);
+  setText("verif-weak-after", `${aPcts.weak_pct ?? 0}%`);
+  setHtml("verif-weak-change", fmtChg(chg.weak_change_percentage_points, true, true));
+
+  setText("verif-gap-before", `${bPcts.gap_pct ?? 0}%`);
+  setText("verif-gap-after", `${aPcts.gap_pct ?? 0}%`);
+  setHtml("verif-gap-change", fmtChg(chg.gap_change_percentage_points, true, true));
+
+  setText("verif-gappoints-before", beforeData.gap_count ?? "--");
+  setText("verif-gappoints-after", afterData.gap_count ?? "--");
+  setHtml("verif-gappoints-change", fmtChg(chg.gap_point_change, false, true));
+
+  setText("verif-gapclusters-before", beforeData.gap_cluster_count ?? "--");
+  setText("verif-gapclusters-after", afterData.gap_cluster_count ?? "--");
+  setHtml("verif-gapclusters-change", fmtChg(chg.gap_cluster_change, false, true));
+}
+
+/**
+ * Phase 6 Requirement 11: Switch between AFTER, BEFORE, or OVERLAY heatmap view.
+ */
+function setHeatmapView(view) {
+  state.activeHeatmapView = view;
+  const btnAfter = document.getElementById("btn-view-after-heatmap");
+  const btnBefore = document.getElementById("btn-view-before-heatmap");
+  const btnOverlay = document.getElementById("btn-view-overlay-heatmap");
+
+  if (btnAfter) btnAfter.classList.toggle("active", view === "AFTER");
+  if (btnBefore) btnBefore.classList.toggle("active", view === "BEFORE");
+  if (btnOverlay) btnOverlay.classList.toggle("active", view === "OVERLAY");
+
+  clearRfAnalysisLayers();
+
+  if (view === "AFTER") {
+    const afterData = state.rfAfterAnalysis || state.rfAnalysis;
+    if (afterData && afterData.heatmap) {
+      renderRfHeatmap(afterData.heatmap, state.rfHeatmapOpacity);
+      renderRfGapPoints(afterData.gap_points);
+    }
+  } else if (view === "BEFORE") {
+    if (state.rfBeforeAnalysis && state.rfBeforeAnalysis.heatmap) {
+      renderRfHeatmap(state.rfBeforeAnalysis.heatmap, state.rfHeatmapOpacity);
+      renderRfGapPoints(state.rfBeforeAnalysis.gap_points);
+    }
+  } else if (view === "OVERLAY") {
+    // Show BEFORE at medium opacity and AFTER on top
+    if (state.rfBeforeAnalysis && state.rfBeforeAnalysis.heatmap) {
+      state.rfBeforeHeatmapLayer = createHeatmapLayer(state.rfBeforeAnalysis.heatmap, 0.35, 4);
+      if (state.rfHeatmapVisible) state.rfBeforeHeatmapLayer.addTo(map);
+    }
+    const afterData = state.rfAfterAnalysis || state.rfAnalysis;
+    if (afterData && afterData.heatmap) {
+      renderRfHeatmap(afterData.heatmap, 0.75);
+      renderRfGapPoints(afterData.gap_points);
+    }
+  }
+}
+
+/**
+ * Phase 6 Requirement 16: Reset verification session without deleting deployed nodes.
+ */
+async function resetVerificationSession() {
+  logEvent("Resetting RF verification session…");
+  try {
+    await apiPost("/api/rf-survey/session-reset", {});
+    state.rfBeforeAnalysis = null;
+    state.rfAfterAnalysis = null;
+    state.rfComparison = null;
+    state.rfAnalysis = null;
+    state.newlyDeployedNodeId = null;
+    state.rfPhase6State = "BEFORE_SURVEY";
+    state.activeHeatmapView = "AFTER";
+
+    clearRfAnalysisLayers();
+    renderAllDeployedNodes();
+
+    const verifResults = document.getElementById("verification-results");
+    if (verifResults) verifResults.classList.add("hidden");
+    const viewSelContainer = document.getElementById("heatmap-view-selector-container");
+    if (viewSelContainer) viewSelContainer.classList.add("hidden");
+    const warnEl = document.getElementById("verif-invalidation-warning");
+    if (warnEl) warnEl.classList.add("hidden");
+    const verifHint = document.getElementById("rf-verification-hint");
+    if (verifHint) {
+      verifHint.textContent = "Deploy a communication node at a candidate site, then complete and analyze an AFTER survey to verify coverage impact.";
+    }
+    resetRfAnalysisState("Verification session reset. Complete an RF scan, then click Analyze.");
+    logEvent("RF verification session reset complete. All deployed nodes preserved.");
+  } catch (err) {
+    logEvent(`Verification session reset failed: ${err.message}`);
+  }
+}
+
+/**
+ * Initialize Phase 6 Verification controls.
+ */
+function initVerificationControls() {
+  const btnAfter = document.getElementById("btn-view-after-heatmap");
+  const btnBefore = document.getElementById("btn-view-before-heatmap");
+  const btnOverlay = document.getElementById("btn-view-overlay-heatmap");
+  const btnResetVerif = document.getElementById("btn-reset-verification");
+
+  if (btnAfter) btnAfter.addEventListener("click", () => setHeatmapView("AFTER"));
+  if (btnBefore) btnBefore.addEventListener("click", () => setHeatmapView("BEFORE"));
+  if (btnOverlay) btnOverlay.addEventListener("click", () => setHeatmapView("OVERLAY"));
+  if (btnResetVerif) btnResetVerif.addEventListener("click", resetVerificationSession);
+}
+
+/**
+ * Phase 6 Requirements 7-14: Fetch and populate RF Survey History (up to 5 completed runs).
+ */
+async function fetchSurveyHistory() {
+  try {
+    const data = await apiGet("/api/rf-survey/history");
+    const surveys = (data && data.surveys) ? data.surveys : [];
+    state.surveyHistory = surveys;
+
+    const selectHist = document.getElementById("select-history-survey");
+    const selectA = document.getElementById("select-compare-a");
+    const selectB = document.getElementById("select-compare-b");
+    const btnView = document.getElementById("btn-view-history-survey");
+    const btnComp = document.getElementById("btn-run-history-compare");
+
+    if (!selectHist) return;
+
+    selectHist.innerHTML = "";
+    if (selectA) selectA.innerHTML = '<option value="">Survey A...</option>';
+    if (selectB) selectB.innerHTML = '<option value="">Survey B...</option>';
+
+    if (surveys.length === 0) {
+      selectHist.innerHTML = '<option value="">(No historical surveys yet)</option>';
+      if (btnView) btnView.disabled = true;
+      if (btnComp) btnComp.disabled = true;
+      return;
+    }
+
+    surveys.forEach((s) => {
+      const timeStr = s.timestamp ? s.timestamp.substring(11, 19) : "--";
+      const roleStr = s.survey_role || "SURVEY";
+      const label = `${s.survey_id} [${roleStr}] - ${timeStr} | Nodes: ${s.node_count}, GAP: ${s.gap_pct}%`;
+
+      const opt = document.createElement("option");
+      opt.value = s.survey_id;
+      opt.textContent = label;
+      selectHist.appendChild(opt);
+
+      if (selectA) {
+        const optA = document.createElement("option");
+        optA.value = s.survey_id;
+        optA.textContent = `${s.survey_id} [${roleStr}]`;
+        selectA.appendChild(optA);
+      }
+
+      if (selectB) {
+        const optB = document.createElement("option");
+        optB.value = s.survey_id;
+        optB.textContent = `${s.survey_id} [${roleStr}]`;
+        selectB.appendChild(optB);
+      }
+    });
+
+    if (btnView) btnView.disabled = false;
+
+    // Default select A and B if at least 2 surveys
+    if (surveys.length >= 2 && selectA && selectB) {
+      selectA.selectedIndex = 1;
+      selectB.selectedIndex = 2;
+      if (btnComp) btnComp.disabled = false;
+    } else if (btnComp) {
+      btnComp.disabled = true;
+    }
+  } catch (err) {
+    console.warn("fetchSurveyHistory error:", err);
+  }
+}
+
+/**
+ * Phase 6 Requirement 10: Viewing historical surveys must never modify current nodes,
+ * current RF collection, current mission, or current candidates.
+ */
+async function viewHistoricalSurvey(surveyId) {
+  if (!surveyId) {
+    const sel = document.getElementById("select-history-survey");
+    surveyId = sel ? sel.value : null;
+  }
+  if (!surveyId) return;
+
+  logEvent(`Viewing historical survey ${surveyId}…`);
+  try {
+    const s = await apiGet(`/api/rf-survey/history/${surveyId}`);
+    if (!s) throw new Error("Survey not found");
+
+    if (state.rfHistoricalLayer) {
+      map.removeLayer(state.rfHistoricalLayer);
+      state.rfHistoricalLayer = null;
+    }
+
+    state.rfHistoricalLayer = L.layerGroup().addTo(map);
+
+    // Render historical heatmap
+    if (s.heatmap && s.heatmap.length > 0) {
+      s.heatmap.forEach((cell) => {
+        let color = "#3FDA7F";
+        if (cell.status === "MODERATE") color = "#F5A623";
+        else if (cell.status === "WEAK") color = "#FF9500";
+        else if (cell.status === "GAP") color = "#FF5C5C";
+
+        const marker = L.circleMarker([cell.lat, cell.lon], {
+          radius: 6,
+          color: color,
+          fillColor: color,
+          fillOpacity: 0.65,
+          weight: 1.5,
+        }).addTo(state.rfHistoricalLayer);
+
+        marker.bindTooltip(
+          `<div style="font-family:var(--font-data); font-size:11px;">
+            <strong>${surveyId} (HISTORICAL)</strong><br>
+            RSSI: ${cell.rssi != null ? cell.rssi.toFixed(1) : "--"} dBm (${cell.status})<br>
+            Lat: ${cell.lat.toFixed(5)}, Lon: ${cell.lon.toFixed(5)}
+          </div>`,
+          { direction: "top", offset: [0, -4] }
+        );
+      });
+    }
+
+    // Render historical gap points
+    if (s.gaps && s.gaps.gap_points) {
+      s.gaps.gap_points.forEach((gp) => {
+        L.circleMarker([gp.lat, gp.lon], {
+          radius: 4,
+          color: "#FF5C5C",
+          fillColor: "#0A0D11",
+          fillOpacity: 0.9,
+          weight: 2,
+        }).addTo(state.rfHistoricalLayer).bindTooltip(
+          `<strong>${surveyId} GAP POINT</strong><br>Lat: ${gp.lat.toFixed(5)}, Lon: ${gp.lon.toFixed(5)}`,
+          { direction: "top", offset: [0, -3] }
+        );
+      });
+    }
+
+    logEvent(
+      `Historical survey ${surveyId} rendered on map (read-only): ` +
+      `${s.sample_count} samples, ${s.node_count} nodes at that time. Live mission & current nodes unchanged.`
+    );
+  } catch (err) {
+    logEvent(`View historical survey error: ${err.message}`);
+  }
+}
+
+/**
+ * Phase 6 Requirement 11 & 12: Compare two historical surveys.
+ * Shows: node count, sample count, GOOD %, MODERATE %, WEAK %, GAP %,
+ * gap points, gap clusters, and heatmaps.
+ */
+async function compareHistoricalSurveys() {
+  const selectA = document.getElementById("select-compare-a");
+  const selectB = document.getElementById("select-compare-b");
+  const idA = selectA ? selectA.value : null;
+  const idB = selectB ? selectB.value : null;
+
+  if (!idA || !idB) {
+    logEvent("Please select both Survey A and Survey B to compare.");
+    return;
+  }
+  if (idA === idB) {
+    logEvent("Please select two distinct historical surveys to compare.");
+    return;
+  }
+
+  logEvent(`Comparing historical surveys: ${idA} vs ${idB}…`);
+  try {
+    const res = await apiPost("/api/rf-survey/history/compare", {
+      survey_id_1: idA,
+      survey_id_2: idB,
+    });
+    const comp = res.body;
+    if (res.status !== 200) {
+      throw new Error(comp && comp.detail ? comp.detail : `HTTP ${res.status}`);
+    }
+
+    const resContainer = document.getElementById("history-compare-results");
+    if (resContainer) resContainer.classList.remove("hidden");
+
+    const badgeEl = document.getElementById("history-compare-badge");
+    if (badgeEl) {
+      if (comp.comparable) {
+        badgeEl.className = "verification-badge gaps-resolved";
+        badgeEl.textContent = `COMPARED: ${idA} vs ${idB} (Area Compatible)`;
+      } else {
+        badgeEl.className = "verification-badge gaps-remaining";
+        badgeEl.textContent = `WARNING: ${comp.invalidation_reason || "Area Mismatch"}`;
+      }
+    }
+
+    const thA = document.getElementById("hist-th-a");
+    const thB = document.getElementById("hist-th-b");
+    if (thA) thA.textContent = `${idA} [${comp.survey_1.survey_role}]`;
+    if (thB) thB.textContent = `${idB} [${comp.survey_2.survey_role}]`;
+
+    const s1 = comp.survey_1;
+    const s2 = comp.survey_2;
+    const d = comp.delta;
+
+    const setField = (id, val) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = val;
+    };
+
+    setField("hist-nodes-a", s1.node_count);
+    setField("hist-nodes-b", s2.node_count);
+    setField("hist-nodes-delta", (d.node_count_change >= 0 ? "+" : "") + d.node_count_change);
+
+    setField("hist-samples-a", s1.sample_count);
+    setField("hist-samples-b", s2.sample_count);
+    setField("hist-samples-delta", (d.sample_count_change >= 0 ? "+" : "") + d.sample_count_change);
+
+    setField("hist-good-a", `${s1.good_pct}%`);
+    setField("hist-good-b", `${s2.good_pct}%`);
+    setField("hist-good-delta", `${d.good_pct_change >= 0 ? "+" : ""}${d.good_pct_change}%`);
+
+    setField("hist-mod-a", `${s1.moderate_pct}%`);
+    setField("hist-mod-b", `${s2.moderate_pct}%`);
+    setField("hist-mod-delta", `${d.moderate_pct_change >= 0 ? "+" : ""}${d.moderate_pct_change}%`);
+
+    setField("hist-weak-a", `${s1.weak_pct}%`);
+    setField("hist-weak-b", `${s2.weak_pct}%`);
+    setField("hist-weak-delta", `${d.weak_pct_change >= 0 ? "+" : ""}${d.weak_pct_change}%`);
+
+    setField("hist-gap-a", `${s1.gap_pct}%`);
+    setField("hist-gap-b", `${s2.gap_pct}%`);
+    setField("hist-gap-delta", `${d.gap_pct_change >= 0 ? "+" : ""}${d.gap_pct_change}%`);
+
+    setField("hist-gappoints-a", s1.gap_points_count);
+    setField("hist-gappoints-b", s2.gap_points_count);
+    setField("hist-gappoints-delta", `${s2.gap_points_count - s1.gap_points_count >= 0 ? "+" : ""}${s2.gap_points_count - s1.gap_points_count}`);
+
+    setField("hist-gapclusters-a", s1.gap_clusters_count);
+    setField("hist-gapclusters-b", s2.gap_clusters_count);
+    setField("hist-gapclusters-delta", `${d.gap_clusters_change >= 0 ? "+" : ""}${d.gap_clusters_change}`);
+
+    logEvent(
+      `Comparison complete: ${idA} -> ${idB} | GAP %: ${s1.gap_pct}% -> ${s2.gap_pct}% ` +
+      `(${d.gap_pct_change >= 0 ? "+" : ""}${d.gap_pct_change}%), Gaps resolved: ${d.gaps_resolved}`
+    );
+  } catch (err) {
+    logEvent(`History comparison failed: ${err.message}`);
+  }
+}
+
+function initSurveyHistoryControls() {
+  const btnView = document.getElementById("btn-view-history-survey");
+  const btnComp = document.getElementById("btn-run-history-compare");
+  const selectA = document.getElementById("select-compare-a");
+  const selectB = document.getElementById("select-compare-b");
+
+  if (btnView) btnView.addEventListener("click", () => viewHistoricalSurvey());
+  if (btnComp) btnComp.addEventListener("click", compareHistoricalSurveys);
+
+  const checkComp = () => {
+    if (btnComp && selectA && selectB) {
+      btnComp.disabled = !selectA.value || !selectB.value || (selectA.value === selectB.value);
+    }
+  };
+  if (selectA) selectA.addEventListener("change", checkComp);
+  if (selectB) selectB.addEventListener("change", checkComp);
 }
 
 /**
@@ -2780,6 +3379,10 @@ function initControls() {
   if (analyzeRfBtn) analyzeRfBtn.addEventListener("click", analyzeRfSurvey);
   // Phase 5 — heatmap toggle/opacity controls (wired after map is ready)
   initRfHeatmapControls();
+  // Phase 6 — deployment verification controls
+  initVerificationControls();
+  // Phase 6 — survey history controls
+  initSurveyHistoryControls();
 }
 
 
@@ -2812,6 +3415,9 @@ async function boot() {
   // Phase 3 — connect to RF survey real-time stream alongside telemetry.
   connectRfSurveyWs();
 
+  // Phase 6 — populate RF survey history (last 5 completed runs)
+  fetchSurveyHistory();
+
   // Phase 5 — try to restore cached RF analysis from backend (survives page reload)
   try {
     const res = await apiGet("/api/rf-survey/analysis");
@@ -2833,11 +3439,35 @@ async function boot() {
     /* no cached analysis — that's fine */
   }
 
+  // Phase 6 — try to restore verification state from backend
+  try {
+    const verif = await apiGet("/api/rf-survey/verification");
+    if (verif && !verif.error) {
+      state.rfPhase6State = verif.phase6_state || state.rfPhase6State;
+      state.newlyDeployedNodeId = verif.newly_deployed_node_id || null;
+      state.rfBeforeAnalysis = verif.before || null;
+      state.rfAfterAnalysis = verif.after || null;
+      state.rfComparison = verif.comparison || null;
+
+      if (state.newlyDeployedNodeId) {
+        renderAllDeployedNodes();
+      }
+
+      if (verif.comparison && verif.before && verif.after) {
+        renderVerificationPanel(verif.comparison, verif.before, verif.after);
+        const viewSel = document.getElementById("heatmap-view-selector-container");
+        if (viewSel) viewSel.classList.remove("hidden");
+      }
+    }
+  } catch (_) {
+    /* no cached verification state */
+  }
+
   initGamepadListeners();
   _updateGamepadStat();
   _updateOverrideStat();
 
-  logEvent("GCS initialized — Phase 5 ready.");
+  logEvent("GCS initialized — Phase 6 ready.");
 }
 
 boot();

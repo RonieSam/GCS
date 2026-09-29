@@ -167,7 +167,7 @@ def build_survey_mission_items(
         "alt"     : alt,
     })
 
-    # Items 1…N: Survey NAV_WAYPOINT items. Ends at final survey waypoint.
+    # Items 1…N: Survey NAV_WAYPOINT items.
     for i, wp in enumerate(px4_waypoints):
         items.append({
             **common,
@@ -179,6 +179,42 @@ def build_survey_mission_items(
             "lat"     : wp["lat"],
             "lon"     : wp["lon"],
             "alt"     : wp["alt"],
+        })
+
+    # Items N+1 and N+2: Return to original pre-survey location and land.
+    # Note: Pre-survey location is the UAV's original position before starting
+    # the survey (NOT the green survey-start point inside the polygon).
+    if return_lat is not None and return_lon is not None:
+        if not (-90 <= return_lat <= 90):
+            raise InvalidMission(f"Return latitude {return_lat} out of range.")
+        if not (-180 <= return_lon <= 180):
+            raise InvalidMission(f"Return longitude {return_lon} out of range.")
+        ret_alt = return_alt_m if (return_alt_m is not None and return_alt_m > 0) else alt
+
+        # Item N+1: WAYPOINT back to pre-survey coordinates at survey altitude
+        items.append({
+            **common,
+            "seq"     : len(items),
+            "command" : _CMD_WAYPOINT,
+            "current" : 0,
+            "param1"  : 0.0,   # hold time (s)
+            "param2"  : 2.0,   # acceptance radius (m)
+            "lat"     : return_lat,
+            "lon"     : return_lon,
+            "alt"     : ret_alt,
+        })
+
+        # Item N+2: LAND at pre-survey coordinates (ground level)
+        items.append({
+            **common,
+            "seq"     : len(items),
+            "command" : _CMD_LAND,
+            "current" : 0,
+            "param1"  : 0.0,   # abort altitude
+            "param2"  : 0.0,   # land mode
+            "lat"     : return_lat,
+            "lon"     : return_lon,
+            "alt"     : 0.0,   # relative to home (ground level)
         })
 
     # Re-sequence to guarantee contiguous indices after building.
