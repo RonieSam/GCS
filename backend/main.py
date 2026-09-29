@@ -1939,6 +1939,8 @@ def api_deployment_status():
 
     is_airborne = (rel_alt is not None and rel_alt > 0.3) or (mission_state == "EXECUTING")
     is_landed = (rel_alt is not None and rel_alt <= 0.3) and not is_airborne
+    flight_mode = uav_state.get("flight_mode") or uav_state.get("mode") or ""
+    is_aborted = mission_state in ("ABORTED", "FAILED") or "RTL" in str(flight_mode).upper()
 
     dist_m = None
     within_tolerance = False
@@ -1961,6 +1963,7 @@ def api_deployment_status():
         and is_landed
         and within_tolerance
         and (not released)
+        and (not is_aborted)
     )
 
     reason = "Ready for release"
@@ -1968,6 +1971,8 @@ def api_deployment_status():
         reason = "No candidate selected"
     elif released:
         reason = "Node already released for this candidate"
+    elif is_aborted:
+        reason = f"RELEASE disabled: Deployment mission was aborted or entered RTL (state={mission_state})"
     elif is_airborne:
         alt_str = f"{rel_alt:.1f}m" if rel_alt is not None else "airborne"
         reason = f"RELEASE disabled: UAV is airborne ({alt_str})"
@@ -1982,6 +1987,7 @@ def api_deployment_status():
         "reason": reason,
         "is_airborne": is_airborne,
         "is_landed": is_landed,
+        "is_aborted": is_aborted,
         "within_tolerance": within_tolerance,
         "distance_to_candidate_m": round(dist_m, 2) if dist_m is not None else None,
         "candidate_tolerance_m": config.CANDIDATE_DEPLOY_TOLERANCE_M,
@@ -1996,7 +2002,7 @@ def api_deployment_release(payload: Optional[DeploymentReleaseRequest] = None):
     Phase 6 Requirements 3-6: Command node physical release.
     Enforces all release interlocks:
       1. UAV must not be airborne.
-      2. Mission must no longer be flying.
+      2. Mission must no longer be flying and not aborted.
       3. UAV must actually be landed.
       4. UAV must be within distance tolerance of selected candidate.
       5. Exactly one node is created at candidate coordinates.
@@ -2018,6 +2024,13 @@ def api_deployment_release(payload: Optional[DeploymentReleaseRequest] = None):
     uav_state = mav_manager.get_vehicle_state()
     rel_alt = uav_state.get("relative_altitude")
     mission_state = session_state.get("mission_state", "IDLE")
+    flight_mode = uav_state.get("flight_mode") or uav_state.get("mode") or ""
+
+    if mission_state in ("ABORTED", "FAILED") or "RTL" in str(flight_mode).upper():
+        raise HTTPException(
+            400,
+            f"RELEASE disabled: Deployment mission was aborted or entered RTL (state={mission_state}, mode={flight_mode}).",
+        )
 
     if (rel_alt is not None and rel_alt > 0.3) or (mission_state == "EXECUTING"):
         raise HTTPException(

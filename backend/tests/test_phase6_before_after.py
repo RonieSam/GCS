@@ -941,3 +941,294 @@ class TestPhase6RevisedRequirements(unittest.TestCase):
         for s in session_state["rf_survey_history"]:
             self.assertNotEqual(s.get("samples", [{}])[0].get("sample_id"), 99)
 
+
+class TestPhase6TwoDeploymentMechanisms(unittest.TestCase):
+    """
+    Dedicated tests verifying the two distinct node-deployment mechanisms:
+      1. AUTO DEPLOY — Immediate logical deployment (no UAV flight/landing/release required).
+      2. NODE MISSION + RELEASE — Physical deployment carried by UAV.
+         - Reaching destination does not create node.
+         - Landing does not create node.
+         - RELEASE disabled while airborne.
+         - RELEASE disabled when off-target.
+         - RELEASE enabled when landed and on-target.
+         - Failed release creates zero nodes.
+         - Successful release creates exactly one node.
+         - Duplicate release creates no duplicate.
+         - Aborted mission creates no node and disables release.
+    """
+
+    def setUp(self):
+        clear_nodes()
+        init_db()
+        self.client = TestClient(app)
+        self.collector = get_rf_collector()
+        self.collector.reset()
+        self.collector.update_deployed_nodes([])
+
+        self.area = [
+            {"lat": 12.9710, "lon": 77.5940},
+            {"lat": 12.9730, "lon": 77.5940},
+            {"lat": 12.9730, "lon": 77.5960},
+            {"lat": 12.9710, "lon": 77.5960},
+        ]
+        self.client.post("/api/area", json={"points": self.area})
+
+        session_state["mission_state"] = "IDLE"
+        session_state["selected_target"] = None
+        session_state["deployment_released"] = False
+
+    def test_a_auto_deploy_creates_node_immediately_without_uav_or_release(self):
+        """
+        Failure & Regression Test A:
+        AUTO DEPLOY creates one node immediately, does NOT require UAV flight,
+        does NOT require ARM, does NOT require landing, and does NOT require RELEASE.
+        """
+        nodes_before = len(list_nodes())
+        self.assertEqual(nodes_before, 0)
+
+        # 1. Operator selects a location or candidate
+        loc_lat = 12.9720
+        loc_lon = 77.5950
+
+        # 2. Press AUTO DEPLOY -> calls direct node creation path (POST /api/nodes)
+        with patch.object(mav_manager, "is_connected", return_value=False):
+            # UAV is completely disconnected / offline
+            res = self.client.post("/api/nodes", json={
+                "id": "COMM-001",
+                "lat": loc_lat,
+                "lon": loc_lon,
+                "coverage_radius_m": 250,
+            })
+            self.assertEqual(res.status_code, 200)
+            created = res.json()
+            self.assertEqual(created["id"], "COMM-001")
+            self.assertEqual(created["lat"], loc_lat)
+            self.assertEqual(created["lon"], loc_lon)
+
+        # 3. Node exists in DB immediately
+        nodes_after = list_nodes()
+        self.assertEqual(len(nodes_after), 1)
+        self.assertEqual(nodes_after[0]["id"], "COMM-001")
+
+        # 4. RELEASE interlock was never touched
+        self.assertFalse(session_state.get("deployment_released", False))
+
+    def test_b_mission_deployment_reaching_and_landing_creates_no_node(self):
+        """
+        Failure & Regression Test B:
+        Reaching destination does NOT create node.
+        Landing does NOT create node.
+        Generating / uploading mission does NOT create node.
+        Only RELEASE creates the node.
+        """
+        cand_lat = 12.9725
+        cand_lon = 77.5955
+        self.client.post("/api/select-target", json={"lat": cand_lat, "lon": cand_lon})
+        self.client.post("/api/mission/generate", json={"lat": cand_lat, "lon": cand_lon, "altitude_m": 15.0})
+
+        # Generating mission created no node
+        self.assertEqual(len(list_nodes()), 0)
+
+        # Step 1: Simulate UAV flying toward and reaching destination coordinates
+        reaching_state = {
+            "connected": True,
+            "latitude": cand_lat,
+            "longitude": cand_lon,
+            "altitude": 15.0,
+            "relative_altitude": 15.0,
+            "mode": "AUTO.MISSION",
+            "armed": True,
+        }
+        with patch.object(mav_manager, "get_vehicle_state", return_value=reaching_state):
+            # Checking status while at destination but airborne
+            status = self.client.get("/api/deployment/status").json()
+            self.assertFalse(status["can_release"])
+            self.assertTrue(status["is_airborne"])
+
+            # Reaching destination MUST NOT create node
+            self.assertEqual(len(list_nodes()), 0)
+
+        # Step 2: Simulate UAV landing at destination
+        landing_state = {
+            "connected": True,
+            "latitude": cand_lat,
+            "longitude": cand_lon,
+            "altitude": 0.0,
+            "relative_altitude": 0.0,
+            "mode": "AUTO_LAND",
+            "armed": False,
+        }
+        with patch.object(mav_manager, "get_vehicle_state", return_value=landing_state):
+            # Landing has completed
+            status_landed = self.client.get("/api/deployment/status").json()
+            self.assertTrue(status_landed["can_release"])
+            self.assertTrue(status_landed["is_landed"])
+
+            # Landing MUST NOT automatically create node!
+            self.assertEqual(len(list_nodes()), 0)
+
+    def test_b_release_disabled_while_airborne_and_off_target(self):
+        """
+        Failure & Regression Test B (continued):
+        RELEASE remains disabled while airborne and when off-target.
+        RELEASE becomes enabled when landed and on-target.
+        """
+        cand_lat = 12.9725
+        cand_lon = 77.5955
+        self.client.post("/api/select-target", json={"lat": cand_lat, "lon": cand_lon})
+
+        # Airborne check
+        airborne_state = {
+            "connected": True,
+            "latitude": cand_lat,
+            "longitude": cand_lon,
+            "altitude": 12.0,
+            "relative_altitude": 12.0,
+            "mode": "AUTO.MISSION",
+            "armed": True,
+        }
+        with patch.object(mav_manager, "get_vehicle_state", return_value=airborne_state):
+            st = self.client.get("/api/deployment/status").json()
+            self.assertFalse(st["can_release"])
+            self.assertIn("airborne", st["reason"].lower())
+
+        # Off-target check (> 10m away)
+        off_target_state = {
+            "connected": True,
+            "latitude": cand_lat + 0.0003,  # ~33m away
+            "longitude": cand_lon + 0.0003,
+            "altitude": 0.0,
+            "relative_altitude": 0.0,
+            "mode": "AUTO_LAND",
+            "armed": False,
+        }
+        with patch.object(mav_manager, "get_vehicle_state", return_value=off_target_state):
+            st = self.client.get("/api/deployment/status").json()
+            self.assertFalse(st["can_release"])
+            self.assertFalse(st["within_tolerance"])
+            self.assertIn("off-target", st["reason"].lower())
+
+        # On-target landed check (within 10m)
+        on_target_state = {
+            "connected": True,
+            "latitude": cand_lat + 0.00001,  # ~1.5m away
+            "longitude": cand_lon + 0.00001,
+            "altitude": 0.0,
+            "relative_altitude": 0.0,
+            "mode": "AUTO_LAND",
+            "armed": False,
+        }
+        with patch.object(mav_manager, "get_vehicle_state", return_value=on_target_state):
+            st = self.client.get("/api/deployment/status").json()
+            self.assertTrue(st["can_release"])
+            self.assertTrue(st["is_landed"])
+            self.assertTrue(st["within_tolerance"])
+
+    def test_c_release_failure_creates_zero_nodes(self):
+        """
+        Failure Test C:
+        A failed release attempt creates ZERO nodes.
+        """
+        cand_lat = 12.9725
+        cand_lon = 77.5955
+        self.client.post("/api/select-target", json={"lat": cand_lat, "lon": cand_lon})
+
+        nodes_initial = len(list_nodes())
+
+        # Attempt release while airborne
+        airborne_state = {
+            "connected": True,
+            "latitude": cand_lat,
+            "longitude": cand_lon,
+            "altitude": 10.0,
+            "relative_altitude": 10.0,
+            "mode": "AUTO.MISSION",
+            "armed": True,
+        }
+        with patch.object(mav_manager, "get_vehicle_state", return_value=airborne_state):
+            rel = self.client.post("/api/deployment/release")
+            self.assertEqual(rel.status_code, 400)
+            self.assertEqual(len(list_nodes()), nodes_initial)
+
+        # Attempt release while off-target
+        off_target_state = {
+            "connected": True,
+            "latitude": cand_lat + 0.0005,
+            "longitude": cand_lon + 0.0005,
+            "altitude": 0.0,
+            "relative_altitude": 0.0,
+            "mode": "AUTO_LAND",
+            "armed": False,
+        }
+        with patch.object(mav_manager, "get_vehicle_state", return_value=off_target_state):
+            rel = self.client.post("/api/deployment/release")
+            self.assertEqual(rel.status_code, 400)
+            self.assertEqual(len(list_nodes()), nodes_initial)
+
+    def test_d_and_e_release_success_creates_one_node_and_duplicate_release_prevented(self):
+        """
+        Failure & Success Tests D & E:
+        Successful release creates exactly one node.
+        Duplicate release is rejected and creates no additional nodes.
+        """
+        cand_lat = 12.9725
+        cand_lon = 77.5955
+        self.client.post("/api/select-target", json={"lat": cand_lat, "lon": cand_lon})
+
+        landed_state = {
+            "connected": True,
+            "latitude": cand_lat,
+            "longitude": cand_lon,
+            "altitude": 0.0,
+            "relative_altitude": 0.0,
+            "mode": "AUTO_LAND",
+            "armed": False,
+        }
+        with patch.object(mav_manager, "get_vehicle_state", return_value=landed_state):
+            # Successful release creates exactly 1 node (Test D)
+            res1 = self.client.post("/api/deployment/release")
+            self.assertEqual(res1.status_code, 200)
+            node1 = res1.json()
+            self.assertEqual(node1["lat"], cand_lat)
+            self.assertEqual(node1["lon"], cand_lon)
+            self.assertEqual(len(list_nodes()), 1)
+
+            # Duplicate release must be rejected (Test E)
+            res2 = self.client.post("/api/deployment/release")
+            self.assertEqual(res2.status_code, 400)
+            self.assertIn("already released", res2.json()["detail"].lower())
+            self.assertEqual(len(list_nodes()), 1)
+
+    def test_f_aborted_mission_creates_no_node_and_disables_release(self):
+        """
+        Failure Test F:
+        Aborted / RTL mission creates NO node and disables RELEASE.
+        """
+        cand_lat = 12.9725
+        cand_lon = 77.5955
+        self.client.post("/api/select-target", json={"lat": cand_lat, "lon": cand_lon})
+
+        # Set mission state to ABORTED
+        session_state["mission_state"] = "ABORTED"
+
+        # Even if UAV is on ground at candidate coordinates
+        landed_state = {
+            "connected": True,
+            "latitude": cand_lat,
+            "longitude": cand_lon,
+            "altitude": 0.0,
+            "relative_altitude": 0.0,
+            "mode": "AUTO_RTL",
+            "armed": False,
+        }
+        with patch.object(mav_manager, "get_vehicle_state", return_value=landed_state):
+            status = self.client.get("/api/deployment/status").json()
+            self.assertFalse(status["can_release"])
+            self.assertIn("aborted", status["reason"].lower())
+
+            rel = self.client.post("/api/deployment/release")
+            self.assertEqual(rel.status_code, 400)
+            self.assertIn("aborted", rel.json()["detail"].lower())
+            self.assertEqual(len(list_nodes()), 0)
+
