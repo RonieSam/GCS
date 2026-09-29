@@ -22,6 +22,7 @@ import mavlink_mission    # Phase 8 — MAVLink mission protocol
 import coordinate_mapper  # Phase 9A — simulation coordinate transformation
 import survey_planner    # Phase 2 — RF scan survey path planner
 from rf_collector import get_rf_collector, SCAN_STATE_ABORTED  # Phase 3 — RF Survey collector
+import rf_survey_analyzer  # Phase 5 — RF-data-driven candidate generation
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -125,6 +126,8 @@ session_state = {
     # Phase 2 — RF scan survey state
     "rf_scan_state": "IDLE",  # IDLE | MISSION_GENERATED | MISSION_UPLOADED | RUNNING | COMPLETED | FAILED
     "rf_scan_mission": None,  # survey_planner output dict or None
+    # Phase 5 — RF survey analysis results (from POST /api/rf-survey/analyze)
+    "rf_analysis": None,      # full analyze_rf_survey() result dict, or None (stale/not-yet-analyzed)
 }
 
 _CANDIDATE_MATCH_TOLERANCE_M = 1.0  # treat as "the same point" within this radius
@@ -549,6 +552,8 @@ def api_area(req: AreaRequest):
     session_state["mission_state"] = "PLANNING"
     session_state["rf_scan_state"] = "IDLE"
     session_state["rf_scan_mission"] = None
+    session_state["rf_analysis"] = None  # Phase 5 — invalidate RF analysis on area change
+
 
     return AreaResponse(accepted=True, point_count=len(polygon), polygon=req.polygon)
 
@@ -656,6 +661,8 @@ def api_rf_scan_generate(req: Optional[RFScanGenerateRequest] = None):
 
     session_state["rf_scan_state"] = "MISSION_GENERATED"
     session_state["rf_scan_mission"] = result
+    session_state["rf_analysis"] = None  # Phase 5 — new survey invalidates previous analysis
+
 
     start_ep = result.get("start_endpoint")
     logger.info(
@@ -924,6 +931,19 @@ def _closest_scored_candidate(lat, lon):
     for c in session_state.get("last_scored") or []:
         if haversine_distance_m(lat, lon, c["lat"], c["lon"]) < _CANDIDATE_MATCH_TOLERANCE_M:
             return c
+    rf_analysis = session_state.get("rf_analysis") or {}
+    for c in rf_analysis.get("candidates") or []:
+        c_lat = c.get("latitude") if c.get("latitude") is not None else c.get("lat")
+        c_lon = c.get("longitude") if c.get("longitude") is not None else c.get("lon")
+        if c_lat is not None and c_lon is not None:
+            if haversine_distance_m(lat, lon, c_lat, c_lon) < _CANDIDATE_MATCH_TOLERANCE_M:
+                return {
+                    "lat": c_lat,
+                    "lon": c_lon,
+                    "score": c.get("score", 0.0),
+                    "coverage_gain": c.get("gap_points", 0),
+                    "dist_to_nearest_m": c.get("nearest_node_distance_m", 0.0),
+                }
     return None
 
 
@@ -1187,6 +1207,14 @@ def api_mission_start():
             "PX4 is not connected. Cannot start mission.",
         )
 
+    # Phase 5 Requirement 25: START MISSION must not work while the UAV is disarmed.
+    vstate = mav_manager.get_vehicle_state()
+    if not vstate.get("armed"):
+        raise HTTPException(
+            400,
+            "UAV must be armed before starting the mission.",
+        )
+
     try:
         mav_manager.send_command("set_mode", mode="MISSION")
         session_state["mission_state"] = "EXECUTING"
@@ -1406,6 +1434,7 @@ def api_rf_survey_reset():
 
     Call this before starting a new RF scan if you want to discard the
     previous run's data without restarting the backend.
+    Clears any previous RF analysis results (heatmap / gap points / candidates).
     """
     rf_collector = get_rf_collector()
     rf_collector.reset()
@@ -1413,8 +1442,92 @@ def api_rf_survey_reset():
     rf_collector.update_deployed_nodes(active_nodes)
     session_state["rf_scan_state"] = "IDLE"
     session_state["rf_scan_mission"] = None
+    session_state["rf_analysis"] = None  # Phase 5 — invalidate stale analysis
     logger.info(f"RF Survey collector reset to IDLE with {len(active_nodes)} active nodes.")
     return {"success": True, "state": "IDLE", "active_nodes": len(active_nodes)}
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — RF Survey Analysis (heatmap + gap detection + candidates from real data)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/rf-survey/analyze")
+def api_rf_survey_analyze():
+    """
+    Analyze the completed RF survey dataset and return:
+      - Coverage heatmap (one point per real survey sample)
+      - Gap points (samples with bestRSSI <= -85 dBm)
+      - Gap cluster count
+      - Ranked candidate locations (MATLAB CandidatePlacement algorithm)
+      - Coverage summary percentages
+
+    Algorithm (deterministic, no randomness):
+      1. bestRSSI = max valid RSSI among currently-active nodes per sample
+      2. Classify: GOOD > -60, MODERATE > -75, WEAK > -85, GAP <= -85
+      3. Gap points → single-link spatial clustering
+           GapClusterDistance = 250 * RFRangeScale  (currently %.1f m)
+      4. Centroid per cluster = candidate (lat, lon)
+      5. Score = gapPoints * 10 + nearestNodeDist_m * 0.1
+      6. Sort descending → Candidate 1 = best
+
+    Requires SCAN_COMPLETE state (or ABORTED with data) for meaningful results.
+    """
+    rf_collector = get_rf_collector()
+    survey_data = rf_collector.get_survey_data()
+
+    state_val = survey_data.get("state", "IDLE")
+    samples = survey_data.get("samples") or []
+    deployed_nodes = list_nodes()  # current active nodes (single source of truth)
+
+    if not samples:
+        raise HTTPException(
+            400,
+            f"No RF survey samples available (collector state: {state_val}). "
+            "Complete an RF scan before analyzing.",
+        )
+
+    logger.info(
+        f"RF survey analysis requested: {len(samples)} samples, "
+        f"{len(deployed_nodes)} active nodes, collector state={state_val}"
+    )
+
+    result = rf_survey_analyzer.analyze_rf_survey(
+        samples=samples,
+        deployed_nodes=deployed_nodes,
+        affected_area=session_state.get("polygon"),
+    )
+
+    # Cache the analysis result so the frontend can retrieve it without re-running
+    session_state["rf_analysis"] = result
+
+    logger.info(
+        f"RF analysis complete: {result['survey_samples']} samples | "
+        f"GOOD={result['good_count']} MODERATE={result['moderate_count']} "
+        f"WEAK={result['weak_count']} GAP={result['gap_count']} "
+        f"UNMEASURED={result['unmeasured_count']} | "
+        f"{result['gap_cluster_count']} gap clusters, "
+        f"{len(result['candidates'])} candidates"
+    )
+
+    return result
+
+
+@app.get("/api/rf-survey/analysis")
+def api_rf_survey_analysis_get():
+    """
+    Return the most recently computed RF analysis result (from POST /api/rf-survey/analyze).
+
+    Returns 404 if no analysis has been run yet or if the previous analysis
+    was invalidated by a new scan or reset.
+    """
+    result = session_state.get("rf_analysis")
+    if result is None:
+        raise HTTPException(
+            404,
+            "No RF analysis results available. POST /api/rf-survey/analyze first.",
+        )
+    return result
 
 
 @app.websocket("/ws/rf-survey")

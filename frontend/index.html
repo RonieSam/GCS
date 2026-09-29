@@ -18,7 +18,7 @@
     </div>
     <div class="topbar-phase">
       <span class="phase-dot"></span>
-      PHASE 8 — MISSION UPLOAD + EXECUTION
+      PHASE 5 — RF COVERAGE HEATMAP + CANDIDATE GENERATION
     </div>
   </header>
 
@@ -210,6 +210,90 @@
           <button id="btn-reset-rf-survey" class="btn btn-block btn-danger" style="font-size:11px">
             Reset Survey Data
           </button>
+        </div>
+      </div>
+
+      <!-- ================================================================
+           RF Coverage Analysis — Phase 5
+           ================================================================ -->
+      <div class="panel" id="panel-rf-analysis">
+        <h2 class="panel-title">RF Coverage Analysis</h2>
+
+        <p class="hint" id="rf-analysis-hint">
+          Complete an RF scan, then click Analyze to generate the coverage heatmap and candidates.
+        </p>
+
+        <div class="btn-row">
+          <button id="btn-analyze-rf" class="btn btn-block btn-primary">
+            &#x1F4CA; Analyze RF Survey
+          </button>
+        </div>
+
+        <!-- Coverage summary (shown after analysis) -->
+        <div id="rf-coverage-summary" class="hidden" style="margin-top:10px">
+          <div class="stat-grid">
+            <div class="stat">
+              <span class="stat-label">Samples</span>
+              <span class="stat-value" id="rfa-samples">--</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label">Clusters</span>
+              <span class="stat-value" id="rfa-clusters">--</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label" style="color:#3FDA7F">GOOD (&gt;-60)</span>
+              <span class="stat-value" id="rfa-good">--</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label" style="color:#F5A623">MODERATE</span>
+              <span class="stat-value" id="rfa-moderate">--</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label" style="color:#FF9500">WEAK</span>
+              <span class="stat-value" id="rfa-weak">--</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label" style="color:#FF5C5C">GAP (&le;-85)</span>
+              <span class="stat-value" id="rfa-gap">--</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Heatmap layer toggle -->
+        <div id="rf-heatmap-controls" class="hidden" style="margin-top:12px;border-top:1px solid #232c37;padding-top:10px">
+          <div class="field-row" style="align-items:center">
+            <label class="field-label" for="toggle-heatmap" style="flex:1">
+              <input type="checkbox" id="toggle-heatmap" checked style="margin-right:6px;">
+              RF Coverage Map
+            </label>
+          </div>
+          <div class="field-row" style="align-items:center;margin-top:6px">
+            <label class="field-label" for="heatmap-opacity" style="flex:1;font-size:11px">
+              Opacity
+            </label>
+            <input type="range" id="heatmap-opacity" min="10" max="90" value="55"
+                   style="flex:2;accent-color:#00E5FF" title="Heatmap opacity">
+            <span id="heatmap-opacity-val" style="min-width:32px;text-align:right;font-size:11px;color:#8A9AB0">55%</span>
+          </div>
+          <div class="field-row" style="align-items:center;margin-top:4px">
+            <label class="field-label" for="toggle-gap-points" style="flex:1;font-size:11px">
+              <input type="checkbox" id="toggle-gap-points" checked style="margin-right:6px;">
+              Gap Points
+            </label>
+            <label class="field-label" for="toggle-rf-candidates" style="flex:1;font-size:11px">
+              <input type="checkbox" id="toggle-rf-candidates" checked style="margin-right:6px;">
+              Candidates
+            </label>
+          </div>
+
+          <!-- Legend -->
+          <div id="rf-heatmap-legend" style="margin-top:8px;padding:6px 8px;background:#0a0d11;border-radius:4px;border:1px solid #232c37">
+            <div style="font-size:10px;color:#8A9AB0;margin-bottom:4px;font-weight:600;letter-spacing:0.05em">RF COVERAGE LEGEND</div>
+            <div class="legend-row"><span class="legend-dot" style="background:#3FDA7F"></span><span class="legend-label">GOOD &nbsp; &gt; -60 dBm</span></div>
+            <div class="legend-row"><span class="legend-dot" style="background:#F5A623"></span><span class="legend-label">MODERATE &nbsp; -75 to -60 dBm</span></div>
+            <div class="legend-row"><span class="legend-dot" style="background:#FF9500"></span><span class="legend-label">WEAK &nbsp; -85 to -75 dBm</span></div>
+            <div class="legend-row"><span class="legend-dot" style="background:#FF5C5C"></span><span class="legend-label">GAP &nbsp; &le; -85 dBm</span></div>
+          </div>
         </div>
       </div>
 
@@ -409,6 +493,6 @@
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-<script src="app.js?v=15"></script>
+<script src="app.js?v=16"></script>
 </body>
 </html>

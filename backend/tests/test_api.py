@@ -46,6 +46,10 @@ class ApiTestCase(unittest.TestCase):
                 "last_scored": None,
                 "selected_target": None,
                 "mission_state": "PLANNING",
+                "last_mission": None,
+                "rf_analysis": None,
+                "rf_scan_state": "IDLE",
+                "rf_scan_mission": None,
             }
         )
 

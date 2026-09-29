@@ -88,6 +88,17 @@ const state = {
   rfScanState: "IDLE",       // IDLE | MISSION_GENERATED | MISSION_UPLOADED | RUNNING | COMPLETED | FAILED
   rfScanLayer: null,         // Leaflet LayerGroup for the survey path and waypoints
   rfScanMission: null,       // Last generated survey result object
+
+  // Phase 5 — RF coverage heatmap + candidate generation
+  rfAnalysis: null,          // last POST /api/rf-survey/analyze result object
+  rfHeatmapLayer: null,      // Leaflet LayerGroup for heatmap circles
+  rfGapLayer: null,          // Leaflet LayerGroup for gap-point markers
+  rfCandidateLayer: null,    // Leaflet LayerGroup for RF candidate markers
+  rfHeatmapVisible: true,
+  rfGapVisible: true,
+  rfCandidatesVisible: true,
+  rfHeatmapOpacity: 0.55,    // 0.10 – 0.90
+  rfAnalysisAutoTriggered: false,
 };
 
 // A message every ~1/MAVLINK stream rate is expected; if nothing arrives
@@ -912,26 +923,37 @@ function clearMissionPanel() {
 
 async function selectLocation(candidate, label) {
   try {
-    const result = await apiPost("/api/select-target", { lat: candidate.lat, lon: candidate.lon });
+    const lat = candidate.lat != null ? candidate.lat : candidate.latitude;
+    const lon = candidate.lon != null ? candidate.lon : candidate.longitude;
+    const result = await apiPost("/api/select-target", { lat, lon });
     if (result.status !== 200) throw new Error(result.body && result.body.detail);
 
-    state.selectedTarget = { lat: candidate.lat, lon: candidate.lon };
+    state.selectedTarget = { lat, lon };
 
-    document.getElementById("mission-lat").value = candidate.lat.toFixed(6);
-    document.getElementById("mission-lon").value = candidate.lon.toFixed(6);
+    document.getElementById("mission-lat").value = lat.toFixed(6);
+    document.getElementById("mission-lon").value = lon.toFixed(6);
     document.getElementById("btn-generate-mission").disabled = false;
-    document.getElementById("mission-hint").textContent =
-      `Location ${label} selected — set altitude and generate the mission.`;
+
+    // Requirement 23: Display Rank, Latitude, Longitude, Gap points, Score, Distance to nearest node
+    let metaDesc = `SELECTED: ${label} (Lat: ${lat.toFixed(5)}, Lon: ${lon.toFixed(5)})`;
+    if (candidate.score != null) {
+      metaDesc += ` | Score: ${candidate.score} | Gap pts: ${candidate.gap_points ?? "--"} | Node dist: ${candidate.nearest_node_distance_m ?? "--"}m`;
+    }
+    metaDesc += ` — Click GENERATE MISSION to plan route.`;
+    document.getElementById("mission-hint").textContent = metaDesc;
+
+    // Requirement 26: Pre-populate Node Deployment panel for explicit AUTO DEPLOY
+    selectDeploymentLocation(lat, lon, label || "candidate");
 
     if (state.selectedMarker) map.removeLayer(state.selectedMarker);
-    state.selectedMarker = L.circleMarker([candidate.lat, candidate.lon], {
+    state.selectedMarker = L.circleMarker([lat, lon], {
       radius: 12,
       color: "#FFB020",
       fillOpacity: 0,
       weight: 3,
     }).addTo(map);
 
-    logEvent(`Location ${label} selected — lat=${candidate.lat.toFixed(5)}, lon=${candidate.lon.toFixed(5)}.`);
+    logEvent(`Selected Candidate ${label}: lat=${lat.toFixed(5)}, lon=${lon.toFixed(5)}`);
   } catch (err) {
     logEvent(`Select Location ${label} failed: ${err.message}`);
   }
@@ -1041,10 +1063,15 @@ async function uploadMission() {
       `Mission uploaded (${body.items} items). Arm vehicle then Start Mission.`;
     logEvent(`Mission uploaded — ${body.items} items accepted by PX4.`);
 
-    // Enable Start; keep Upload enabled (re-upload allowed).
+    // Enable Start only if armed; keep Upload enabled (re-upload allowed).
     btn.disabled = false;
-    document.getElementById("btn-start-mission").disabled = false;
+    const isArmed = Boolean(state.vehicle && state.vehicle.armed);
+    document.getElementById("btn-start-mission").disabled = !isArmed;
     document.getElementById("btn-abort-mission").disabled = false;
+    if (!isArmed) {
+      document.getElementById("mission-hint").textContent =
+        `Mission uploaded (${body.items} items). UAV must be armed before starting the mission.`;
+    }
 
   } catch (err) {
     document.getElementById("stat-mission-state").textContent = "FAILED";
@@ -1060,6 +1087,22 @@ async function startMission() {
 
   const btn = document.getElementById("btn-start-mission");
   const rfStartBtn = document.getElementById("btn-start-rf-scan");
+
+  // Phase 5 Requirement 25: START MISSION must not work while the UAV is disarmed.
+  const isArmed = Boolean(state.vehicle && state.vehicle.armed);
+  if (!isArmed) {
+    const msg = "UAV must be armed before starting the mission.";
+    document.getElementById("mission-hint").textContent = msg;
+    const rfHintEl = document.getElementById("rf-scan-hint");
+    if (rfHintEl && state.rfScanState === "MISSION_UPLOADED") {
+      rfHintEl.textContent = msg;
+    }
+    if (btn) btn.disabled = true;
+    if (rfStartBtn) rfStartBtn.disabled = true;
+    logEvent(`Start Mission rejected: ${msg}`);
+    return;
+  }
+
   if (btn) btn.disabled = true;
   if (rfStartBtn) rfStartBtn.disabled = true;
   document.getElementById("mission-hint").textContent = "Commanding PX4 into mission mode…";
@@ -1603,6 +1646,16 @@ function renderTelemetryPanel() {
         returnHomeBtn.disabled = false;
       }
     }
+
+    // Phase 5 Requirement 25: START MISSION / START RF SCAN available only after ARM
+    const startMissionBtn = document.getElementById("btn-start-mission");
+    if (startMissionBtn && state.missionUploaded && !state.missionExecuting) {
+      startMissionBtn.disabled = !v.armed;
+    }
+    const startRfBtn = document.getElementById("btn-start-rf-scan");
+    if (startRfBtn && state.rfScanState === "MISSION_UPLOADED") {
+      startRfBtn.disabled = !v.armed;
+    }
   }
 
   // Update Manual Override button gating whenever telemetry refreshes
@@ -1821,6 +1874,9 @@ function clearRfScan() {
   if (uploadBtn) uploadBtn.disabled = true;
   const startBtn = document.getElementById("btn-start-rf-scan");
   if (startBtn) startBtn.disabled = true;
+
+  // Phase 5 Requirement 27: New survey invalidates old analysis
+  resetRfAnalysisState("RF scan cleared. Define area and generate survey to start.");
 }
 
 function renderRfScanPath(waypoints) {
@@ -1920,6 +1976,9 @@ async function handleRfScan() {
     const data = result.body;
     state.rfScanState = data.state;
     state.rfScanMission = data;
+
+    // Phase 5 Requirement 27: New survey invalidates old analysis
+    resetRfAnalysisState("New RF scan generated. Complete scan to run coverage analysis.");
 
     // Update UI stats
     const stateEl = document.getElementById("stat-rf-state");
@@ -2044,9 +2103,15 @@ async function uploadRfScanMission() {
       `Arm vehicle then click START RF SCAN.`;
     logEvent(`RF scan mission uploaded — ${body.items} items accepted by PX4.`);
 
-    // Enable Start; keep Upload enabled (re-upload is allowed).
+    // Enable Start only if vehicle is armed; keep Upload enabled (re-upload is allowed).
+    const isArmed = Boolean(state.vehicle && state.vehicle.armed);
     if (uploadBtn) uploadBtn.disabled = false;
-    if (startBtn)  startBtn.disabled  = false;
+    if (startBtn)  startBtn.disabled  = !isArmed;
+    if (hintEl) {
+      hintEl.textContent = isArmed
+        ? `RF scan mission uploaded (${body.items} items). Ready to Start RF Scan.`
+        : `RF scan mission uploaded (${body.items} items). UAV must be armed before starting the RF scan.`;
+    }
 
     // Keep Mission panel upload status in sync so telemetry WP display works.
     document.getElementById("stat-mission-state").textContent  = "UPLOADED";
@@ -2059,6 +2124,349 @@ async function uploadRfScanMission() {
     if (hintEl)  hintEl.textContent  = `Upload error: ${err.message}`;
     logEvent(`RF scan upload error: ${err.message}`);
     if (uploadBtn) uploadBtn.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — RF Coverage Heatmap + Candidate Generation from real survey data
+// ---------------------------------------------------------------------------
+
+/**
+ * RSSI color per classification status (matches backend thresholds exactly).
+ */
+const RF_STATUS_COLOR = {
+  GOOD:       "#3FDA7F",
+  MODERATE:   "#F5A623",
+  WEAK:       "#FF9500",
+  GAP:        "#FF5C5C",
+  UNMEASURED: "#4A5568",
+};
+
+/**
+ * Remove all heatmap / gap-point / RF-candidate Leaflet layers from the map.
+ */
+function clearRfAnalysisLayers() {
+  if (state.rfHeatmapLayer) { map.removeLayer(state.rfHeatmapLayer); state.rfHeatmapLayer = null; }
+  if (state.rfGapLayer)     { map.removeLayer(state.rfGapLayer);     state.rfGapLayer = null; }
+  if (state.rfCandidateLayer){ map.removeLayer(state.rfCandidateLayer); state.rfCandidateLayer = null; }
+}
+
+/**
+ * Phase 5 Requirement 27: Reset all RF analysis state and UI panels when
+ * a new survey starts, an area changes, or data is reset.
+ */
+function resetRfAnalysisState(hintMessage) {
+  clearRfAnalysisLayers();
+  state.rfAnalysis = null;
+  state.rfAnalysisAutoTriggered = false;
+  const summaryEl = document.getElementById("rf-coverage-summary");
+  if (summaryEl) summaryEl.classList.add("hidden");
+  const ctrlEl = document.getElementById("rf-heatmap-controls");
+  if (ctrlEl) ctrlEl.classList.add("hidden");
+  const candListEl = document.getElementById("recommended-list");
+  if (candListEl) candListEl.innerHTML = "";
+  const candEmptyEl = document.getElementById("recommended-empty");
+  if (candEmptyEl) candEmptyEl.classList.remove("hidden");
+  const rfaHintEl = document.getElementById("rf-analysis-hint");
+  if (rfaHintEl) {
+    rfaHintEl.textContent = hintMessage || "Complete an RF scan, then click Analyze to generate the coverage heatmap and candidates.";
+  }
+}
+
+/**
+ * Render the RF coverage heatmap from heatmap_points array.
+ * Each point: {latitude, longitude, best_rssi, status}
+ */
+function renderRfHeatmap(heatmapPoints, opacity) {
+  if (state.rfHeatmapLayer) { map.removeLayer(state.rfHeatmapLayer); state.rfHeatmapLayer = null; }
+  if (!heatmapPoints || heatmapPoints.length === 0) return;
+
+  state.rfHeatmapLayer = L.layerGroup().addTo(map);
+
+  const fillOpacity = Math.max(0.05, Math.min(0.95, opacity));
+  const strokeOpacity = Math.min(1, fillOpacity * 1.4);
+
+  for (const pt of heatmapPoints) {
+    const color = RF_STATUS_COLOR[pt.status] || RF_STATUS_COLOR.UNMEASURED;
+    const rssiText = pt.best_rssi != null ? `${pt.best_rssi} dBm` : "--";
+
+    L.circleMarker([pt.latitude, pt.longitude], {
+      radius: 5,
+      color: color,
+      fillColor: color,
+      fillOpacity,
+      opacity: strokeOpacity,
+      weight: 0.8,
+      renderer: canvasRenderer,
+    })
+      .bindTooltip(
+        `<div style="font-family:var(--font-data);font-size:11px">`
+        + `<strong>${pt.status}</strong><br>RSSI: ${rssiText}<br>`
+        + `${pt.latitude.toFixed(6)}, ${pt.longitude.toFixed(6)}</div>`,
+        { direction: "top", offset: [0, -4] }
+      )
+      .addTo(state.rfHeatmapLayer);
+  }
+
+  if (!state.rfHeatmapVisible) {
+    map.removeLayer(state.rfHeatmapLayer);
+  }
+}
+
+/**
+ * Render gap-point cluster markers (red diamonds).
+ */
+function renderRfGapPoints(gapPoints) {
+  if (state.rfGapLayer) { map.removeLayer(state.rfGapLayer); state.rfGapLayer = null; }
+  if (!gapPoints || gapPoints.length === 0) return;
+
+  state.rfGapLayer = L.layerGroup().addTo(map);
+
+  for (const pt of gapPoints) {
+    L.circleMarker([pt.latitude, pt.longitude], {
+      radius: 4,
+      color: "#FF5C5C",
+      fillColor: "#FF5C5C",
+      fillOpacity: 0.0,
+      opacity: 0.7,
+      weight: 1.5,
+      renderer: canvasRenderer,
+    }).addTo(state.rfGapLayer);
+  }
+
+  if (!state.rfGapVisible) {
+    map.removeLayer(state.rfGapLayer);
+  }
+}
+
+/**
+ * Render RF analysis candidates on the map and populate the Recommended panel.
+ */
+function renderRfCandidates(candidates) {
+  if (state.rfCandidateLayer) { map.removeLayer(state.rfCandidateLayer); state.rfCandidateLayer = null; }
+
+  const listEl = document.getElementById("recommended-list");
+  const emptyEl = document.getElementById("recommended-empty");
+
+  if (!candidates || candidates.length === 0) {
+    if (listEl) listEl.innerHTML = "";
+    if (emptyEl) emptyEl.classList.remove("hidden");
+    return;
+  }
+
+  if (emptyEl) emptyEl.classList.add("hidden");
+  state.rfCandidateLayer = L.layerGroup().addTo(map);
+
+  if (listEl) listEl.innerHTML = "";
+
+  candidates.forEach((c, idx) => {
+    const label = `Candidate #${c.rank || (idx + 1)}`;
+    const isTop = idx === 0;
+
+    // Map marker
+    const color = isTop ? "#FFB020" : "#F5A623";
+    const marker = L.circleMarker([c.latitude, c.longitude], {
+      radius: isTop ? 10 : 8,
+      color,
+      fillColor: color,
+      fillOpacity: 0.18,
+      weight: isTop ? 3 : 2.5,
+    })
+      .bindTooltip(
+        `<div style="font-family:var(--font-data);font-size:11px">`
+        + `<strong>${label}</strong><br>`
+        + `Score: ${c.score}<br>`
+        + `Gap pts: ${c.gap_points} | Node dist: ${c.nearest_node_distance_m}m<br>`
+        + `${c.latitude.toFixed(6)}, ${c.longitude.toFixed(6)}`
+        + `</div>`,
+        { direction: "top", offset: [0, -6] }
+      )
+      .addTo(state.rfCandidateLayer);
+
+    // Requirement 23: Clicking marker selects the candidate
+    marker.on("click", () => {
+      selectLocation(c, label);
+      document.querySelectorAll(".rf-candidate-card").forEach(el => el.classList.remove("selected"));
+      card.classList.add("selected");
+    });
+
+    // Rank label divIcon
+    L.marker([c.latitude, c.longitude], {
+      icon: L.divIcon({
+        className: "",
+        html: `<div style="font-size:10px;font-weight:700;color:${color};font-family:var(--font-data);text-shadow:0 0 3px #000;white-space:nowrap">#${c.rank || (idx+1)}</div>`,
+        iconAnchor: [-10, 4],
+      }),
+      interactive: false,
+    }).addTo(state.rfCandidateLayer);
+
+    // Side-panel card
+    const card = document.createElement("div");
+    card.className = `rf-candidate-card${isTop ? " rank-1" : ""}`;
+    card.id = `rf-cand-${idx}`;
+    card.innerHTML =
+      `<div class="rf-candidate-rank${isTop ? " rank-1" : ""}">★ ${label}${isTop ? " (BEST)" : ""}</div>`
+      + `<div class="rf-candidate-meta">`
+      + `Score: ${c.score}&nbsp;&nbsp;|&nbsp;&nbsp;Gap pts: ${c.gap_points}<br>`
+      + `Nearest node: ${c.nearest_node_distance_m} m<br>`
+      + `Lat: ${c.latitude.toFixed(6)}&nbsp;&nbsp;Lon: ${c.longitude.toFixed(6)}`
+      + `</div>`
+      + `<div class="rf-candidate-actions">`
+      + `<button class="btn btn-primary" id="rfcand-select-${idx}">Select for Mission</button>`
+      + `</div>`;
+    if (listEl) listEl.appendChild(card);
+
+    // Wire "Select for Mission" button
+    setTimeout(() => {
+      const btn = document.getElementById(`rfcand-select-${idx}`);
+      if (btn) {
+        btn.addEventListener("click", () => {
+          selectLocation(c, label);
+          // Highlight selected card
+          document.querySelectorAll(".rf-candidate-card").forEach(el => el.classList.remove("selected"));
+          card.classList.add("selected");
+        });
+      }
+    }, 0);
+  });
+
+  if (!state.rfCandidatesVisible) {
+    map.removeLayer(state.rfCandidateLayer);
+  }
+}
+
+/**
+ * Update the RF coverage summary stats panel.
+ */
+function updateRfCoverageSummary(data) {
+  const total = data.survey_samples || 0;
+  function pct(n) {
+    return total > 0 ? ` (${((n / total) * 100).toFixed(0)}%)` : "";
+  }
+
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+  set("rfa-samples",  total);
+  set("rfa-clusters", data.gap_cluster_count ?? "--");
+  set("rfa-good",     `${data.good_count}${pct(data.good_count)}`);
+  set("rfa-moderate", `${data.moderate_count}${pct(data.moderate_count)}`);
+  set("rfa-weak",     `${data.weak_count}${pct(data.weak_count)}`);
+  set("rfa-gap",      `${data.gap_count}${pct(data.gap_count)}`);
+}
+
+/**
+ * Main Phase 5 action: POST /api/rf-survey/analyze and render results.
+ */
+async function analyzeRfSurvey() {
+  const btn     = document.getElementById("btn-analyze-rf");
+  const hintEl  = document.getElementById("rf-analysis-hint");
+
+  if (btn) btn.disabled = true;
+  if (hintEl) hintEl.textContent = "Running RF coverage analysis…";
+  logEvent("RF coverage analysis requested…");
+
+  try {
+    const result = await apiPost("/api/rf-survey/analyze", {});
+
+    if (result.status === 400) {
+      const msg = result.body && result.body.detail ? result.body.detail : `HTTP ${result.status}`;
+      if (hintEl) hintEl.textContent = `Analysis failed: ${msg}`;
+      logEvent(`RF analysis failed: ${msg}`);
+      return;
+    }
+
+    if (result.status !== 200) {
+      throw new Error(result.body && result.body.detail ? result.body.detail : `HTTP ${result.status}`);
+    }
+
+    const data = result.body;
+    state.rfAnalysis = data;
+
+    // --- Update coverage summary ---
+    updateRfCoverageSummary(data);
+
+    // --- Render heatmap ---
+    clearRfAnalysisLayers();
+    renderRfHeatmap(data.heatmap, state.rfHeatmapOpacity);
+    renderRfGapPoints(data.gap_points);
+    renderRfCandidates(data.candidates);
+
+    // --- Show controls ---
+    const summaryEl = document.getElementById("rf-coverage-summary");
+    if (summaryEl) summaryEl.classList.remove("hidden");
+    const ctrlEl = document.getElementById("rf-heatmap-controls");
+    if (ctrlEl) ctrlEl.classList.remove("hidden");
+
+    const total = data.survey_samples || 0;
+    const gapPct = total > 0 ? ((data.gap_count / total) * 100).toFixed(0) : 0;
+    if (hintEl) {
+      hintEl.textContent =
+        `${total} samples analyzed. Gap coverage: ${gapPct}%. `
+        + `${data.gap_cluster_count} gap cluster(s) → ${data.candidates.length} candidate(s).`;
+    }
+    logEvent(
+      `RF analysis done: ${total} samples | GOOD=${data.good_count} MODERATE=${data.moderate_count} `
+      + `WEAK=${data.weak_count} GAP=${data.gap_count} | `
+      + `${data.gap_cluster_count} clusters → ${data.candidates.length} candidates.`
+    );
+
+  } catch (err) {
+    if (hintEl) hintEl.textContent = `Analysis error: ${err.message}`;
+    logEvent(`RF analysis error: ${err.message}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/**
+ * Heatmap opacity slider handler.
+ */
+function initRfHeatmapControls() {
+  const toggle  = document.getElementById("toggle-heatmap");
+  const opacity = document.getElementById("heatmap-opacity");
+  const opVal   = document.getElementById("heatmap-opacity-val");
+  const gapChk  = document.getElementById("toggle-gap-points");
+  const candChk = document.getElementById("toggle-rf-candidates");
+
+  if (opacity) {
+    opacity.addEventListener("input", () => {
+      const pct = parseInt(opacity.value, 10);
+      if (opVal) opVal.textContent = `${pct}%`;
+      state.rfHeatmapOpacity = pct / 100;
+      // Re-render heatmap at new opacity
+      if (state.rfAnalysis && state.rfHeatmapVisible) {
+        renderRfHeatmap(state.rfAnalysis.heatmap, state.rfHeatmapOpacity);
+      }
+    });
+  }
+
+  if (toggle) {
+    toggle.addEventListener("change", () => {
+      state.rfHeatmapVisible = toggle.checked;
+      if (state.rfHeatmapLayer) {
+        if (state.rfHeatmapVisible) map.addLayer(state.rfHeatmapLayer);
+        else map.removeLayer(state.rfHeatmapLayer);
+      }
+    });
+  }
+
+  if (gapChk) {
+    gapChk.addEventListener("change", () => {
+      state.rfGapVisible = gapChk.checked;
+      if (state.rfGapLayer) {
+        if (state.rfGapVisible) map.addLayer(state.rfGapLayer);
+        else map.removeLayer(state.rfGapLayer);
+      }
+    });
+  }
+
+  if (candChk) {
+    candChk.addEventListener("change", () => {
+      state.rfCandidatesVisible = candChk.checked;
+      if (state.rfCandidateLayer) {
+        if (state.rfCandidatesVisible) map.addLayer(state.rfCandidateLayer);
+        else map.removeLayer(state.rfCandidateLayer);
+      }
+    });
   }
 }
 
@@ -2208,6 +2616,13 @@ function renderRfSurveyPanel(data) {
   if (rfStateEl && collectorState !== "IDLE") {
     rfStateEl.textContent = collectorState;
   }
+
+  // Phase 5 Requirement 11: SCAN_COMPLETE -> automatically request RF coverage analysis & heatmap
+  if (collectorState === "SCAN_COMPLETE" && !state.rfAnalysisAutoTriggered && (data.sample_count || 0) > 0) {
+    state.rfAnalysisAutoTriggered = true;
+    logEvent("RF survey complete — automatically generating coverage heatmap and candidates…");
+    analyzeRfSurvey();
+  }
 }
 
 /**
@@ -2299,6 +2714,9 @@ async function resetSurveyData() {
     if (container) container.classList.add("hidden");
     if (rfStateEl) rfStateEl.textContent = "IDLE";
 
+    // Phase 5 Requirement 27: New survey invalidates old analysis
+    resetRfAnalysisState("Survey data reset. Run a new scan to analyze.");
+
     logEvent("RF survey data reset to IDLE.");
   } catch (err) {
     logEvent(`RF survey reset failed: ${err.message}`);
@@ -2357,7 +2775,13 @@ function initControls() {
       }
     });
   }
+  // Phase 5 — RF coverage analysis
+  const analyzeRfBtn = document.getElementById("btn-analyze-rf");
+  if (analyzeRfBtn) analyzeRfBtn.addEventListener("click", analyzeRfSurvey);
+  // Phase 5 — heatmap toggle/opacity controls (wired after map is ready)
+  initRfHeatmapControls();
 }
+
 
 // ---------------------------------------------------------------------------
 // Boot
@@ -2388,11 +2812,32 @@ async function boot() {
   // Phase 3 — connect to RF survey real-time stream alongside telemetry.
   connectRfSurveyWs();
 
+  // Phase 5 — try to restore cached RF analysis from backend (survives page reload)
+  try {
+    const res = await apiGet("/api/rf-survey/analysis");
+    if (res && !res.error && res.survey_samples > 0) {
+      state.rfAnalysis = res;
+      updateRfCoverageSummary(res);
+      renderRfHeatmap(res.heatmap, state.rfHeatmapOpacity);
+      renderRfGapPoints(res.gap_points);
+      renderRfCandidates(res.candidates);
+      const summaryEl = document.getElementById("rf-coverage-summary");
+      if (summaryEl) summaryEl.classList.remove("hidden");
+      const ctrlEl = document.getElementById("rf-heatmap-controls");
+      if (ctrlEl) ctrlEl.classList.remove("hidden");
+      const hintEl = document.getElementById("rf-analysis-hint");
+      if (hintEl) hintEl.textContent = `Previous analysis restored: ${res.survey_samples} samples, ${res.candidates.length} candidates.`;
+      logEvent(`RF analysis restored from server: ${res.survey_samples} samples.`);
+    }
+  } catch (_) {
+    /* no cached analysis — that's fine */
+  }
+
   initGamepadListeners();
   _updateGamepadStat();
   _updateOverrideStat();
 
-  logEvent("GCS initialized — Phase 4 ready.");
+  logEvent("GCS initialized — Phase 5 ready.");
 }
 
 boot();

@@ -513,3 +513,82 @@ body {
   color: #00E5FF;
   font-weight: 600;
 }
+
+/* ---------- RF Coverage Legend ---------- */
+
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 4px;
+  font-size: 11px;
+  font-family: var(--font-data);
+  color: var(--text-muted);
+}
+
+.legend-dot {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255,255,255,0.25);
+  flex-shrink: 0;
+}
+
+.legend-label {
+  color: var(--text-muted);
+}
+
+/* ---------- RF Analysis — candidate cards ---------- */
+
+.rf-candidate-card {
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  position: relative;
+  transition: border-color 0.15s;
+}
+
+.rf-candidate-card.rank-1 {
+  border-color: #F5A623;
+}
+
+.rf-candidate-card.selected {
+  border-color: #FFB020;
+  box-shadow: 0 0 0 2px rgba(255, 176, 32, 0.22);
+}
+
+.rf-candidate-rank {
+  font-size: 11px;
+  font-weight: 700;
+  color: #F5A623;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 4px;
+}
+
+.rf-candidate-rank.rank-1 {
+  color: #FFB020;
+}
+
+.rf-candidate-meta {
+  font-family: var(--font-data);
+  font-size: 10px;
+  color: var(--text-muted);
+  line-height: 1.7;
+}
+
+.rf-candidate-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.rf-candidate-actions .btn {
+  font-size: 11px;
+  padding: 4px 10px;
+  flex: 1;
+}
+
