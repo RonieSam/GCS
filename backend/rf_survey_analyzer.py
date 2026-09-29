@@ -34,7 +34,7 @@ Design guarantees:
 """
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import config
 from coverage import haversine_distance_m, point_in_polygon
@@ -378,30 +378,17 @@ def analyze_rf_survey(
             "score": c["score"],
         })
 
-    coverage_counts = {
-        "good": good_count,
-        "moderate": moderate_count,
-        "weak": weak_count,
-        "gap": gap_count,
-        "unmeasured": unmeasured_count,
-    }
-    counts_for_pct = {
-        "good_count": good_count,
-        "moderate_count": moderate_count,
-        "weak_count": weak_count,
-        "gap_count": gap_count,
-        "unmeasured_count": unmeasured_count,
-        "survey_samples": len(heatmap_points),
-    }
-    cov_percentages = calculate_coverage_percentages(counts_for_pct)
+    cov_stats = calculate_coverage_statistics(heatmap_points, active_node_ids=active_node_ids)
+    coverage_counts = cov_stats["coverage_counts"]
+    cov_percentages = cov_stats["coverage_percentages"]
 
     return {
         "survey_samples": len(heatmap_points),
-        "good_count": good_count,
-        "moderate_count": moderate_count,
-        "weak_count": weak_count,
-        "gap_count": gap_count,
-        "unmeasured_count": unmeasured_count,
+        "good_count": cov_stats["good_count"],
+        "moderate_count": cov_stats["moderate_count"],
+        "weak_count": cov_stats["weak_count"],
+        "gap_count": cov_stats["gap_count"],
+        "unmeasured_count": cov_stats["unmeasured_count"],
         "coverage_counts": coverage_counts,
         "coverage_percentages": cov_percentages,
         "good_percentage": cov_percentages["good_percentage"],
@@ -423,53 +410,222 @@ def analyze_rf_survey(
 
 
 # ---------------------------------------------------------------------------
-# Phase 6 — Re-Scan & Before/After Verification
+# Phase 6 — Re-Scan & Authoritative Coverage Statistics
 # ---------------------------------------------------------------------------
 
 
-def calculate_coverage_percentages(result: Dict) -> Dict:
-    """Calculate exact coverage percentages from actual survey classification data.
+def extract_actual_sample_rssi(
+    sample: Dict,
+    active_node_ids: Optional[set] = None,
+) -> Optional[float]:
+    """Extract authoritative numeric RSSI value from a survey sample.
 
-    Measured total:
-        measured = good + moderate + weak + gap
-    Percentages:
-        good_percentage     = good / measured * 100
-        moderate_percentage = moderate / measured * 100
-        weak_percentage     = weak / measured * 100
-        gap_percentage      = gap / measured * 100
-    If measured == 0: all percentages = 0.0.
+    Supports:
+      1. sample["best_rssi"] (precomputed best RSSI)
+      2. sample["rssi"] as dict {node_id: rssi_val} (using active nodes if provided, or best across all nodes)
+      3. sample["rssi"] as numeric float/int
+      4. sample["rssis"] as dict or list
+    Returns float or None.
     """
-    good = result.get("good_count", 0)
-    moderate = result.get("moderate_count", 0)
-    weak = result.get("weak_count", 0)
-    gap = result.get("gap_count", 0)
-    unmeasured = result.get("unmeasured_count", 0)
+    if not isinstance(sample, dict):
+        return None
+
+    # 1. Direct best_rssi
+    best_val = sample.get("best_rssi")
+    if best_val is not None:
+        try:
+            v = float(best_val)
+            if math.isfinite(v):
+                return v
+        except (TypeError, ValueError):
+            pass
+
+    # 2. rssi field
+    rssi_field = sample.get("rssi")
+    if isinstance(rssi_field, dict) and rssi_field:
+        best_dict = compute_best_rssi(rssi_field, active_node_ids)
+        if best_dict is not None and math.isfinite(best_dict):
+            return best_dict
+        if active_node_ids is not None:
+            fallback = compute_best_rssi(rssi_field, None)
+            if fallback is not None and math.isfinite(fallback):
+                return fallback
+    elif isinstance(rssi_field, (int, float)):
+        try:
+            v = float(rssi_field)
+            if math.isfinite(v):
+                return v
+        except (TypeError, ValueError):
+            pass
+
+    # 3. rssis field
+    rssis_field = sample.get("rssis")
+    if isinstance(rssis_field, dict) and rssis_field:
+        best_rssis = compute_best_rssi(rssis_field, active_node_ids)
+        if best_rssis is not None and math.isfinite(best_rssis):
+            return best_rssis
+        if active_node_ids is not None:
+            fallback = compute_best_rssi(rssis_field, None)
+            if fallback is not None and math.isfinite(fallback):
+                return fallback
+    elif isinstance(rssis_field, list) and rssis_field:
+        valid = []
+        for x in rssis_field:
+            try:
+                vx = float(x)
+                if math.isfinite(vx):
+                    valid.append(vx)
+            except (TypeError, ValueError):
+                pass
+        if valid:
+            return max(valid)
+
+    return None
+
+
+def calculate_coverage_statistics(
+    samples_or_result: Any,
+    active_node_ids: Optional[set] = None,
+    affected_area: Optional[List[Dict]] = None,
+) -> Dict:
+    """Authoritative single source of truth for coverage counts and percentages.
+
+    Derived directly from real survey samples using the exact RF thresholds:
+        GOOD:       RSSI > -60 dBm
+        MODERATE:   -75 < RSSI <= -60 dBm
+        WEAK:       -85 < RSSI <= -75 dBm
+        GAP:        RSSI <= -85 dBm
+        UNMEASURED: No valid RSSI measurement.
+
+    Percentage denominator is MEASURED samples:
+        measured = good + moderate + weak + gap
+    If measured > 0:
+        good_percentage     = round(good / measured * 100, 1)
+        moderate_percentage = round(moderate / measured * 100, 1)
+        weak_percentage     = round(weak / measured * 100, 1)
+        gap_percentage      = round(gap / measured * 100, 1)
+    Else:
+        all four percentages = 0.0
+
+    UNMEASURED is tracked and reported separately.
+    """
+    if isinstance(samples_or_result, dict):
+        has_counts = any(
+            int(samples_or_result.get(k, 0) or 0) > 0
+            for k in ("good_count", "moderate_count", "weak_count", "gap_count", "good", "moderate", "weak", "gap")
+        )
+        samples = samples_or_result.get("samples") or samples_or_result.get("heatmap")
+        if has_counts and (not samples or len(samples) < samples_or_result.get("survey_samples", 0)):
+            good = int(samples_or_result.get("good_count", samples_or_result.get("good", 0)))
+            moderate = int(samples_or_result.get("moderate_count", samples_or_result.get("moderate", 0)))
+            weak = int(samples_or_result.get("weak_count", samples_or_result.get("weak", 0)))
+            gap = int(samples_or_result.get("gap_count", samples_or_result.get("gap", 0)))
+            unmeasured = int(samples_or_result.get("unmeasured_count", samples_or_result.get("unmeasured", 0)))
+            measured = good + moderate + weak + gap
+            total = samples_or_result.get("total_samples", samples_or_result.get("survey_samples", measured + unmeasured))
+            if measured > 0:
+                good_pct = round((good / measured) * 100.0, 1)
+                mod_pct = round((moderate / measured) * 100.0, 1)
+                weak_pct = round((weak / measured) * 100.0, 1)
+                gap_pct = round((gap / measured) * 100.0, 1)
+            else:
+                good_pct = mod_pct = weak_pct = gap_pct = 0.0
+            unmeasured_pct = round((unmeasured / total) * 100.0, 1) if total > 0 else 0.0
+            cov_counts = {"good": good, "moderate": moderate, "weak": weak, "gap": gap, "unmeasured": unmeasured}
+            cov_pcts = {
+                "good_percentage": good_pct, "moderate_percentage": mod_pct,
+                "weak_percentage": weak_pct, "gap_percentage": gap_pct,
+                "good_pct": good_pct, "moderate_pct": mod_pct,
+                "weak_pct": weak_pct, "gap_pct": gap_pct,
+                "unmeasured_pct": unmeasured_pct,
+                "measured_count": measured, "unmeasured_count": unmeasured,
+            }
+            return {
+                "sample_count": total, "total_samples": total,
+                "measured_count": measured, "unmeasured_count": unmeasured,
+                "good_count": good, "moderate_count": moderate, "weak_count": weak, "gap_count": gap,
+                "coverage_counts": cov_counts, "coverage_percentages": cov_pcts,
+                "good_percentage": good_pct, "moderate_percentage": mod_pct,
+                "weak_percentage": weak_pct, "gap_percentage": gap_pct,
+                "good_pct": good_pct, "moderate_pct": mod_pct,
+                "weak_pct": weak_pct, "gap_pct": gap_pct,
+                "unmeasured_pct": unmeasured_pct,
+            }
+        if samples is None:
+            samples = []
+    elif isinstance(samples_or_result, list):
+        samples = samples_or_result
+    else:
+        samples = []
+
+    good = 0
+    moderate = 0
+    weak = 0
+    gap = 0
+    unmeasured = 0
+
+    has_polygon = affected_area is not None and len(affected_area) >= 3
+
+    for s in samples:
+        if not isinstance(s, dict):
+            continue
+
+        lat = s.get("latitude") if s.get("latitude") is not None else s.get("lat")
+        lon = s.get("longitude") if s.get("longitude") is not None else s.get("lon")
+
+        # Constrain to affected area if defined
+        if has_polygon and lat is not None and lon is not None:
+            if not point_in_polygon(lat, lon, affected_area):
+                continue
+
+        rssi = extract_actual_sample_rssi(s, active_node_ids)
+        if rssi is not None:
+            if rssi > GOOD_THRESHOLD:
+                good += 1
+            elif rssi > MODERATE_THRESHOLD:
+                moderate += 1
+            elif rssi > WEAK_THRESHOLD:
+                weak += 1
+            else:
+                gap += 1
+        else:
+            status = s.get("status")
+            if status == STATUS_GOOD:
+                good += 1
+            elif status == STATUS_MODERATE:
+                moderate += 1
+            elif status == STATUS_WEAK:
+                weak += 1
+            elif status == STATUS_GAP:
+                gap += 1
+            else:
+                unmeasured += 1
 
     measured = good + moderate + weak + gap
-    if measured <= 0:
-        return {
-            "good_percentage": 0.0,
-            "moderate_percentage": 0.0,
-            "weak_percentage": 0.0,
-            "gap_percentage": 0.0,
-            "good_pct": 0.0,
-            "moderate_pct": 0.0,
-            "weak_pct": 0.0,
-            "gap_pct": 0.0,
-            "unmeasured_pct": 0.0,
-            "measured_count": 0,
-            "unmeasured_count": unmeasured,
-        }
+    total = measured + unmeasured
 
-    good_pct = round((good / measured) * 100.0, 1)
-    mod_pct = round((moderate / measured) * 100.0, 1)
-    weak_pct = round((weak / measured) * 100.0, 1)
-    gap_pct = round((gap / measured) * 100.0, 1)
+    if measured > 0:
+        good_pct = round((good / measured) * 100.0, 1)
+        mod_pct = round((moderate / measured) * 100.0, 1)
+        weak_pct = round((weak / measured) * 100.0, 1)
+        gap_pct = round((gap / measured) * 100.0, 1)
+    else:
+        good_pct = 0.0
+        mod_pct = 0.0
+        weak_pct = 0.0
+        gap_pct = 0.0
 
-    total_with_unmeasured = measured + unmeasured
-    unmeasured_pct = round((unmeasured / total_with_unmeasured) * 100.0, 1) if total_with_unmeasured > 0 else 0.0
+    unmeasured_pct = round((unmeasured / total) * 100.0, 1) if total > 0 else 0.0
 
-    return {
+    coverage_counts = {
+        "good": good,
+        "moderate": moderate,
+        "weak": weak,
+        "gap": gap,
+        "unmeasured": unmeasured,
+    }
+
+    coverage_percentages = {
         "good_percentage": good_pct,
         "moderate_percentage": mod_pct,
         "weak_percentage": weak_pct,
@@ -482,6 +638,44 @@ def calculate_coverage_percentages(result: Dict) -> Dict:
         "measured_count": measured,
         "unmeasured_count": unmeasured,
     }
+
+    return {
+        "sample_count": total,
+        "total_samples": total,
+        "measured_count": measured,
+        "unmeasured_count": unmeasured,
+        "good_count": good,
+        "moderate_count": moderate,
+        "weak_count": weak,
+        "gap_count": gap,
+        "coverage_counts": coverage_counts,
+        "coverage_percentages": coverage_percentages,
+        "good_percentage": good_pct,
+        "moderate_percentage": mod_pct,
+        "weak_percentage": weak_pct,
+        "gap_percentage": gap_pct,
+        "good_pct": good_pct,
+        "moderate_pct": mod_pct,
+        "weak_pct": weak_pct,
+        "gap_pct": gap_pct,
+        "unmeasured_pct": unmeasured_pct,
+    }
+
+
+def calculate_coverage_percentages(result_or_samples: Any) -> Dict:
+    """Calculate exact coverage percentages from analysis result or samples list.
+
+    Measured total:
+        measured = good + moderate + weak + gap
+    Percentages:
+        good_percentage     = good / measured * 100
+        moderate_percentage = moderate / measured * 100
+        weak_percentage     = weak / measured * 100
+        gap_percentage      = gap / measured * 100
+    If measured == 0: all percentages = 0.0.
+    """
+    stats = calculate_coverage_statistics(result_or_samples)
+    return stats["coverage_percentages"]
 
 
 def package_analysis_snapshot(

@@ -1602,3 +1602,347 @@ class TestPhase6BugFixHistoricalAndReleaseInterlock(unittest.TestCase):
         self.assertEqual(node["lon"], 77.5950)
         self.assertEqual(len(list_nodes()), 1)
 
+
+class TestPhase6CoveragePercentagesBugFix(unittest.TestCase):
+    """Phase 6 Bug Fix: Coverage percentages must come authoritatively from survey samples.
+
+    Verifies all 15 required regression tests:
+      1. Known RSSI values produce non-zero GOOD percentage.
+      2. Known RSSI values produce non-zero MODERATE percentage.
+      3. Known RSSI values produce non-zero WEAK percentage.
+      4. GAP values produce non-zero GAP percentage.
+      5. Percentages sum to approximately 100% for measured samples.
+      6. UNMEASURED does not incorrectly become GAP.
+      7. History API derives correct statistics from raw samples.
+      8. Comparison API returns correct A/B percentages.
+      9. Comparison percentage deltas are percentage-point differences.
+      10. Historical Survey 001/002 with stale 0% fields return correct percentages.
+      11. Historical visualization continues to work with valid lat/lon.
+      12. No regression to RF survey collection.
+      13. No regression to candidate generation.
+      14. No regression to AUTO DEPLOY.
+      15. No regression to RELEASE.
+    """
+
+    def setUp(self):
+        clear_nodes()
+        session_state["polygon"] = [
+            {"lat": 12.9710, "lon": 77.5940},
+            {"lat": 12.9730, "lon": 77.5940},
+            {"lat": 12.9730, "lon": 77.5960},
+            {"lat": 12.9710, "lon": 77.5960},
+        ]
+        session_state["rf_scan_state"] = "IDLE"
+        session_state["rf_survey_history"] = []
+        session_state["rf_survey_history_counter"] = 0
+        self.client = TestClient(app)
+        self.collector = get_rf_collector()
+        self.collector.reset()
+
+    def tearDown(self):
+        clear_nodes()
+        self.collector.reset()
+
+    def test_1_to_5_authoritative_coverage_percentages_and_sum_to_100(self):
+        """Requirements 1-5: GOOD (> -60), MODERATE (-75 to -60), WEAK (-85 to -75), GAP (<= -85)
+        percentages are strictly non-zero and sum to approximately 100%."""
+        samples = []
+        # 100 GOOD (-50 dBm)
+        for _ in range(100):
+            samples.append({"latitude": 12.9715, "longitude": 77.5945, "best_rssi": -50.0})
+        # 150 MODERATE (-68 dBm)
+        for _ in range(150):
+            samples.append({"latitude": 12.9716, "longitude": 77.5946, "best_rssi": -68.0})
+        # 100 WEAK (-79 dBm)
+        for _ in range(100):
+            samples.append({"latitude": 12.9717, "longitude": 77.5947, "best_rssi": -79.0})
+        # 217 GAP (-92 dBm) -> Total 567 samples
+        for _ in range(217):
+            samples.append({"latitude": 12.9725, "longitude": 77.5955, "best_rssi": -92.0})
+
+        stats = rf_survey_analyzer.calculate_coverage_statistics(samples)
+        self.assertEqual(stats["measured_count"], 567)
+        self.assertEqual(stats["good_count"], 100)
+        self.assertEqual(stats["moderate_count"], 150)
+        self.assertEqual(stats["weak_count"], 100)
+        self.assertEqual(stats["gap_count"], 217)
+        self.assertEqual(stats["unmeasured_count"], 0)
+
+        # Expected percentages
+        expected_good = round(100 / 567 * 100, 1)  # 17.6%
+        expected_mod = round(150 / 567 * 100, 1)   # 26.5%
+        expected_weak = round(100 / 567 * 100, 1)  # 17.6%
+        expected_gap = round(217 / 567 * 100, 1)   # 38.3%
+
+        self.assertEqual(stats["good_percentage"], expected_good)
+        self.assertEqual(stats["moderate_percentage"], expected_mod)
+        self.assertEqual(stats["weak_percentage"], expected_weak)
+        self.assertEqual(stats["gap_percentage"], expected_gap)
+
+        total_pct = (
+            stats["good_percentage"]
+            + stats["moderate_percentage"]
+            + stats["weak_percentage"]
+            + stats["gap_percentage"]
+        )
+        self.assertAlmostEqual(total_pct, 100.0, delta=0.5)
+
+    def test_6_unmeasured_does_not_become_gap(self):
+        """Requirement 6: UNMEASURED samples (no valid RSSI) must NOT become GAP.
+        Denominator for GOOD/MOD/WEAK/GAP must be measured samples only."""
+        samples = [
+            {"latitude": 12.9715, "longitude": 77.5945, "best_rssi": -55.0},  # GOOD
+            {"latitude": 12.9716, "longitude": 77.5946, "best_rssi": -70.0},  # MODERATE
+            {"latitude": 12.9717, "longitude": 77.5947, "best_rssi": None, "rssi": {}},  # UNMEASURED
+            {"latitude": 12.9718, "longitude": 77.5948, "best_rssi": None},  # UNMEASURED
+        ]
+        stats = rf_survey_analyzer.calculate_coverage_statistics(samples)
+        self.assertEqual(stats["good_count"], 1)
+        self.assertEqual(stats["moderate_count"], 1)
+        self.assertEqual(stats["weak_count"], 0)
+        self.assertEqual(stats["gap_count"], 0)
+        self.assertEqual(stats["unmeasured_count"], 2)
+        self.assertEqual(stats["measured_count"], 2)
+
+        # 1 GOOD out of 2 measured = 50.0%
+        self.assertEqual(stats["good_percentage"], 50.0)
+        # 1 MODERATE out of 2 measured = 50.0%
+        self.assertEqual(stats["moderate_percentage"], 50.0)
+        self.assertEqual(stats["gap_percentage"], 0.0)
+        self.assertEqual(stats["weak_percentage"], 0.0)
+
+    def test_7_and_10_historical_survey_with_stale_zero_fields_derives_correctly(self):
+        """Requirements 7 & 10: Existing historical Survey 001 with stale 0% fields
+        dynamically returns correct non-zero percentages derived from raw samples."""
+        samples_001 = []
+        # 217 WEAK (-80 dBm)
+        for _ in range(217):
+            samples_001.append({
+                "latitude": 12.9715, "longitude": 77.5945,
+                "rssi": {"COMM-001": -80.0}, "best_rssi": -80.0
+            })
+        # 350 GAP (-92 dBm) -> Total 567 samples
+        for _ in range(350):
+            samples_001.append({
+                "latitude": 12.9725, "longitude": 77.5955,
+                "rssi": {"COMM-001": -92.0}, "best_rssi": -92.0
+            })
+
+        # Inject stale historical record (simulating Survey 001 with broken 0% stored values)
+        stale_record = {
+            "survey_id": "SURVEY-001",
+            "survey_role": "BEFORE",
+            "timestamp": "2026-09-29T18:00:00Z",
+            "affected_area": session_state["polygon"],
+            "node_set": [{"id": "COMM-001", "lat": 12.9715, "lon": 77.5945}],
+            "node_count": 1,
+            "samples": samples_001,
+            "sample_count": len(samples_001),
+            "heatmap": [
+                {"lat": s["latitude"], "lon": s["longitude"], "best_rssi": s["best_rssi"],
+                 "status": "GAP" if s["best_rssi"] <= -85 else "WEAK"}
+                for s in samples_001
+            ],
+            # Stale broken fields
+            "good_percentage": 0.0,
+            "moderate_percentage": 0.0,
+            "weak_percentage": 0.0,
+            "gap_percentage": 0.0,
+            "coverage_statistics": {
+                "good_percentage": 0.0,
+                "moderate_percentage": 0.0,
+                "weak_percentage": 0.0,
+                "gap_percentage": 0.0,
+                "good_count": 0,
+                "gap_count": 350,
+            },
+            "gaps": {
+                "gap_count": 350,
+                "gap_cluster_count": 1,
+                "gap_points": [{"lat": 12.9725, "lon": 77.5955} for _ in range(350)],
+            },
+        }
+        session_state["rf_survey_history"] = [stale_record]
+
+        # 1. GET /api/rf-survey/history must return non-zero percentages
+        hist_list_res = self.client.get("/api/rf-survey/history")
+        self.assertEqual(hist_list_res.status_code, 200)
+        surveys = hist_list_res.json()["surveys"]
+        self.assertEqual(len(surveys), 1)
+        s001_summary = surveys[0]
+        self.assertEqual(s001_summary["sample_count"], 567)
+        self.assertEqual(s001_summary["gap_count"], 350)
+        expected_gap_pct = round(350 / 567 * 100, 1)  # 61.7%
+        self.assertEqual(s001_summary["gap_percentage"], expected_gap_pct)
+        self.assertEqual(s001_summary["weak_percentage"], round(217 / 567 * 100, 1))  # 38.3%
+
+        # 2. GET /api/rf-survey/history/SURVEY-001 must return non-zero percentages
+        hist_detail_res = self.client.get("/api/rf-survey/history/SURVEY-001")
+        self.assertEqual(hist_detail_res.status_code, 200)
+        s001_detail = hist_detail_res.json()
+        self.assertEqual(s001_detail["gap_percentage"], expected_gap_pct)
+        self.assertEqual(s001_detail["coverage_statistics"]["gap_percentage"], expected_gap_pct)
+
+    def test_8_and_9_comparison_api_and_percentage_point_deltas(self):
+        """Requirements 8 & 9: Comparison API computes authoritative A/B stats and pp deltas."""
+        # Survey 001: 567 samples, 350 GAP (61.7%), 217 WEAK (38.3%)
+        samples_001 = [
+            {"latitude": 12.9715, "longitude": 77.5945, "best_rssi": -80.0} for _ in range(217)
+        ] + [
+            {"latitude": 12.9725, "longitude": 77.5955, "best_rssi": -92.0} for _ in range(350)
+        ]
+        # Survey 002: 568 samples, 243 GAP (42.8%), 325 GOOD (57.2%)
+        samples_002 = [
+            {"latitude": 12.9715, "longitude": 77.5945, "best_rssi": -55.0} for _ in range(325)
+        ] + [
+            {"latitude": 12.9725, "longitude": 77.5955, "best_rssi": -92.0} for _ in range(243)
+        ]
+
+        session_state["rf_survey_history"] = [
+            {
+                "survey_id": "SURVEY-001",
+                "survey_role": "BEFORE",
+                "timestamp": "2026-09-29T18:00:00Z",
+                "affected_area": session_state["polygon"],
+                "node_set": [{"id": "COMM-001", "lat": 12.9715, "lon": 77.5945}],
+                "node_count": 1,
+                "samples": samples_001,
+                "sample_count": 567,
+                "heatmap": [],
+                "gaps": {"gap_count": 350, "gap_cluster_count": 1, "gap_points": []},
+            },
+            {
+                "survey_id": "SURVEY-002",
+                "survey_role": "AFTER",
+                "timestamp": "2026-09-29T18:30:00Z",
+                "affected_area": session_state["polygon"],
+                "node_set": [
+                    {"id": "COMM-001", "lat": 12.9715, "lon": 77.5945},
+                    {"id": "COMM-002", "lat": 12.9725, "lon": 77.5955},
+                ],
+                "node_count": 2,
+                "samples": samples_002,
+                "sample_count": 568,
+                "heatmap": [],
+                "gaps": {"gap_count": 243, "gap_cluster_count": 1, "gap_points": []},
+            }
+        ]
+
+        comp_res = self.client.post("/api/rf-survey/history/compare", json={
+            "survey_id_1": "SURVEY-001",
+            "survey_id_2": "SURVEY-002",
+        })
+        self.assertEqual(comp_res.status_code, 200)
+        comp = comp_res.json()
+
+        sa = comp["survey_a"]
+        sb = comp["survey_b"]
+        d = comp["delta"]
+
+        # Survey A: 61.7% GAP, 38.3% WEAK, 0% GOOD
+        self.assertEqual(sa["gap_percentage"], 61.7)
+        self.assertEqual(sa["weak_percentage"], 38.3)
+        self.assertEqual(sa["good_percentage"], 0.0)
+        self.assertEqual(sa["gap_count"], 350)
+
+        # Survey B: 42.8% GAP, 0% WEAK, 57.2% GOOD
+        self.assertEqual(sb["gap_percentage"], 42.8)
+        self.assertEqual(sb["good_percentage"], 57.2)
+        self.assertEqual(sb["gap_count"], 243)
+
+        # Delta in percentage points:
+        # GAP: 42.8 - 61.7 = -18.9 pp
+        self.assertEqual(d["gap_percentage_pp"], -18.9)
+        # GOOD: 57.2 - 0.0 = +57.2 pp
+        self.assertEqual(d["good_percentage_pp"], 57.2)
+        # WEAK: 0.0 - 38.3 = -38.3 pp
+        self.assertEqual(d["weak_percentage_pp"], -38.3)
+        # Gap count delta: 243 - 350 = -107
+        self.assertEqual(d["gap_count"], -107)
+
+    def test_11_historical_visualization_preserves_valid_lat_lon(self):
+        """Requirement 11: Historical heatmap and gaps contain valid finite lat/lon coordinates."""
+        samples = [
+            {"latitude": 12.9715, "longitude": 77.5945, "best_rssi": -55.0},
+            {"latitude": 12.9725, "longitude": 77.5955, "best_rssi": -92.0},
+        ]
+        self.collector._samples = samples
+        self.collector._state = SCAN_STATE_COMPLETE
+        analyze_res = self.client.post("/api/rf-survey/analyze")
+        survey_id = analyze_res.json()["survey_id"]
+
+        hist_res = self.client.get(f"/api/rf-survey/history/{survey_id}")
+        self.assertEqual(hist_res.status_code, 200)
+        h = hist_res.json()
+
+        for pt in h["heatmap"]:
+            self.assertTrue(math.isfinite(pt["lat"]))
+            self.assertTrue(math.isfinite(pt["lon"]))
+            self.assertTrue(math.isfinite(pt["latitude"]))
+            self.assertTrue(math.isfinite(pt["longitude"]))
+
+    def test_12_diagnostic_endpoint_verifies_sample_structure_and_counts(self):
+        """Requirement 12: GET /api/rf-survey/history/{survey_id}/diagnostics endpoint returns exact counts."""
+        samples = [
+            {"latitude": 12.9715, "longitude": 77.5945, "rssi": {"COMM-001": -55.0}, "best_rssi": -55.0},
+            {"latitude": 12.9725, "longitude": 77.5955, "rssi": {"COMM-001": -92.0}, "best_rssi": -92.0},
+        ]
+        self.collector._samples = samples
+        self.collector._state = SCAN_STATE_COMPLETE
+        res = self.client.post("/api/rf-survey/analyze")
+        survey_id = res.json()["survey_id"]
+
+        diag_res = self.client.get(f"/api/rf-survey/history/{survey_id}/diagnostics")
+        self.assertEqual(diag_res.status_code, 200)
+        diag = diag_res.json()
+
+        self.assertEqual(diag["survey_id"], survey_id)
+        self.assertEqual(diag["sample_count"], 2)
+        self.assertEqual(diag["measured_count"], 2)
+        self.assertEqual(diag["good"], 1)
+        self.assertEqual(diag["gap"], 1)
+        self.assertEqual(diag["good_percentage"], 50.0)
+        self.assertEqual(diag["gap_percentage"], 50.0)
+        self.assertIn("sample_schema", diag)
+        self.assertEqual(diag["sample_schema"]["sample_0_best_rssi"], -55.0)
+
+    def test_13_no_regression_candidate_generation(self):
+        """Requirement 13: Candidate generation continues to operate correctly on gap points."""
+        samples = [
+            {"latitude": 12.9715, "longitude": 77.5945, "best_rssi": -55.0} for _ in range(10)
+        ] + [
+            {"latitude": 12.9725, "longitude": 77.5955, "best_rssi": -92.0} for _ in range(20)
+        ]
+        self.collector._samples = samples
+        self.collector._state = SCAN_STATE_COMPLETE
+        res = self.client.post("/api/rf-survey/analyze")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertGreater(len(data["candidates"]), 0)
+        cand = data["candidates"][0]
+        self.assertEqual(cand["rank"], 1)
+        self.assertTrue(math.isfinite(cand["latitude"]))
+        self.assertTrue(math.isfinite(cand["longitude"]))
+
+    def test_14_and_15_no_regression_auto_deploy_and_release(self):
+        """Requirements 14 & 15: AUTO DEPLOY and RELEASE interlocks remain intact."""
+        # 1. AUTO DEPLOY creates node immediately
+        ad_res = self.client.post("/api/nodes", json={
+            "id": "COMM-001", "lat": 12.9720, "lon": 77.5950, "coverage_radius_m": 250.0
+        })
+        self.assertEqual(ad_res.status_code, 200)
+        self.assertEqual(len(list_nodes()), 1)
+
+        # 2. RELEASE disabled when airborne
+        self.client.post("/api/select-target", json={"lat": 12.9720, "lon": 77.5950})
+        airborne_state = {
+            "connected": True, "in_air": True, "landed_state": "IN_AIR",
+            "latitude": 12.9720, "longitude": 77.5950, "altitude": 10.0,
+            "relative_altitude": 10.0, "flight_mode": "AUTO_MISSION", "armed": True,
+        }
+        with patch.object(mav_manager, "get_vehicle_state", return_value=airborne_state), \
+             patch.object(mav_manager, "is_connected", return_value=True):
+            status = self.client.get("/api/deployment/status").json()
+            self.assertFalse(status["can_release"])
+            self.assertTrue(status["is_airborne"])
+

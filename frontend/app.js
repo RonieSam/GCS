@@ -2886,7 +2886,8 @@ async function fetchSurveyHistory() {
     surveys.forEach((s) => {
       const timeStr = s.timestamp ? s.timestamp.substring(11, 19) : "--";
       const roleStr = s.survey_role || "SURVEY";
-      const label = `${s.survey_id} [${roleStr}] - ${timeStr} | Nodes: ${s.node_count}, GAP: ${s.gap_pct}%`;
+      const gapVal = s.gap_percentage != null ? s.gap_percentage : (s.gap_pct != null ? s.gap_pct : "--");
+      const label = `${s.survey_id} [${roleStr}] - ${timeStr} | Nodes: ${s.node_count}, GAP: ${gapVal}%`;
 
       const opt = document.createElement("option");
       opt.value = s.survey_id;
@@ -3089,69 +3090,83 @@ async function compareHistoricalSurveys() {
       if (el) el.textContent = val;
     };
 
-    const s1_good = s1.good_percentage != null ? s1.good_percentage : (s1.good_pct != null ? s1.good_pct : 0);
-    const s2_good = s2.good_percentage != null ? s2.good_percentage : (s2.good_pct != null ? s2.good_pct : 0);
-    const d_good = d.good_percentage_pp != null ? d.good_percentage_pp : (d.good_pct_change != null ? d.good_pct_change : 0);
+    const formatPct = (val) => {
+      if (typeof val === "number" && !isNaN(val)) {
+        return `${val.toFixed(1).replace(/\.0$/, "")}%`;
+      }
+      return "--";
+    };
+    const formatDeltaPct = (val) => {
+      if (typeof val === "number" && !isNaN(val)) {
+        const sign = val >= 0 ? "+" : "";
+        return `${sign}${val.toFixed(1).replace(/\.0$/, "")}%`;
+      }
+      return "--";
+    };
 
-    const s1_mod = s1.moderate_percentage != null ? s1.moderate_percentage : (s1.moderate_pct != null ? s1.moderate_pct : 0);
-    const s2_mod = s2.moderate_percentage != null ? s2.moderate_percentage : (s2.moderate_pct != null ? s2.moderate_pct : 0);
-    const d_mod = d.moderate_percentage_pp != null ? d.moderate_percentage_pp : (d.moderate_pct_change != null ? d.moderate_pct_change : 0);
+    const s1_good = s1.good_percentage ?? s1.good_pct;
+    const s2_good = s2.good_percentage ?? s2.good_pct;
+    const d_good = d.good_percentage_pp ?? d.good_pct_change;
 
-    const s1_weak = s1.weak_percentage != null ? s1.weak_percentage : (s1.weak_pct != null ? s1.weak_pct : 0);
-    const s2_weak = s2.weak_percentage != null ? s2.weak_percentage : (s2.weak_pct != null ? s2.weak_pct : 0);
-    const d_weak = d.weak_percentage_pp != null ? d.weak_percentage_pp : (d.weak_pct_change != null ? d.weak_pct_change : 0);
+    const s1_mod = s1.moderate_percentage ?? s1.moderate_pct;
+    const s2_mod = s2.moderate_percentage ?? s2.moderate_pct;
+    const d_mod = d.moderate_percentage_pp ?? d.moderate_pct_change;
 
-    const s1_gap = s1.gap_percentage != null ? s1.gap_percentage : (s1.gap_pct != null ? s1.gap_pct : 0);
-    const s2_gap = s2.gap_percentage != null ? s2.gap_percentage : (s2.gap_pct != null ? s2.gap_pct : 0);
-    const d_gap = d.gap_percentage_pp != null ? d.gap_percentage_pp : (d.gap_pct_change != null ? d.gap_pct_change : 0);
+    const s1_weak = s1.weak_percentage ?? s1.weak_pct;
+    const s2_weak = s2.weak_percentage ?? s2.weak_pct;
+    const d_weak = d.weak_percentage_pp ?? d.weak_pct_change;
 
-    const s1_gap_count = s1.gap_count != null ? s1.gap_count : (s1.gap_points_count != null ? s1.gap_points_count : 0);
-    const s2_gap_count = s2.gap_count != null ? s2.gap_count : (s2.gap_points_count != null ? s2.gap_points_count : 0);
-    const d_gap_count = d.gap_count != null ? d.gap_count : (s2_gap_count - s1_gap_count);
+    const s1_gap = s1.gap_percentage ?? s1.gap_pct;
+    const s2_gap = s2.gap_percentage ?? s2.gap_pct;
+    const d_gap = d.gap_percentage_pp ?? d.gap_pct_change;
 
-    const s1_clusters = s1.gap_cluster_count != null ? s1.gap_cluster_count : (s1.gap_clusters_count != null ? s1.gap_clusters_count : 0);
-    const s2_clusters = s2.gap_cluster_count != null ? s2.gap_cluster_count : (s2.gap_clusters_count != null ? s2.gap_clusters_count : 0);
-    const d_clusters = d.gap_cluster_count != null ? d.gap_cluster_count : (d.gap_clusters_change != null ? d.gap_clusters_change : 0);
+    const s1_gap_count = s1.gap_count ?? s1.gap_points_count ?? "--";
+    const s2_gap_count = s2.gap_count ?? s2.gap_points_count ?? "--";
+    const d_gap_count = d.gap_count != null ? d.gap_count : (typeof s2_gap_count === "number" && typeof s1_gap_count === "number" ? s2_gap_count - s1_gap_count : "--");
 
-    const d_nodes = d.node_count != null ? d.node_count : (d.node_count_change != null ? d.node_count_change : 0);
-    const d_samples = d.sample_count != null ? d.sample_count : (d.sample_count_change != null ? d.sample_count_change : 0);
+    const s1_clusters = s1.gap_cluster_count ?? s1.gap_clusters_count ?? "--";
+    const s2_clusters = s2.gap_cluster_count ?? s2.gap_clusters_count ?? "--";
+    const d_clusters = d.gap_cluster_count ?? d.gap_clusters_change ?? "--";
 
-    setField("hist-nodes-a", s1.node_count);
-    setField("hist-nodes-b", s2.node_count);
-    setField("hist-nodes-delta", (d_nodes >= 0 ? "+" : "") + d_nodes);
+    const d_nodes = d.node_count ?? d.node_count_change ?? 0;
+    const d_samples = d.sample_count ?? d.sample_count_change ?? 0;
 
-    setField("hist-samples-a", s1.sample_count);
-    setField("hist-samples-b", s2.sample_count);
-    setField("hist-samples-delta", (d_samples >= 0 ? "+" : "") + d_samples);
+    setField("hist-nodes-a", s1.node_count ?? "--");
+    setField("hist-nodes-b", s2.node_count ?? "--");
+    setField("hist-nodes-delta", (typeof d_nodes === "number" ? (d_nodes >= 0 ? "+" : "") + d_nodes : "--"));
 
-    setField("hist-good-a", `${s1_good}%`);
-    setField("hist-good-b", `${s2_good}%`);
-    setField("hist-good-delta", `${d_good >= 0 ? "+" : ""}${d_good}%`);
+    setField("hist-samples-a", s1.sample_count ?? "--");
+    setField("hist-samples-b", s2.sample_count ?? "--");
+    setField("hist-samples-delta", (typeof d_samples === "number" ? (d_samples >= 0 ? "+" : "") + d_samples : "--"));
 
-    setField("hist-mod-a", `${s1_mod}%`);
-    setField("hist-mod-b", `${s2_mod}%`);
-    setField("hist-mod-delta", `${d_mod >= 0 ? "+" : ""}${d_mod}%`);
+    setField("hist-good-a", formatPct(s1_good));
+    setField("hist-good-b", formatPct(s2_good));
+    setField("hist-good-delta", formatDeltaPct(d_good));
 
-    setField("hist-weak-a", `${s1_weak}%`);
-    setField("hist-weak-b", `${s2_weak}%`);
-    setField("hist-weak-delta", `${d_weak >= 0 ? "+" : ""}${d_weak}%`);
+    setField("hist-mod-a", formatPct(s1_mod));
+    setField("hist-mod-b", formatPct(s2_mod));
+    setField("hist-mod-delta", formatDeltaPct(d_mod));
 
-    setField("hist-gap-a", `${s1_gap}%`);
-    setField("hist-gap-b", `${s2_gap}%`);
-    setField("hist-gap-delta", `${d_gap >= 0 ? "+" : ""}${d_gap}%`);
+    setField("hist-weak-a", formatPct(s1_weak));
+    setField("hist-weak-b", formatPct(s2_weak));
+    setField("hist-weak-delta", formatDeltaPct(d_weak));
+
+    setField("hist-gap-a", formatPct(s1_gap));
+    setField("hist-gap-b", formatPct(s2_gap));
+    setField("hist-gap-delta", formatDeltaPct(d_gap));
 
     setField("hist-gappoints-a", s1_gap_count);
     setField("hist-gappoints-b", s2_gap_count);
-    setField("hist-gappoints-delta", (d_gap_count >= 0 ? "+" : "") + d_gap_count);
+    setField("hist-gappoints-delta", (typeof d_gap_count === "number" ? (d_gap_count >= 0 ? "+" : "") + d_gap_count : d_gap_count));
 
     setField("hist-gapclusters-a", s1_clusters);
     setField("hist-gapclusters-b", s2_clusters);
-    setField("hist-gapclusters-delta", (d_clusters >= 0 ? "+" : "") + d_clusters);
+    setField("hist-gapclusters-delta", (typeof d_clusters === "number" ? (d_clusters >= 0 ? "+" : "") + d_clusters : d_clusters));
 
-    const gapsResolved = d.gaps_resolved != null ? d.gaps_resolved : Math.max(0, s1_gap_count - s2_gap_count);
+    const gapsResolved = d.gaps_resolved != null ? d.gaps_resolved : (typeof s1_gap_count === "number" && typeof s2_gap_count === "number" ? Math.max(0, s1_gap_count - s2_gap_count) : "--");
     logEvent(
-      `Comparison complete: ${idA} -> ${idB} | GAP %: ${s1_gap}% -> ${s2_gap}% ` +
-      `(${d_gap >= 0 ? "+" : ""}${d_gap}%), Gaps resolved: ${gapsResolved}`
+      `Comparison complete: ${idA} -> ${idB} | GAP %: ${formatPct(s1_gap)} -> ${formatPct(s2_gap)} ` +
+      `(${formatDeltaPct(d_gap)}), Gaps resolved: ${gapsResolved}`
     );
   } catch (err) {
     logEvent(`History comparison failed: ${err.message}`);

@@ -1628,11 +1628,11 @@ def api_rf_survey_analyze():
     if state_val != SCAN_STATE_ABORTED:
         session_state["rf_survey_history_counter"] = session_state.get("rf_survey_history_counter", 0) + 1
         survey_id = f"SURVEY-{session_state['rf_survey_history_counter']:03d}"
-        cov_pcts = result.get("coverage_percentages") or rf_survey_analyzer.calculate_coverage_percentages(result)
-        good_pct = cov_pcts.get("good_percentage", cov_pcts.get("good_pct", 0.0))
-        moderate_pct = cov_pcts.get("moderate_percentage", cov_pcts.get("moderate_pct", 0.0))
-        weak_pct = cov_pcts.get("weak_percentage", cov_pcts.get("weak_pct", 0.0))
-        gap_pct = cov_pcts.get("gap_percentage", cov_pcts.get("gap_pct", 0.0))
+        cov_stats = rf_survey_analyzer.calculate_coverage_statistics(result)
+        good_pct = cov_stats["good_percentage"]
+        moderate_pct = cov_stats["moderate_percentage"]
+        weak_pct = cov_stats["weak_percentage"]
+        gap_pct = cov_stats["gap_percentage"]
 
         history_record = {
             "survey_id": survey_id,
@@ -1655,6 +1655,8 @@ def api_rf_survey_analyze():
                 for s in samples
             ],
             "sample_count": len(samples),
+            "measured_count": cov_stats["measured_count"],
+            "unmeasured_count": cov_stats["unmeasured_count"],
             "heatmap": [
                 {
                     "lat": c.get("lat") if c.get("lat") is not None else c.get("latitude"),
@@ -1676,12 +1678,13 @@ def api_rf_survey_analyze():
             "weak_pct": weak_pct,
             "gap_pct": gap_pct,
             "coverage_statistics": {
-                "good_count": result.get("good_count", 0),
-                "moderate_count": result.get("moderate_count", 0),
-                "weak_count": result.get("weak_count", 0),
-                "gap_count": result.get("gap_count", 0),
-                "unmeasured_count": result.get("unmeasured_count", 0),
-                "total_samples": result.get("survey_samples", len(samples)),
+                "good_count": cov_stats["good_count"],
+                "moderate_count": cov_stats["moderate_count"],
+                "weak_count": cov_stats["weak_count"],
+                "gap_count": cov_stats["gap_count"],
+                "unmeasured_count": cov_stats["unmeasured_count"],
+                "measured_count": cov_stats["measured_count"],
+                "total_samples": cov_stats["total_samples"],
                 "good_percentage": good_pct,
                 "moderate_percentage": moderate_pct,
                 "weak_percentage": weak_pct,
@@ -1692,7 +1695,7 @@ def api_rf_survey_analyze():
                 "gap_pct": gap_pct,
             },
             "gaps": {
-                "gap_count": result.get("gap_count", 0),
+                "gap_count": cov_stats["gap_count"],
                 "gap_cluster_count": result.get("gap_cluster_count", 0),
                 "gap_points": [
                     {
@@ -1816,36 +1819,42 @@ def _execute_history_comparison(survey_id_1: str, survey_id_2: str) -> dict:
     if not comparable:
         invalidation_reason = "Affected areas differ between surveys. Comparison may be unrepresentative."
 
-    s1_stats = s1["coverage_statistics"]
-    s2_stats = s2["coverage_statistics"]
-    s1_gaps = s1["gaps"]
-    s2_gaps = s2["gaps"]
+    raw_s1 = s1.get("samples") or s1.get("heatmap") or []
+    raw_s2 = s2.get("samples") or s2.get("heatmap") or []
+    s1_stats = rf_survey_analyzer.calculate_coverage_statistics(raw_s1, affected_area=area1)
+    s2_stats = rf_survey_analyzer.calculate_coverage_statistics(raw_s2, affected_area=area2)
 
-    s1_good = s1_stats.get("good_percentage", s1_stats.get("good_pct", 0.0))
-    s1_mod = s1_stats.get("moderate_percentage", s1_stats.get("moderate_pct", 0.0))
-    s1_weak = s1_stats.get("weak_percentage", s1_stats.get("weak_pct", 0.0))
-    s1_gap = s1_stats.get("gap_percentage", s1_stats.get("gap_pct", 0.0))
+    s1_good = s1_stats["good_percentage"]
+    s1_mod = s1_stats["moderate_percentage"]
+    s1_weak = s1_stats["weak_percentage"]
+    s1_gap = s1_stats["gap_percentage"]
 
-    s2_good = s2_stats.get("good_percentage", s2_stats.get("good_pct", 0.0))
-    s2_mod = s2_stats.get("moderate_percentage", s2_stats.get("moderate_pct", 0.0))
-    s2_weak = s2_stats.get("weak_percentage", s2_stats.get("weak_pct", 0.0))
-    s2_gap = s2_stats.get("gap_percentage", s2_stats.get("gap_pct", 0.0))
+    s2_good = s2_stats["good_percentage"]
+    s2_mod = s2_stats["moderate_percentage"]
+    s2_weak = s2_stats["weak_percentage"]
+    s2_gap = s2_stats["gap_percentage"]
 
     delta_good_pp = round(s2_good - s1_good, 1)
     delta_mod_pp = round(s2_mod - s1_mod, 1)
     delta_weak_pp = round(s2_weak - s1_weak, 1)
     delta_gap_pp = round(s2_gap - s1_gap, 1)
 
-    s1_gap_count = s1_gaps.get("gap_count", 0)
-    s2_gap_count = s2_gaps.get("gap_count", 0)
+    s1_gap_count = s1_stats["gap_count"]
+    s2_gap_count = s2_stats["gap_count"]
+    s1_gaps = s1.get("gaps", {})
+    s2_gaps = s2.get("gaps", {})
     s1_clusters = s1_gaps.get("gap_cluster_count", 0)
     s2_clusters = s2_gaps.get("gap_cluster_count", 0)
+
+    delta_gap_count = s2_gap_count - s1_gap_count
 
     survey_a = {
         "survey_id": s1["survey_id"],
         "survey_role": s1.get("survey_role", "SURVEY"),
         "timestamp": s1["timestamp"],
-        "sample_count": s1["sample_count"],
+        "sample_count": s1_stats["sample_count"],
+        "measured_count": s1_stats["measured_count"],
+        "unmeasured_count": s1_stats["unmeasured_count"],
         "node_count": s1["node_count"],
         "good_percentage": s1_good,
         "moderate_percentage": s1_mod,
@@ -1869,7 +1878,9 @@ def _execute_history_comparison(survey_id_1: str, survey_id_2: str) -> dict:
         "survey_id": s2["survey_id"],
         "survey_role": s2.get("survey_role", "SURVEY"),
         "timestamp": s2["timestamp"],
-        "sample_count": s2["sample_count"],
+        "sample_count": s2_stats["sample_count"],
+        "measured_count": s2_stats["measured_count"],
+        "unmeasured_count": s2_stats["unmeasured_count"],
         "node_count": s2["node_count"],
         "good_percentage": s2_good,
         "moderate_percentage": s2_mod,
@@ -1894,16 +1905,16 @@ def _execute_history_comparison(survey_id_1: str, survey_id_2: str) -> dict:
         "moderate_percentage_pp": delta_mod_pp,
         "weak_percentage_pp": delta_weak_pp,
         "gap_percentage_pp": delta_gap_pp,
-        "sample_count": s2["sample_count"] - s1["sample_count"],
+        "sample_count": s2_stats["sample_count"] - s1_stats["sample_count"],
         "node_count": s2["node_count"] - s1["node_count"],
-        "gap_count": s2_gap_count - s1_gap_count,
+        "gap_count": delta_gap_count,
         "gap_cluster_count": s2_clusters - s1_clusters,
         # backward compat aliases:
         "good_pct_change": delta_good_pp,
         "moderate_pct_change": delta_mod_pp,
         "weak_pct_change": delta_weak_pp,
         "gap_pct_change": delta_gap_pp,
-        "sample_count_change": s2["sample_count"] - s1["sample_count"],
+        "sample_count_change": s2_stats["sample_count"] - s1_stats["sample_count"],
         "node_count_change": s2["node_count"] - s1["node_count"],
         "gaps_resolved": max(0, s1_gap_count - s2_gap_count),
         "gap_clusters_change": s2_clusters - s1_clusters,
@@ -1923,23 +1934,33 @@ def _execute_history_comparison(survey_id_1: str, survey_id_2: str) -> dict:
 @app.get("/api/rf-survey/history")
 def api_rf_survey_history_list():
     """
-    Phase 6 Requirement 7 & 8: Return summary list of the last 5 completed RF surveys.
+    Phase 6 Requirement 7, 8, 9: Return summary list of the last 5 completed RF surveys.
+    Authoritatively derives statistics from actual historical survey samples on read.
     Does NOT modify current state.
     """
     history = session_state.get("rf_survey_history", [])
     surveys_summary = []
     for s in history:
-        stats = s["coverage_statistics"]
-        good_pct = stats.get("good_percentage", stats.get("good_pct", 0.0))
-        mod_pct = stats.get("moderate_percentage", stats.get("moderate_pct", 0.0))
-        weak_pct = stats.get("weak_percentage", stats.get("weak_pct", 0.0))
-        gap_pct = stats.get("gap_percentage", stats.get("gap_pct", 0.0))
+        raw_samples = s.get("samples") or s.get("heatmap") or []
+        stats = rf_survey_analyzer.calculate_coverage_statistics(
+            raw_samples,
+            affected_area=s.get("affected_area"),
+        )
+        good_pct = stats["good_percentage"]
+        mod_pct = stats["moderate_percentage"]
+        weak_pct = stats["weak_percentage"]
+        gap_pct = stats["gap_percentage"]
+        gap_count = stats["gap_count"]
+        gap_cluster_count = s.get("gaps", {}).get("gap_cluster_count", 0)
+
         surveys_summary.append({
             "survey_id": s["survey_id"],
             "survey_role": s.get("survey_role", "SURVEY"),
             "timestamp": s["timestamp"],
             "node_count": s["node_count"],
-            "sample_count": s["sample_count"],
+            "sample_count": stats["sample_count"],
+            "measured_count": stats["measured_count"],
+            "unmeasured_count": stats["unmeasured_count"],
             "good_percentage": good_pct,
             "moderate_percentage": mod_pct,
             "weak_percentage": weak_pct,
@@ -1948,8 +1969,8 @@ def api_rf_survey_history_list():
             "moderate_pct": mod_pct,
             "weak_pct": weak_pct,
             "gap_pct": gap_pct,
-            "gap_count": s["gaps"]["gap_count"],
-            "gap_cluster_count": s["gaps"]["gap_cluster_count"],
+            "gap_count": gap_count,
+            "gap_cluster_count": gap_cluster_count,
             "candidate_count": len(s.get("candidates", [])),
         })
     return {
@@ -1965,14 +1986,98 @@ def api_rf_survey_history_get(survey_id: str):
     Return complete historical survey record retaining:
       survey timestamp, affected area, node set at that time, samples,
       heatmap, coverage statistics, gaps, candidates/analysis.
+    Authoritatively derives statistics from immutable raw samples on read.
     Viewing historical surveys never modifies current nodes, current RF collection,
     current mission, or current candidates.
     """
     history = session_state.get("rf_survey_history", [])
     for s in history:
         if s["survey_id"] == survey_id:
-            return copy.deepcopy(s)
+            s_copy = copy.deepcopy(s)
+            raw_samples = s_copy.get("samples") or s_copy.get("heatmap") or []
+            stats = rf_survey_analyzer.calculate_coverage_statistics(
+                raw_samples,
+                affected_area=s_copy.get("affected_area"),
+            )
+            s_copy["sample_count"] = stats["sample_count"]
+            s_copy["measured_count"] = stats["measured_count"]
+            s_copy["unmeasured_count"] = stats["unmeasured_count"]
+            s_copy["good_percentage"] = stats["good_percentage"]
+            s_copy["moderate_percentage"] = stats["moderate_percentage"]
+            s_copy["weak_percentage"] = stats["weak_percentage"]
+            s_copy["gap_percentage"] = stats["gap_percentage"]
+            s_copy["good_pct"] = stats["good_pct"]
+            s_copy["moderate_pct"] = stats["moderate_pct"]
+            s_copy["weak_pct"] = stats["weak_pct"]
+            s_copy["gap_pct"] = stats["gap_pct"]
+
+            cov_stats = s_copy.setdefault("coverage_statistics", {})
+            cov_stats["good_count"] = stats["good_count"]
+            cov_stats["moderate_count"] = stats["moderate_count"]
+            cov_stats["weak_count"] = stats["weak_count"]
+            cov_stats["gap_count"] = stats["gap_count"]
+            cov_stats["unmeasured_count"] = stats["unmeasured_count"]
+            cov_stats["measured_count"] = stats["measured_count"]
+            cov_stats["total_samples"] = stats["total_samples"]
+            cov_stats["good_percentage"] = stats["good_percentage"]
+            cov_stats["moderate_percentage"] = stats["moderate_percentage"]
+            cov_stats["weak_percentage"] = stats["weak_percentage"]
+            cov_stats["gap_percentage"] = stats["gap_percentage"]
+            cov_stats["good_pct"] = stats["good_pct"]
+            cov_stats["moderate_pct"] = stats["moderate_pct"]
+            cov_stats["weak_pct"] = stats["weak_pct"]
+            cov_stats["gap_pct"] = stats["gap_pct"]
+
+            if "gaps" in s_copy:
+                s_copy["gaps"]["gap_count"] = stats["gap_count"]
+
+            return s_copy
     raise HTTPException(404, f"Historical RF survey '{survey_id}' not found.")
+
+
+@app.get("/api/rf-survey/history/{survey_id}/diagnostics")
+def api_rf_survey_history_diagnostics(survey_id: str):
+    """
+    Phase 6 Requirement 12: Diagnostic endpoint inspecting raw survey samples,
+    classification counts, measured/unmeasured counts, and exact percentages.
+    """
+    history = session_state.get("rf_survey_history", [])
+    survey = next((s for s in history if s["survey_id"] == survey_id), None)
+    if not survey:
+        raise HTTPException(404, f"Historical survey '{survey_id}' not found in history.")
+
+    raw_samples = survey.get("samples") or survey.get("heatmap") or []
+    sample_schema = {}
+    if raw_samples:
+        s0 = raw_samples[0]
+        sample_schema = {
+            "keys": list(s0.keys()),
+            "sample_0_best_rssi": s0.get("best_rssi"),
+            "sample_0_rssi_type": type(s0.get("rssi")).__name__,
+            "sample_0_rssi_val": s0.get("rssi"),
+            "sample_0_status": s0.get("status"),
+        }
+
+    stats = rf_survey_analyzer.calculate_coverage_statistics(
+        raw_samples,
+        affected_area=survey.get("affected_area"),
+    )
+
+    return {
+        "survey_id": survey_id,
+        "sample_count": stats["sample_count"],
+        "measured_count": stats["measured_count"],
+        "unmeasured_count": stats["unmeasured_count"],
+        "good": stats["good_count"],
+        "moderate": stats["moderate_count"],
+        "weak": stats["weak_count"],
+        "gap": stats["gap_count"],
+        "good_percentage": stats["good_percentage"],
+        "moderate_percentage": stats["moderate_percentage"],
+        "weak_percentage": stats["weak_percentage"],
+        "gap_percentage": stats["gap_percentage"],
+        "sample_schema": sample_schema,
+    }
 
 
 @app.post("/api/rf-survey/history/compare")
