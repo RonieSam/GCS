@@ -92,7 +92,7 @@ def calculate_rssi(
     When rf_range_scale = 0.25, the effective coverage distance is 1/4 of normal range.
     """
     if rf_range_scale is None:
-        rf_range_scale = getattr(config, "RF_RANGE_SCALE", 0.25)
+        rf_range_scale = getattr(config, "RF_RANGE_SCALE", 0.30)
     scale = max(rf_range_scale, 1e-6)
     effective_dist = max(distance_m, reference_distance_m) / scale
     rssi = reference_rssi - (10.0 * path_loss_exponent * math.log10(effective_dist / reference_distance_m))
@@ -173,18 +173,13 @@ def calculate_node_rssi_vector(
                 continue
             nx, ny = latlon_to_xy_m(float(n_lat), float(n_lon), ref_lat, ref_lon)
 
-        # Pure horizontal Euclidean distance in metres
+        # Pure horizontal Euclidean distance in metres (altitude excluded — spec §4, Item P)
         dist_h = compute_distance_horizontal_m(ux, uy, nx, ny)
 
-        # 3D Euclidean distance including altitude
-        n_alt = float(node.get("alt") if node.get("alt") is not None else node.get("altitude", 10.0))
-        u_alt = float(uav_alt_m) if uav_alt_m is not None else n_alt
-        dist_v = abs(u_alt - n_alt)
-        dist_3d = math.sqrt(dist_h ** 2 + dist_v ** 2)
-
-        # Calculate effective distance scaled by RFRangeScale (applied exactly once)
+        # Calculate effective distance scaled by RFRangeScale (applied exactly once — Item O)
+        # d_eff = max(d, d0) / RFRangeScale
         scale = max(rf_range_scale, 1e-6)
-        effective_dist = max(dist_3d, reference_distance_m) / scale
+        effective_dist = max(dist_h, reference_distance_m) / scale
 
         # Calculate log-distance path loss
         rssi = reference_rssi - (10.0 * path_loss_exponent * math.log10(effective_dist / reference_distance_m))
@@ -192,11 +187,11 @@ def calculate_node_rssi_vector(
 
         rssi_dict[nid] = rssi
 
-        # Diagnostic output (per user spec)
+        # Diagnostic output (per user spec §22)
         logger.info(
-            f"{nid} UAV=({ux:.1f},{uy:.1f},{u_alt:.1f}) NODE=({nx:.1f},{ny:.1f},{n_alt:.1f}) "
-            f"distance={dist_3d:.2f}m (h={dist_h:.2f}m,v={dist_v:.2f}m) effectiveDistance={effective_dist:.2f}m "
-            f"P0={reference_rssi:.0f} n={path_loss_exponent:.1f} RSSI={rssi:.2f}dBm"
+            f"{nid} UAV=({ux:.1f},{uy:.1f}) NODE=({nx:.1f},{ny:.1f}) "
+            f"horizontalDistance={dist_h:.2f}m effectiveDistance={effective_dist:.2f}m "
+            f"P0={reference_rssi:.0f} n={path_loss_exponent:.1f} scale={rf_range_scale:.2f} RSSI={rssi:.2f}dBm"
         )
 
     return rssi_dict
