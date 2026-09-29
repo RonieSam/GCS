@@ -267,6 +267,35 @@ body {
   cursor: default;
 }
 
+/* Phase 6 — Physical payload release button */
+.btn-release {
+  background: transparent;
+  color: #00E5FF;
+  border-color: #00E5FF;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.btn-release:hover:not(:disabled) {
+  background: rgba(0, 229, 255, 0.12);
+  border-color: #00E5FF;
+  box-shadow: 0 0 10px rgba(0, 229, 255, 0.35);
+}
+
+.btn-release:disabled {
+  color: var(--text-muted);
+  border-color: var(--border);
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-release.ready {
+  background: rgba(63, 218, 127, 0.2);
+  color: var(--green);
+  border-color: var(--green);
+  box-shadow: 0 0 12px rgba(63, 218, 127, 0.4);
+}
+
 /* Node Deployment panel — selected location display row */
 .deploy-location-row {
   display: flex;

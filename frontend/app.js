@@ -476,8 +476,11 @@ function selectDeploymentLocation(latInput, lonInput, source) {
   const srcEl = document.getElementById("stat-deploy-source");
   if (srcEl) srcEl.textContent = src.toUpperCase();
 
-  state.deploymentReleased = false;
-  updateDeploymentReleaseButton();
+  const deployBtn = document.getElementById("btn-auto-deploy");
+  if (deployBtn) deployBtn.disabled = false;
+
+  const hintEl = document.getElementById("deploy-hint");
+  if (hintEl) hintEl.textContent = `Location selected (${src}). Press AUTO DEPLOY to create node immediately.`;
 
   logEvent(`Deployment location selected (${src}): lat=${latitude.toFixed(5)}, lon=${longitude.toFixed(5)}`);
 }
@@ -485,6 +488,7 @@ function selectDeploymentLocation(latInput, lonInput, source) {
 // Running counter for deployed-node IDs
 let _deployNodeSeq = 0;
 let _deployInProgress = false;
+let _releaseInProgress = false;
 
 function haversineDistanceM(lat1, lon1, lat2, lon2) {
   const R = 6371000;
@@ -498,90 +502,17 @@ function haversineDistanceM(lat1, lon1, lat2, lon2) {
 }
 
 /**
- * Phase 6 Requirements 3-6: Deployment RELEASE interlock evaluation.
- * RELEASE must only become enabled after:
- *   - deployment mission is no longer flying
- *   - UAV is actually landed
- *   - UAV is within configured distance tolerance (10m) of selected candidate
- * If UAV lands somewhere else or is airborne, RELEASE remains disabled.
- */
-function updateDeploymentReleaseButton() {
-  const deployBtn = document.getElementById("btn-auto-deploy");
-  const interlockEl = document.getElementById("deploy-interlock-status");
-  const hintEl = document.getElementById("deploy-hint");
-  if (!deployBtn) return;
-
-  const target = state.selectedLocation || state.selectedDeploymentLocation || state.selectedTarget;
-  if (!target) {
-    deployBtn.disabled = true;
-    if (interlockEl) interlockEl.textContent = "Select target location and land UAV to enable release.";
-    return;
-  }
-
-  if (state.deploymentReleased || _deployInProgress) {
-    deployBtn.disabled = true;
-    if (interlockEl) interlockEl.textContent = "Node already released at target. Duplicate release blocked.";
-    return;
-  }
-
-  const v = state.vehicle;
-  // If telemetry vehicle is connected:
-  if (v && v.connected) {
-    const relAlt = v.relative_altitude;
-    const isAirborne = (relAlt != null && relAlt > 0.3) || state.missionExecuting;
-    const isLanded = (relAlt != null && relAlt <= 0.3) && !isAirborne;
-
-    const targetLat = target.latitude != null ? target.latitude : target.lat;
-    const targetLon = target.longitude != null ? target.longitude : target.lon;
-    let distM = null;
-    let withinTolerance = false;
-
-    if (v.latitude != null && v.longitude != null && targetLat != null && targetLon != null) {
-      distM = haversineDistanceM(v.latitude, v.longitude, targetLat, targetLon);
-      withinTolerance = distM <= 10.0; // 10 metre candidate tolerance
-    }
-
-    if (isAirborne) {
-      deployBtn.disabled = true;
-      const altStr = relAlt != null ? `${relAlt.toFixed(1)}m` : "airborne";
-      if (interlockEl) interlockEl.textContent = `RELEASE DISABLED: UAV is airborne (alt ${altStr}).`;
-      if (hintEl) hintEl.textContent = `Release disabled: UAV is airborne (${altStr}).`;
-    } else if (!isLanded) {
-      deployBtn.disabled = true;
-      if (interlockEl) interlockEl.textContent = "RELEASE DISABLED: UAV is not landed.";
-      if (hintEl) hintEl.textContent = "Release disabled: UAV is not landed.";
-    } else if (!withinTolerance) {
-      deployBtn.disabled = true;
-      const distStr = distM != null ? `${distM.toFixed(1)}m` : "unknown";
-      if (interlockEl) interlockEl.textContent = `RELEASE DISABLED: UAV landed off-target (${distStr} > 10m tolerance).`;
-      if (hintEl) hintEl.textContent = `UAV landed off-target (${distStr}). Release disabled.`;
-    } else {
-      deployBtn.disabled = false;
-      const distStr = distM != null ? `${distM.toFixed(1)}m` : "0m";
-      if (interlockEl) interlockEl.textContent = `RELEASE ENABLED: UAV landed on target (dist ${distStr}).`;
-      if (hintEl) hintEl.textContent = `Landed within tolerance (${distStr}). Press AUTO DEPLOY to release communication node.`;
-    }
-  } else {
-    // Standalone test/offline mode without live PX4 telemetry
-    deployBtn.disabled = false;
-    if (interlockEl) interlockEl.textContent = "Direct placement ready (offline mode).";
-  }
-}
-
-/**
- * autoDeploy — releases a communication node at the selected candidate coordinates.
- * Enforces server-side interlocks via POST /api/deployment/release.
- * Guarantees exactly one node is created, and repeated release cannot create duplicates.
+ * AUTO DEPLOY — Immediate logical node deployment.
+ * Operator selects location or candidate, presses AUTO DEPLOY.
+ * Node is created immediately at selected coordinates via POST /api/nodes.
+ * No UAV flight, no landing, and no RELEASE required.
  */
 async function autoDeploy() {
-  if (_deployInProgress || state.deploymentReleased) {
-    logEvent("AUTO DEPLOY blocked: node already released or release in progress.");
-    return;
-  }
+  if (_deployInProgress) return;
 
-  const sel = state.selectedLocation || state.selectedDeploymentLocation || state.selectedTarget;
+  const sel = state.selectedLocation || state.selectedDeploymentLocation;
   if (!sel) {
-    logEvent("AUTO DEPLOY: no location selected. Click the map or pick a candidate first.");
+    logEvent("AUTO DEPLOY: no location selected. Click map or select a candidate first.");
     return;
   }
 
@@ -601,10 +532,173 @@ async function autoDeploy() {
   const deployBtn = document.getElementById("btn-auto-deploy");
   if (deployBtn) deployBtn.disabled = true;
 
+  _deployNodeSeq++;
+  const nodeId = `COMM-${String(_deployNodeSeq).padStart(3, "0")}`;
+  const nodePayload = { id: nodeId, lat: latitude, lon: longitude, coverage_radius_m: 250 };
+
+  try {
+    const res = await apiPost("/api/nodes", nodePayload);
+    const created = res && res.body ? res.body : nodePayload;
+    if (res && res.status !== 200) {
+      throw new Error((created && created.detail) || `Server error: HTTP ${res.status}`);
+    }
+
+    state.newlyDeployedNodeId = created.id;
+    if (state.rfBeforeAnalysis) {
+      state.rfPhase6State = "NODE_DEPLOYED";
+    }
+
+    addDeployedNode(created);
+    renderAllDeployedNodes();
+    updateNodeUI();
+
+    if (state.deploymentSelectionMarker) {
+      map.removeLayer(state.deploymentSelectionMarker);
+      state.deploymentSelectionMarker = null;
+    }
+    state.selectedLocation = null;
+    state.selectedDeploymentLocation = null;
+
+    const locText = document.getElementById("deploy-location-text");
+    if (locText) locText.textContent = "None";
+    const srcEl = document.getElementById("stat-deploy-source");
+    if (srcEl) srcEl.textContent = "--";
+    const hintEl = document.getElementById("deploy-hint");
+    if (hintEl) hintEl.textContent = `Node ${created.id} created immediately (logical auto-deploy).`;
+
+    const verifHint = document.getElementById("rf-verification-hint");
+    if (verifHint) {
+      verifHint.textContent = `Node ${created.id} deployed! Start a NEW RF survey (AFTER survey) to verify coverage improvement.`;
+    }
+
+    logEvent(
+      `AUTO DEPLOY SUCCESS: Node ${created.id} created immediately at lat=${latitude.toFixed(5)}, lon=${longitude.toFixed(5)}. ` +
+      `Active deployed nodes: ${state.deployedNodes.length}.`
+    );
+  } catch (err) {
+    logEvent(`AUTO DEPLOY failed: ${err.message}`);
+    const hintEl = document.getElementById("deploy-hint");
+    if (hintEl) hintEl.textContent = `AUTO DEPLOY error: ${err.message}`;
+  } finally {
+    _deployInProgress = false;
+    if (deployBtn) deployBtn.disabled = !state.selectedLocation;
+  }
+}
+
+/**
+ * Phase 6 Requirements 3-6: Deployment RELEASE interlock evaluation.
+ * RELEASE is ONLY enabled when:
+ *   - deployment mission has reached destination
+ *   - UAV is confirmed landed / on ground
+ *   - UAV altitude is below landing threshold (<= 0.3m)
+ *   - UAV position is within configured destination tolerance (<= 10m)
+ *   - deployment mission is landed/completed and NOT aborted/RTL
+ *   - node has not already been successfully released for this mission.
+ */
+function updateReleaseInterlockButton() {
+  const releaseBtn = document.getElementById("btn-release-payload");
+  const interlockEl = document.getElementById("release-interlock-status");
+  if (!releaseBtn) return;
+
+  const target = state.selectedTarget;
+  if (!target) {
+    releaseBtn.disabled = true;
+    releaseBtn.classList.remove("ready");
+    if (interlockEl) interlockEl.textContent = "Select candidate and fly mission to enable release.";
+    return;
+  }
+
+  if (state.deploymentReleased || _releaseInProgress) {
+    releaseBtn.disabled = true;
+    releaseBtn.classList.remove("ready");
+    if (interlockEl) interlockEl.textContent = "RELEASE SUCCESSFUL — Node already released. Duplicate release blocked.";
+    return;
+  }
+
+  const v = state.vehicle;
+  const isMissionAborted = state.missionState === "ABORTED" || (v && (v.flight_mode === "RTL" || v.mode === "RTL"));
+  if (isMissionAborted) {
+    releaseBtn.disabled = true;
+    releaseBtn.classList.remove("ready");
+    if (interlockEl) interlockEl.textContent = "ABORT / RTL — RELEASE DISABLED.";
+    return;
+  }
+
+  if (v && v.connected) {
+    const relAlt = v.relative_altitude;
+    const isAirborne = (relAlt != null && relAlt > 0.3) || state.missionExecuting;
+    const isLanded = (relAlt != null && relAlt <= 0.3) && !isAirborne;
+
+    const targetLat = target.latitude != null ? target.latitude : target.lat;
+    const targetLon = target.longitude != null ? target.longitude : target.lon;
+    let distM = null;
+    let withinTolerance = false;
+
+    if (v.latitude != null && v.longitude != null && targetLat != null && targetLon != null) {
+      distM = haversineDistanceM(v.latitude, v.longitude, targetLat, targetLon);
+      withinTolerance = distM <= 10.0; // 10 metre tolerance
+    }
+
+    if (isAirborne) {
+      releaseBtn.disabled = true;
+      releaseBtn.classList.remove("ready");
+      const altStr = relAlt != null ? `${relAlt.toFixed(1)}m` : "airborne";
+      if (interlockEl) interlockEl.textContent = `AIRBORNE - RELEASE DISABLED (alt ${altStr}).`;
+    } else if (state.missionExecuting) {
+      releaseBtn.disabled = true;
+      releaseBtn.classList.remove("ready");
+      if (interlockEl) interlockEl.textContent = "FLYING TO DESTINATION - RELEASE DISABLED.";
+    } else if (!isLanded) {
+      releaseBtn.disabled = true;
+      releaseBtn.classList.remove("ready");
+      if (interlockEl) interlockEl.textContent = "NOT LANDED - RELEASE DISABLED.";
+    } else if (!withinTolerance) {
+      releaseBtn.disabled = true;
+      releaseBtn.classList.remove("ready");
+      const distStr = distM != null ? `${distM.toFixed(1)}m` : "unknown";
+      if (interlockEl) interlockEl.textContent = `OFF TARGET - RELEASE DISABLED (${distStr} > 10m tolerance).`;
+    } else {
+      releaseBtn.disabled = false;
+      releaseBtn.classList.add("ready");
+      const distStr = distM != null ? `${distM.toFixed(1)}m` : "0m";
+      if (interlockEl) interlockEl.textContent = `READY TO RELEASE — Landed on target (dist ${distStr}). Press RELEASE.`;
+    }
+  } else {
+    // Standalone test/offline mode
+    releaseBtn.disabled = false;
+    releaseBtn.classList.add("ready");
+    if (interlockEl) interlockEl.textContent = "READY TO RELEASE (Offline simulation mode).";
+  }
+}
+
+/**
+ * releaseCarriedNode — physical payload release workflow.
+ * Carried node is physically released at destination via POST /api/deployment/release.
+ * Only after backend returns success is the node created on map and in state.
+ */
+async function releaseCarriedNode() {
+  if (_releaseInProgress || state.deploymentReleased) {
+    logEvent("RELEASE blocked: payload already released or release in progress.");
+    return;
+  }
+
+  const target = state.selectedTarget;
+  if (!target) {
+    logEvent("RELEASE failed: No destination candidate selected.");
+    return;
+  }
+
+  const targetLat = target.latitude != null ? target.latitude : target.lat;
+  const targetLon = target.longitude != null ? target.longitude : target.lon;
+
+  _releaseInProgress = true;
+  const releaseBtn = document.getElementById("btn-release-payload");
+  if (releaseBtn) releaseBtn.disabled = true;
+
   try {
     const res = await apiPost("/api/deployment/release", {
-      lat: latitude,
-      lon: longitude,
+      lat: targetLat,
+      lon: targetLon,
       coverage_radius_m: 250,
     });
     const created = res && res.body ? res.body : null;
@@ -620,42 +714,31 @@ async function autoDeploy() {
 
     addDeployedNode(created);
     renderAllDeployedNodes();
+    updateNodeUI();
 
-    if (state.deploymentSelectionMarker) {
-      map.removeLayer(state.deploymentSelectionMarker);
-      state.deploymentSelectionMarker = null;
-    }
-    state.selectedLocation = null;
-    state.selectedDeploymentLocation = null;
-
-    const locText = document.getElementById("deploy-location-text");
-    if (locText) locText.textContent = "None";
-    const srcEl = document.getElementById("stat-deploy-source");
-    if (srcEl) srcEl.textContent = "--";
-    const hintEl = document.getElementById("deploy-hint");
-    if (hintEl) hintEl.textContent = `Node ${created.id} released at target! Duplicate release blocked.`;
-    const interlockEl = document.getElementById("deploy-interlock-status");
-    if (interlockEl) interlockEl.textContent = `Node ${created.id} successfully released.`;
+    if (releaseBtn) releaseBtn.classList.remove("ready");
+    const interlockEl = document.getElementById("release-interlock-status");
+    if (interlockEl) interlockEl.textContent = `RELEASE SUCCESSFUL: Node ${created.id} deployed at destination.`;
 
     const verifHint = document.getElementById("rf-verification-hint");
     if (verifHint) {
-      verifHint.textContent = `Node ${created.id} deployed! Start a NEW RF survey (AFTER survey) to verify coverage improvement.`;
+      verifHint.textContent = `Node ${created.id} deployed via physical release! Start a NEW RF survey (AFTER survey) to verify coverage improvement.`;
     }
 
     logEvent(
-      `AUTO DEPLOY SUCCESS: Node ${created.id} deployed at lat=${latitude.toFixed(5)}, lon=${longitude.toFixed(5)}. ` +
-      `Total active deployed nodes: ${state.deployedNodes.length}. Repeated release blocked.`
+      `PHYSICAL RELEASE SUCCESS: Node ${created.id} released at lat=${targetLat.toFixed(5)}, lon=${targetLon.toFixed(5)}. ` +
+      `Total active deployed nodes: ${state.deployedNodes.length}. Duplicate release protected.`
     );
   } catch (err) {
-    logEvent(`AUTO DEPLOY rejected: ${err.message}`);
-    const interlockEl = document.getElementById("deploy-interlock-status");
-    if (interlockEl) interlockEl.textContent = `Release rejected: ${err.message}`;
-    _deployInProgress = false;
-    updateDeploymentReleaseButton();
+    logEvent(`PHYSICAL RELEASE FAILED: ${err.message}`);
+    const interlockEl = document.getElementById("release-interlock-status");
+    if (interlockEl) interlockEl.textContent = `RELEASE FAILED: ${err.message}`;
+    _releaseInProgress = false;
+    updateReleaseInterlockButton();
     return;
   } finally {
-    _deployInProgress = false;
-    if (deployBtn) deployBtn.disabled = true;
+    _releaseInProgress = false;
+    if (releaseBtn && state.deploymentReleased) releaseBtn.disabled = true;
   }
 }
 
@@ -1050,6 +1133,8 @@ async function selectLocation(candidate, label) {
     if (result.status !== 200) throw new Error(result.body && result.body.detail);
 
     state.selectedTarget = { lat, lon };
+    state.deploymentReleased = false;
+    updateReleaseInterlockButton();
 
     document.getElementById("mission-lat").value = lat.toFixed(6);
     document.getElementById("mission-lon").value = lon.toFixed(6);
@@ -1782,7 +1867,7 @@ function renderTelemetryPanel() {
   // Update Manual Override button gating whenever telemetry refreshes
   _updateManualButtons();
   _updateOverrideStat();
-  updateDeploymentReleaseButton();
+  updateReleaseInterlockButton();
 
   setStat("tel-mode", v.mode || "--");
   setStat("tel-gps-fix", v.gps_fix || "--");
@@ -3351,9 +3436,12 @@ function initControls() {
   if (manualBtn) manualBtn.addEventListener("click", enterManualControl);
   const resumeBtn = document.getElementById("btn-resume-mission");
   if (resumeBtn) resumeBtn.addEventListener("click", resumeMission);
-  // Node Deployment (Phase 1)
+  // Node Deployment (Phase 1) — Logical Auto Deploy
   const autoDeployBtn = document.getElementById("btn-auto-deploy");
   if (autoDeployBtn) autoDeployBtn.addEventListener("click", autoDeploy);
+  // Phase 6 — Physical payload release button
+  const releasePayloadBtn = document.getElementById("btn-release-payload");
+  if (releasePayloadBtn) releasePayloadBtn.addEventListener("click", releaseCarriedNode);
   // RF Scan Survey (Phase 2)
   const rfScanBtn = document.getElementById("btn-rf-scan");
   if (rfScanBtn) rfScanBtn.addEventListener("click", handleRfScan);
@@ -3401,6 +3489,7 @@ async function boot() {
   // Initialize map first so LayerGroups and markers can attach properly
   initMap(FALLBACK_CENTER.lat, FALLBACK_CENTER.lon);
   initControls();
+  updateReleaseInterlockButton();
 
   // Load and render active deployed nodes (clean session = 0 nodes)
   const nodes = await loadNodes();

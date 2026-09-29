@@ -69,12 +69,12 @@
         </div>
       </div>
 
-      <!-- Node Deployment panel — Phase 1 -->
+      <!-- Node Deployment panel — Phase 1: Logical Auto Deploy -->
       <div class="panel" id="panel-node-deploy">
-        <h2 class="panel-title">Node Deployment</h2>
+        <h2 class="panel-title">Node Deployment (Auto Deploy)</h2>
 
         <p class="hint" id="deploy-hint">
-          Click the map or select a candidate to set a deployment location.
+          Click the map or select a candidate, then press AUTO DEPLOY to create a node immediately (logical deployment).
         </p>
 
         <div class="deploy-location-row" id="deploy-location-display">
@@ -85,9 +85,9 @@
         <button id="btn-auto-deploy" class="btn btn-block btn-deploy" disabled>
           &#x1F4E1; AUTO DEPLOY
         </button>
-        <div id="deploy-interlock-status" class="hint" style="margin-top:4px;font-size:11px;color:#8A9AB0">
-          Select target location and land UAV to enable release.
-        </div>
+        <p class="hint" style="margin-top:4px;font-size:11px;color:#8A9AB0">
+          Immediate logical deployment — creates node instantly without UAV flight.
+        </p>
 
         <div class="stat-grid" style="margin-top:10px">
           <div class="stat">
@@ -529,6 +529,19 @@
           <button id="btn-return-home" class="btn btn-block btn-primary" disabled>&#8617; Return to Home</button>
         </div>
         <p class="hint" id="mission-hint">Select a recommended location to generate a mission.</p>
+
+        <!-- Physical Payload Release (Requirements 2, 3, 4, 5, 6, 7) -->
+        <div class="mission-release-section" style="margin-top:12px;border-top:1px solid #232c37;padding-top:10px;">
+          <div style="font-size:10px;font-weight:700;color:var(--text-muted);margin-bottom:6px;letter-spacing:0.05em">
+            PHYSICAL PAYLOAD RELEASE
+          </div>
+          <button id="btn-release-payload" class="btn btn-block btn-release" disabled>
+            &#x1F4E6; RELEASE (PHYSICAL DEPLOYMENT)
+          </button>
+          <div id="release-interlock-status" class="hint" style="margin-top:4px;font-size:11px;color:#8A9AB0">
+            Awaiting UAV landing at target candidate coordinates.
+          </div>
+        </div>
 
         <div class="stat-grid">
           <div class="stat">
