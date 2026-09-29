@@ -4,702 +4,667 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>UAV Emergency Deployment — GCS</title>
-
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
-  <header class="topbar">
-    <div class="topbar-title">
-      <span class="topbar-callsign">UAV EMERGENCY DEPLOYMENT</span>
-      <span class="topbar-sub">GROUND CONTROL STATION</span>
+<!-- ===================================================================
+     TOP BAR — fixed, always visible
+     =================================================================== -->
+<header class="topbar" role="banner">
+  <div class="topbar-brand">
+    <span class="brand-primary">UAV EMERGENCY DEPLOYMENT</span>
+    <span class="brand-sub">GROUND CONTROL STATION</span>
+  </div>
+
+  <div class="topbar-status">
+    <div class="status-pill" id="status-connection-pill">
+      <span class="status-dot" id="status-conn-dot"></span>
+      <span class="status-label" id="status-conn-label">DISCONNECTED</span>
     </div>
-    <div class="topbar-phase">
-      <span class="phase-dot"></span>
-      PHASE 6 — RE-SCAN, BEFORE/AFTER RF COVERAGE VERIFICATION
+    <div class="status-pill" id="status-armed-pill">
+      <span class="status-dot status-dot--warn" id="status-armed-dot"></span>
+      <span class="status-label" id="status-armed-label">DISARMED</span>
     </div>
-  </header>
+    <div class="status-pill">
+      <span class="status-label muted">MISSION:</span>
+      <span class="status-label" id="status-mission-label">IDLE</span>
+    </div>
+  </div>
 
-  <main class="workspace">
+  <div class="topbar-meta">
+    <span class="meta-time" id="topbar-clock">--:--:--</span>
+    <div class="telemetry-strip">
+      <div class="tel-chip"><span class="tel-chip-label">ALT</span><span class="tel-chip-val" id="hdr-alt">--</span></div>
+      <div class="tel-chip"><span class="tel-chip-label">SPD</span><span class="tel-chip-val" id="hdr-spd">--</span></div>
+      <div class="tel-chip"><span class="tel-chip-label">BAT</span><span class="tel-chip-val" id="hdr-bat">--</span></div>
+      <div class="tel-chip"><span class="tel-chip-label">GPS</span><span class="tel-chip-val" id="hdr-gps">--</span></div>
+    </div>
+  </div>
+</header>
 
-    <section class="map-pane">
-      <div id="map"></div>
-      <div id="map-fallback-banner" class="fallback-banner hidden">
-        Map tiles unavailable — showing schematic fallback grid. Coordinates and drawing are unaffected.
-      </div>
-    </section>
+<!-- ===================================================================
+     MAIN WORKSPACE — map + right panel
+     =================================================================== -->
+<main class="workspace" role="main">
 
-    <aside class="side-pane">
+  <!-- ---------------------------------------------------------------
+       MAP PANE
+       --------------------------------------------------------------- -->
+  <section class="map-pane" aria-label="Live Map">
+    <div id="map"></div>
 
-      <div class="panel">
-        <h2 class="panel-title">Area Planning</h2>
+    <div id="map-fallback-banner" class="fallback-banner hidden">
+      Map tiles unavailable — showing schematic fallback grid.
+    </div>
 
-        <div class="btn-row">
-          <button id="btn-draw" class="btn btn-primary">Draw Affected Area</button>
-          <button id="btn-finish" class="btn" disabled>Finish Area</button>
-          <button id="btn-clear" class="btn btn-danger" disabled>Clear Area</button>
-        </div>
+    <!-- Compact map tool stack -->
+    <div class="map-tools" aria-label="Map controls">
+      <button class="map-tool-btn" id="btn-map-zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
+      <button class="map-tool-btn" id="btn-map-zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
+      <div class="map-tool-sep"></div>
+      <button class="map-tool-btn" id="btn-map-fit" title="Fit affected area" aria-label="Fit area">⊡</button>
+      <div class="map-tool-sep"></div>
+      <button class="map-tool-btn" id="btn-draw" title="Draw affected area" aria-label="Draw affected area">✏</button>
+      <button class="map-tool-btn" id="btn-finish" title="Close polygon" aria-label="Finish area" disabled>✓</button>
+      <button class="map-tool-btn map-tool-btn--danger" id="btn-clear" title="Clear area" aria-label="Clear area" disabled>✕</button>
+      <div class="map-tool-sep"></div>
+      <button class="map-tool-btn" id="btn-analyze" title="Analyze area" aria-label="Analyze area" disabled>⬡</button>
+      <div class="map-tool-sep"></div>
+      <button class="map-tool-btn" id="btn-map-layers" title="Toggle map layers" aria-label="Toggle map layers">☵</button>
+    </div>
 
-        <button id="btn-analyze" class="btn btn-block" disabled>Analyze Area</button>
-        <p class="hint" id="analyze-hint">Draw and close a polygon with at least 3 points to enable analysis.</p>
+    <!-- Map layers popover -->
+    <div class="map-layers-popover hidden" id="map-layers-popover" aria-label="Map layer controls">
+      <div class="map-layers-title">MAP LAYERS</div>
+      <label class="layer-chk"><input type="checkbox" id="chk-layer-nodes" checked><span>Nodes</span></label>
+      <label class="layer-chk"><input type="checkbox" id="chk-layer-uav" checked><span>UAV</span></label>
+      <label class="layer-chk"><input type="checkbox" id="chk-layer-mission" checked><span>Mission Route</span></label>
+      <label class="layer-chk"><input type="checkbox" id="chk-layer-rfscan" checked><span>RF Survey Path</span></label>
+      <label class="layer-chk"><input type="checkbox" id="chk-layer-rfheatmap" checked><span>RF Coverage</span></label>
+      <label class="layer-chk"><input type="checkbox" id="chk-layer-candidates" checked><span>Candidates</span></label>
+    </div>
 
-        <div class="stat-grid">
-          <div class="stat">
-            <span class="stat-label">Drawing State</span>
-            <span class="stat-value" id="stat-state">IDLE</span>
+    <!-- RF legend — shown when heatmap active -->
+    <div class="map-rf-legend hidden" id="rf-legend-overlay" aria-label="RF coverage legend">
+      <div class="rf-legend-title">RF COVERAGE</div>
+      <div class="rf-legend-row"><span class="rf-dot rf-dot--good"></span><span>GOOD <span class="rf-legend-thresh">&gt; −60 dBm</span></span></div>
+      <div class="rf-legend-row"><span class="rf-dot rf-dot--mod"></span><span>MODERATE <span class="rf-legend-thresh">−75 to −60</span></span></div>
+      <div class="rf-legend-row"><span class="rf-dot rf-dot--weak"></span><span>WEAK <span class="rf-legend-thresh">−85 to −75</span></span></div>
+      <div class="rf-legend-row"><span class="rf-dot rf-dot--gap"></span><span>GAP <span class="rf-legend-thresh">≤ −85 dBm</span></span></div>
+      <div class="rf-legend-row rf-legend-path"><span class="rf-path-line"></span><span>SURVEY PATH</span></div>
+    </div>
+
+    <!-- Area quick-stats overlay -->
+    <div class="map-area-stats hidden" id="map-area-stats">
+      <span class="area-stat"><span class="area-stat-label">POINTS</span><span class="area-stat-val" id="stat-points">0</span></span>
+      <span class="area-stat-sep">|</span>
+      <span class="area-stat"><span class="area-stat-label">NODES</span><span class="area-stat-val" id="stat-nodes">--</span></span>
+      <span class="area-stat-sep">|</span>
+      <span class="area-stat"><span class="area-stat-label">STATE</span><span class="area-stat-val" id="stat-state">IDLE</span></span>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------------------------
+       RIGHT COMMAND PANEL
+       --------------------------------------------------------------- -->
+  <aside class="cmd-panel" aria-label="Command panel">
+
+    <!-- Tab navigation -->
+    <nav class="cmd-tabs" role="tablist" aria-label="Command tabs">
+      <button class="cmd-tab active" id="tab-mission" role="tab" aria-selected="true"  aria-controls="pane-mission">MISSION</button>
+      <button class="cmd-tab"        id="tab-rf"      role="tab" aria-selected="false" aria-controls="pane-rf">RF</button>
+      <button class="cmd-tab"        id="tab-deploy"  role="tab" aria-selected="false" aria-controls="pane-deploy">DEPLOY</button>
+      <button class="cmd-tab"        id="tab-history" role="tab" aria-selected="false" aria-controls="pane-history">HISTORY</button>
+    </nav>
+
+    <!-- ============================================================
+         TAB: MISSION
+         ============================================================ -->
+    <div class="cmd-pane active" id="pane-mission" role="tabpanel" aria-labelledby="tab-mission">
+      <div class="cmd-scroll">
+
+        <!-- Mission Flight Summary Hero -->
+        <section class="cs mission-hero" aria-label="Mission execution summary">
+          <div class="mission-hero-header">
+            <span class="mission-hero-title">MISSION EXECUTION</span>
+            <span class="mission-hero-badge" id="mission-hero-badge">PLANNING</span>
           </div>
-          <div class="stat">
-            <span class="stat-label">Polygon Points</span>
-            <span class="stat-value" id="stat-points">0</span>
+          <div class="kv-grid kv-grid--2">
+            <div class="kv kv--wide"><span class="kv-label">DESTINATION</span><span class="kv-val font-data" id="mission-summary-dest">None</span></div>
+            <div class="kv"><span class="kv-label">DISTANCE</span><span class="kv-val font-data" id="mission-summary-dist">--</span></div>
+            <div class="kv"><span class="kv-label">ALTITUDE</span><span class="kv-val font-data" id="mission-summary-alt">--</span></div>
+            <div class="kv"><span class="kv-label">SPEED</span><span class="kv-val font-data" id="mission-summary-spd">--</span></div>
+            <div class="kv"><span class="kv-label">CURRENT WP</span><span class="kv-val font-data" id="mission-summary-wp">--</span></div>
           </div>
-          <div class="stat">
-            <span class="stat-label">Existing Nodes</span>
-            <span class="stat-value" id="stat-nodes">--</span>
+        </section>
+
+        <!-- Primary Flight Actions -->
+        <section class="cs" aria-label="Primary flight actions">
+          <div class="btn-row">
+            <button id="btn-arm"    class="btn btn-primary" aria-label="Arm vehicle">ARM</button>
+            <button id="btn-disarm" class="btn btn-danger"  aria-label="Disarm vehicle" disabled>DISARM</button>
           </div>
-          <div class="stat">
-            <span class="stat-label">Coverage</span>
-            <span class="stat-value" id="stat-coverage">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Coverage Gap</span>
-            <span class="stat-value" id="stat-gap">--</span>
-          </div>
-        </div>
-      </div>
+          <button id="btn-start-mission" class="btn btn-primary btn-block" disabled>▶ START MISSION</button>
+          <button id="btn-abort-mission" class="btn btn-danger  btn-block" disabled>■ ABORT / RTL</button>
+          <button id="btn-return-home"   class="btn btn-secondary btn-block" disabled>↩ RETURN HOME</button>
+        </section>
 
-      <!-- Node Deployment panel — Phase 1: Logical Auto Deploy -->
-      <div class="panel" id="panel-node-deploy">
-        <h2 class="panel-title">Node Deployment (Auto Deploy)</h2>
-
-        <p class="hint" id="deploy-hint">
-          Click the map or select a candidate, then press AUTO DEPLOY to create a node immediately (logical deployment).
-        </p>
-
-        <div class="deploy-location-row" id="deploy-location-display">
-          <span class="stat-label">Selected Location</span>
-          <span class="stat-value font-data" id="deploy-location-text">None</span>
-        </div>
-
-        <button id="btn-auto-deploy" class="btn btn-block btn-deploy" disabled>
-          &#x1F4E1; AUTO DEPLOY
-        </button>
-        <p class="hint" style="margin-top:4px;font-size:11px;color:#8A9AB0">
-          Immediate logical deployment — creates node instantly without UAV flight.
-        </p>
-
-        <div class="stat-grid" style="margin-top:10px">
-          <div class="stat">
-            <span class="stat-label">Deployed Nodes</span>
-            <span class="stat-value" id="stat-deployed-count">0</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Source</span>
-            <span class="stat-value" id="stat-deploy-source">--</span>
-          </div>
-        </div>
-
-        <div id="deployed-nodes-container" style="margin-top:12px;border-top:1px solid #232c37;padding-top:10px;">
-          <label class="field-label" style="margin-bottom:6px;display:block;">Delete Deployed Node</label>
-          <div style="display:flex;flex-direction:column;gap:6px;width:100%;box-sizing:border-box;">
-            <select id="select-delete-node" class="field-input" style="width:100%;min-width:0;box-sizing:border-box;">
-              <option value="">(No nodes deployed)</option>
-            </select>
-            <button id="btn-delete-node" class="btn btn-danger" style="width:100%;box-sizing:border-box;padding:6px 12px;font-size:12px;" disabled>
-              Delete Node
-            </button>
-          </div>
-          <p class="hint" style="margin-top:4px;font-size:11px;">
-            Select a deployed node from the dropdown to delete it from the network.
-          </p>
-        </div>
-      </div>
-
-      <div class="panel" id="panel-rf-scan">
-        <h2 class="panel-title">RF Scan Survey</h2>
-
-        <div class="field-row">
-          <label class="field-label" for="scan-spacing">Line Spacing (m)</label>
-          <input type="number" id="scan-spacing" class="field-input" value="25" min="5" max="200" step="5">
-        </div>
-        <div class="field-row">
-          <label class="field-label" for="scan-alt">Survey Altitude (m)</label>
-          <input type="number" id="scan-alt" class="field-input" value="15" min="1" max="100">
-        </div>
-
-        <button id="btn-rf-scan" class="btn btn-block btn-primary">
-          &#x1F4E1; RF SCAN
-        </button>
-
-        <p class="hint" id="rf-scan-hint">
-          Define an affected area, then click RF SCAN to generate a survey path.
-        </p>
-
-        <div class="stat-grid" style="margin-top:10px">
-          <div class="stat">
-            <span class="stat-label">Scan State</span>
-            <span class="stat-value" id="stat-rf-state">IDLE</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Waypoints</span>
-            <span class="stat-value" id="stat-rf-waypoints">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Survey Lines</span>
-            <span class="stat-value" id="stat-rf-lines">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Spacing</span>
-            <span class="stat-value" id="stat-rf-spacing">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Altitude</span>
-            <span class="stat-value" id="stat-rf-altitude">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Est. Distance</span>
-            <span class="stat-value" id="stat-rf-distance">--</span>
-          </div>
-        </div>
-
-        <!-- Compact scan summary (replaces the full waypoint list) -->
-        <div id="rf-waypoints-container" class="rf-waypoints-container hidden" style="margin-top:10px">
-          <div id="rf-waypoints-summary"></div>
-        </div>
-
-        <div class="btn-row" style="margin-top:10px">
-          <button id="btn-upload-rf-scan" class="btn btn-block" disabled>Upload RF Scan</button>
-        </div>
-        <div class="btn-row">
-          <button id="btn-start-rf-scan" class="btn btn-block btn-primary" disabled>&#9654; START RF SCAN</button>
-        </div>
-      </div>
-
-      <!-- RF Survey Live Data panel — Phase 3 -->
-      <div class="panel" id="panel-rf-survey">
-        <h2 class="panel-title">RF Survey Data</h2>
-
-        <p class="hint" id="rf-survey-hint">
-          Live data will appear here once an RF Scan mission is started.
-        </p>
-
-        <div class="stat-grid">
-          <div class="stat">
-            <span class="stat-label">Collector State</span>
-            <span class="stat-value" id="stat-rfs-state">IDLE</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Samples</span>
-            <span class="stat-value" id="stat-rfs-samples">0</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Best RSSI</span>
-            <span class="stat-value" id="stat-rfs-best-rssi">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Nodes Tracked</span>
-            <span class="stat-value" id="stat-rfs-nodes">0</span>
-          </div>
-        </div>
-
-        <!-- Per-node RSSI table (most recent sample) -->
-        <div id="rf-rssi-table-container" class="hidden" style="margin-top:8px">
-          <div class="stat-label" style="margin-bottom:4px;font-size:10px">Latest RSSI per node:</div>
-          <div id="rf-rssi-table"></div>
-        </div>
-
-        <div class="btn-row" style="margin-top:10px">
-          <button id="btn-reset-rf-survey" class="btn btn-block btn-danger" style="font-size:11px">
-            Reset Survey Data
-          </button>
-        </div>
-      </div>
-
-      <!-- ================================================================
-           RF Coverage Analysis — Phase 5
-           ================================================================ -->
-      <div class="panel" id="panel-rf-analysis">
-        <h2 class="panel-title">RF Coverage Analysis</h2>
-
-        <p class="hint" id="rf-analysis-hint">
-          Complete an RF scan, then click Analyze to generate the coverage heatmap and candidates.
-        </p>
-
-        <div class="btn-row">
-          <button id="btn-analyze-rf" class="btn btn-block btn-primary">
-            &#x1F4CA; Analyze RF Survey
-          </button>
-        </div>
-
-        <!-- Coverage summary (shown after analysis) -->
-        <div id="rf-coverage-summary" class="hidden" style="margin-top:10px">
-          <div class="stat-grid">
-            <div class="stat">
-              <span class="stat-label">Samples</span>
-              <span class="stat-value" id="rfa-samples">--</span>
-            </div>
-            <div class="stat">
-              <span class="stat-label">Clusters</span>
-              <span class="stat-value" id="rfa-clusters">--</span>
-            </div>
-            <div class="stat">
-              <span class="stat-label" style="color:#3FDA7F">GOOD (&gt;-60)</span>
-              <span class="stat-value" id="rfa-good">--</span>
-            </div>
-            <div class="stat">
-              <span class="stat-label" style="color:#F5A623">MODERATE</span>
-              <span class="stat-value" id="rfa-moderate">--</span>
-            </div>
-            <div class="stat">
-              <span class="stat-label" style="color:#FF9500">WEAK</span>
-              <span class="stat-value" id="rfa-weak">--</span>
-            </div>
-            <div class="stat">
-              <span class="stat-label" style="color:#FF5C5C">GAP (&le;-85)</span>
-              <span class="stat-value" id="rfa-gap">--</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- Heatmap layer toggle -->
-        <div id="rf-heatmap-controls" class="hidden" style="margin-top:12px;border-top:1px solid #232c37;padding-top:10px">
-          <div class="field-row" style="align-items:center">
-            <label class="field-label" for="toggle-heatmap" style="flex:1">
-              <input type="checkbox" id="toggle-heatmap" checked style="margin-right:6px;">
-              RF Coverage Map
-            </label>
-          </div>
-          <div class="field-row" style="align-items:center;margin-top:6px">
-            <label class="field-label" for="heatmap-opacity" style="flex:1;font-size:11px">
-              Opacity
-            </label>
-            <input type="range" id="heatmap-opacity" min="10" max="90" value="55"
-                   style="flex:2;accent-color:#00E5FF" title="Heatmap opacity">
-            <span id="heatmap-opacity-val" style="min-width:32px;text-align:right;font-size:11px;color:#8A9AB0">55%</span>
-          </div>
-          <div class="field-row" style="align-items:center;margin-top:4px">
-            <label class="field-label" for="toggle-gap-points" style="flex:1;font-size:11px">
-              <input type="checkbox" id="toggle-gap-points" checked style="margin-right:6px;">
-              Gap Points
-            </label>
-            <label class="field-label" for="toggle-rf-candidates" style="flex:1;font-size:11px">
-              <input type="checkbox" id="toggle-rf-candidates" checked style="margin-right:6px;">
-              Candidates
-            </label>
-          </div>
-
-          <!-- Legend -->
-          <div id="rf-heatmap-legend" style="margin-top:8px;padding:6px 8px;background:#0a0d11;border-radius:4px;border:1px solid #232c37">
-            <div style="font-size:10px;color:#8A9AB0;margin-bottom:4px;font-weight:600;letter-spacing:0.05em">RF COVERAGE LEGEND</div>
-            <div class="legend-row"><span class="legend-dot" style="background:#3FDA7F"></span><span class="legend-label">GOOD &nbsp; &gt; -60 dBm</span></div>
-            <div class="legend-row"><span class="legend-dot" style="background:#F5A623"></span><span class="legend-label">MODERATE &nbsp; -75 to -60 dBm</span></div>
-            <div class="legend-row"><span class="legend-dot" style="background:#FF9500"></span><span class="legend-label">WEAK &nbsp; -85 to -75 dBm</span></div>
-            <div class="legend-row"><span class="legend-dot" style="background:#FF5C5C"></span><span class="legend-label">GAP &nbsp; &le; -85 dBm</span></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- ================================================================
-           Phase 6 — Deployment Verification (BEFORE vs AFTER)
-           ================================================================ -->
-      <div class="panel" id="panel-rf-verification">
-        <h2 class="panel-title">Deployment Verification</h2>
-
-        <p class="hint" id="rf-verification-hint">
-          Deploy a communication node at a candidate site, then complete and analyze an AFTER survey to verify coverage impact.
-        </p>
-
-        <!-- Invalidation Warning (hidden by default) -->
-        <div id="verif-invalidation-warning" class="hidden" style="margin-bottom:8px;padding:8px 10px;background:rgba(255,92,92,0.15);border:1px solid #FF5C5C;border-radius:4px;color:#FF5C5C;font-size:11px;line-height:1.4">
-          <strong>Cannot Compare:</strong> <span id="verif-invalidation-reason">Affected area changed between surveys.</span>
-        </div>
-
-        <!-- Heatmap View Selector (shown when both BEFORE and AFTER exist) -->
-        <div id="heatmap-view-selector-container" class="hidden" style="margin-bottom:10px">
-          <div style="font-size:10px;font-weight:600;color:var(--text-muted);margin-bottom:4px;letter-spacing:0.04em">HEATMAP VIEW:</div>
-          <div class="btn-toggle-group">
-            <button id="btn-view-after-heatmap" class="btn-toggle active" title="Show AFTER deployment survey heatmap">AFTER</button>
-            <button id="btn-view-before-heatmap" class="btn-toggle" title="Show BEFORE deployment survey heatmap">BEFORE</button>
-            <button id="btn-view-overlay-heatmap" class="btn-toggle" title="Show both heatmaps for comparison">OVERLAY</button>
-          </div>
-        </div>
-
-        <!-- Verification Results Table -->
-        <div id="verification-results" class="hidden">
-          <!-- Remaining Gaps Banner -->
-          <div id="remaining-gaps-banner" class="verification-badge gaps-remaining">
-            Remaining Coverage Gaps: <span id="remaining-gaps-count">--</span>
-          </div>
-
-          <table class="verification-table">
-            <thead>
-              <tr>
-                <th style="text-align:left">METRIC</th>
-                <th style="text-align:right">BEFORE</th>
-                <th style="text-align:right">AFTER</th>
-                <th style="text-align:right">CHANGE</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>Active Nodes</td>
-                <td style="text-align:right" id="verif-nodes-before">--</td>
-                <td style="text-align:right" id="verif-nodes-after">--</td>
-                <td style="text-align:right" id="verif-nodes-change">--</td>
-              </tr>
-              <tr>
-                <td style="color:#3FDA7F">GOOD (&gt;-60 dBm)</td>
-                <td style="text-align:right" id="verif-good-before">--</td>
-                <td style="text-align:right" id="verif-good-after">--</td>
-                <td style="text-align:right" id="verif-good-change">--</td>
-              </tr>
-              <tr>
-                <td style="color:#F5A623">MODERATE</td>
-                <td style="text-align:right" id="verif-mod-before">--</td>
-                <td style="text-align:right" id="verif-mod-after">--</td>
-                <td style="text-align:right" id="verif-mod-change">--</td>
-              </tr>
-              <tr>
-                <td style="color:#FF9500">WEAK</td>
-                <td style="text-align:right" id="verif-weak-before">--</td>
-                <td style="text-align:right" id="verif-weak-after">--</td>
-                <td style="text-align:right" id="verif-weak-change">--</td>
-              </tr>
-              <tr>
-                <td style="color:#FF5C5C">GAP (&le;-85 dBm)</td>
-                <td style="text-align:right" id="verif-gap-before">--</td>
-                <td style="text-align:right" id="verif-gap-after">--</td>
-                <td style="text-align:right" id="verif-gap-change">--</td>
-              </tr>
-              <tr>
-                <td>Gap Points</td>
-                <td style="text-align:right" id="verif-gappoints-before">--</td>
-                <td style="text-align:right" id="verif-gappoints-after">--</td>
-                <td style="text-align:right" id="verif-gappoints-change">--</td>
-              </tr>
-              <tr>
-                <td>Gap Regions</td>
-                <td style="text-align:right" id="verif-gapclusters-before">--</td>
-                <td style="text-align:right" id="verif-gapclusters-after">--</td>
-                <td style="text-align:right" id="verif-gapclusters-change">--</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <button id="btn-reset-verification" class="btn btn-block btn-secondary" style="font-size:11px;margin-top:6px">
-          Reset Verification Session
-        </button>
-
-        <!-- RF Survey History & Multi-Survey Comparison (Requirements 7-12) -->
-        <div id="survey-history-section" style="margin-top:14px;border-top:1px solid #232c37;padding-top:10px">
-          <div style="font-size:11px;font-weight:700;color:var(--text);margin-bottom:6px;letter-spacing:0.04em">
-            &#x1F4DC; RF SURVEY HISTORY (LAST 5)
-          </div>
-          
+        <!-- Mission Planning and Upload -->
+        <section class="cs" aria-label="Mission parameters">
+          <h3 class="cs-title">MISSION PARAMETERS</h3>
           <div class="field-row">
-            <select id="select-history-survey" class="field-input" style="font-size:11px;width:100%">
-              <option value="">(No historical surveys yet)</option>
-            </select>
+            <label class="field-label" for="mission-lat">TARGET LAT</label>
+            <input type="text" id="mission-lat" class="field-input" readonly value="--" aria-label="Mission target latitude">
           </div>
-          <div class="btn-row" style="margin-bottom:10px">
-            <button id="btn-view-history-survey" class="btn btn-secondary btn-block" style="font-size:11px" disabled>
-              View Historical Heatmap
-            </button>
+          <div class="field-row">
+            <label class="field-label" for="mission-lon">TARGET LON</label>
+            <input type="text" id="mission-lon" class="field-input" readonly value="--" aria-label="Mission target longitude">
           </div>
+          <div class="field-row">
+            <label class="field-label" for="mission-alt">ALTITUDE (m)</label>
+            <input type="number" id="mission-alt" class="field-input" value="15" min="1" aria-label="Mission altitude">
+          </div>
+          <p class="cs-hint" id="mission-hint">Select a candidate location to generate a mission.</p>
+          <button id="btn-generate-mission" class="btn btn-secondary btn-block" disabled>GENERATE MISSION</button>
+          <button id="btn-upload-mission"   class="btn btn-secondary btn-block" disabled>UPLOAD TO PX4</button>
+        </section>
 
-          <div style="font-size:10px;font-weight:600;color:var(--text-muted);margin-bottom:4px;letter-spacing:0.04em">
-            COMPARE TWO SURVEYS:
+        <!-- Mission Diagnostics & Status -->
+        <section class="cs" aria-label="Mission status diagnostics">
+          <h3 class="cs-title">DIAGNOSTICS &amp; STATUS</h3>
+          <div class="kv-grid">
+            <div class="kv"><span class="kv-label">MISSION</span><span class="kv-val" id="stat-mission-state">PLANNING</span></div>
+            <div class="kv"><span class="kv-label">CONNECTION</span><span class="kv-val" id="stat-connection">DISCONNECTED</span></div>
+            <div class="kv"><span class="kv-label">UPLOAD</span><span class="kv-val" id="stat-upload-status">--</span></div>
+            <div class="kv"><span class="kv-label">PX4 ACK</span><span class="kv-val" id="stat-px4-ack">--</span></div>
+            <div class="kv"><span class="kv-label">WP ITEMS</span><span class="kv-val" id="stat-mission-items">--</span></div>
+            <div class="kv"><span class="kv-label">CURRENT WP</span><span class="kv-val" id="stat-mission-current">--</span></div>
           </div>
-          <div style="display:flex;gap:6px;margin-bottom:6px">
-            <select id="select-compare-a" class="field-input" style="font-size:11px;flex:1">
-              <option value="">Survey A...</option>
-            </select>
-            <select id="select-compare-b" class="field-input" style="font-size:11px;flex:1">
-              <option value="">Survey B...</option>
-            </select>
-          </div>
-          <button id="btn-run-history-compare" class="btn btn-block" style="font-size:11px" disabled>
-            Compare Surveys A &amp; B
+        </section>
+
+        <!-- PHYSICAL PAYLOAD RELEASE -->
+        <section class="cs release-section" aria-label="Physical payload release">
+          <h3 class="cs-title">PHYSICAL PAYLOAD RELEASE</h3>
+          <p class="cs-hint">Release the carried node at the landed destination.</p>
+          <button id="btn-release-payload" class="btn btn-release btn-block" disabled aria-label="Release payload">
+            RELEASE NODE
           </button>
+          <div id="release-interlock-status" class="interlock-status" aria-live="polite">
+            Awaiting UAV landing at target candidate coordinates.
+          </div>
+        </section>
 
-          <!-- History Comparison Results Table -->
-          <div id="history-compare-results" class="hidden" style="margin-top:10px">
-            <div id="history-compare-badge" class="verification-badge" style="margin-bottom:6px"></div>
-            <table class="verification-table" id="history-compare-table">
+        <!-- Full telemetry (expandable) -->
+        <section class="cs" aria-label="Live telemetry">
+          <button class="cs-collapsible" id="tel-toggle" aria-expanded="false" aria-controls="tel-detail">
+            TELEMETRY <span class="cs-chevron">▾</span>
+          </button>
+          <div id="tel-detail" class="cs-collapse" hidden>
+            <div class="kv-grid kv-grid--3">
+              <div class="kv"><span class="kv-label">CONNECTION</span><span class="kv-val" id="tel-connection">--</span></div>
+              <div class="kv"><span class="kv-label">ARMED</span><span class="kv-val" id="tel-armed">--</span></div>
+              <div class="kv"><span class="kv-label">MODE</span><span class="kv-val" id="tel-mode">--</span></div>
+              <div class="kv"><span class="kv-label">GPS FIX</span><span class="kv-val" id="tel-gps-fix">--</span></div>
+              <div class="kv"><span class="kv-label">SATS</span><span class="kv-val" id="tel-satellites">--</span></div>
+              <div class="kv"><span class="kv-label">HDG</span><span class="kv-val" id="tel-heading">--</span></div>
+              <div class="kv kv--wide"><span class="kv-label">LAT</span><span class="kv-val" id="tel-lat">--</span></div>
+              <div class="kv kv--wide"><span class="kv-label">LON</span><span class="kv-val" id="tel-lon">--</span></div>
+              <div class="kv"><span class="kv-label">ALT</span><span class="kv-val" id="tel-alt">--</span></div>
+              <div class="kv"><span class="kv-label">REL ALT</span><span class="kv-val" id="tel-rel-alt">--</span></div>
+              <div class="kv"><span class="kv-label">GND SPD</span><span class="kv-val" id="tel-ground-speed">--</span></div>
+              <div class="kv"><span class="kv-label">BATTERY</span><span class="kv-val" id="tel-battery">--</span></div>
+              <div class="kv"><span class="kv-label">WP CUR</span><span class="kv-val" id="tel-mission-current">--</span></div>
+              <div class="kv"><span class="kv-label">WP REACH</span><span class="kv-val" id="tel-mission-reached">--</span></div>
+            </div>
+            <p class="cs-hint" id="telemetry-hint">Connecting to telemetry stream…</p>
+          </div>
+        </section>
+
+        <!-- Manual override (expandable) -->
+        <section class="cs" aria-label="Manual override">
+          <button class="cs-collapsible" id="manual-toggle" aria-expanded="false" aria-controls="manual-detail">
+            MANUAL OVERRIDE <span class="cs-chevron">▾</span>
+          </button>
+          <div id="manual-detail" class="cs-collapse" hidden>
+            <div class="btn-row">
+              <button id="btn-manual-control" class="btn btn-warning" disabled aria-label="Enter manual control">🕹 MANUAL</button>
+              <button id="btn-resume-mission" class="btn btn-secondary" disabled aria-label="Resume auto">▶ RESUME AUTO</button>
+            </div>
+            <p class="cs-hint" id="manual-hint">Connect a gamepad to enable manual override.</p>
+            <div class="kv-grid">
+              <div class="kv"><span class="kv-label">OVERRIDE</span><span class="kv-val" id="stat-override-mode">AUTO</span></div>
+              <div class="kv"><span class="kv-label">GAMEPAD</span><span class="kv-val" id="stat-gamepad">NONE</span></div>
+              <div class="kv"><span class="kv-label">VX FWD</span><span class="kv-val" id="stat-vx">--</span></div>
+              <div class="kv"><span class="kv-label">VY RIGHT</span><span class="kv-val" id="stat-vy">--</span></div>
+              <div class="kv"><span class="kv-label">VZ DOWN</span><span class="kv-val" id="stat-vz">--</span></div>
+              <div class="kv"><span class="kv-label">YAW °/s</span><span class="kv-val" id="stat-yaw-rate">--</span></div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </div>
+
+    <!-- ============================================================
+         TAB: RF SURVEY
+         ============================================================ -->
+    <div class="cmd-pane" id="pane-rf" role="tabpanel" aria-labelledby="tab-rf">
+      <div class="cmd-scroll">
+
+        <!-- Step 1: DEFINE -->
+        <section class="cs" aria-label="RF survey: define area">
+          <h3 class="cs-title"><span class="step-badge">01</span> DEFINE AREA</h3>
+          <p class="cs-hint" id="analyze-hint">Draw a polygon on the map, then analyze to define the affected area.</p>
+          <div class="kv-grid">
+            <div class="kv"><span class="kv-label">DRAW STATE</span><span class="kv-val" id="stat-state-rf">IDLE</span></div>
+            <div class="kv"><span class="kv-label">NODES</span><span class="kv-val" id="stat-nodes-rf">--</span></div>
+            <div class="kv"><span class="kv-label">COVERAGE</span><span class="kv-val" id="stat-coverage">--</span></div>
+            <div class="kv"><span class="kv-label">GAPS</span><span class="kv-val" id="stat-gap">--</span></div>
+          </div>
+        </section>
+
+        <!-- Step 2: PLAN -->
+        <section class="cs" aria-label="RF survey: plan">
+          <h3 class="cs-title"><span class="step-badge">02</span> PLAN SURVEY</h3>
+          <div class="field-row">
+            <label class="field-label" for="scan-spacing">LINE SPACING (m)</label>
+            <input type="number" id="scan-spacing" class="field-input" value="25" min="5" max="200" step="5" aria-label="Scan line spacing">
+          </div>
+          <div class="field-row">
+            <label class="field-label" for="scan-alt">ALTITUDE (m)</label>
+            <input type="number" id="scan-alt" class="field-input" value="15" min="1" max="100" aria-label="Scan altitude">
+          </div>
+          <button id="btn-rf-scan" class="btn btn-secondary btn-block">GENERATE RF SURVEY</button>
+          <p class="cs-hint" id="rf-scan-hint">Define an affected area first.</p>
+          <div id="rf-waypoints-container" class="rf-plan-stats hidden">
+            <div id="rf-waypoints-summary"></div>
+          </div>
+          <div class="kv-grid" style="margin-top:10px">
+            <div class="kv"><span class="kv-label">WAYPOINTS</span><span class="kv-val" id="stat-rf-waypoints">--</span></div>
+            <div class="kv"><span class="kv-label">LINES</span><span class="kv-val" id="stat-rf-lines">--</span></div>
+            <div class="kv"><span class="kv-label">SPACING</span><span class="kv-val" id="stat-rf-spacing">--</span></div>
+            <div class="kv"><span class="kv-label">ALT</span><span class="kv-val" id="stat-rf-altitude">--</span></div>
+            <div class="kv kv--wide"><span class="kv-label">EST. DIST</span><span class="kv-val" id="stat-rf-distance">--</span></div>
+            <div class="kv kv--wide"><span class="kv-label">SCAN STATE</span><span class="kv-val" id="stat-rf-state">IDLE</span></div>
+          </div>
+          <button id="btn-upload-rf-scan" class="btn btn-secondary btn-block" disabled style="margin-top:8px">UPLOAD RF SURVEY</button>
+        </section>
+
+        <!-- Step 3: EXECUTE -->
+        <section class="cs" aria-label="RF survey: execute">
+          <h3 class="cs-title"><span class="step-badge">03</span> EXECUTE</h3>
+          <button id="btn-start-rf-scan" class="btn btn-primary btn-block" disabled>▶ START RF SCAN</button>
+
+          <!-- Live scan progress -->
+          <div id="rf-scan-live" class="rf-scan-live hidden">
+            <div class="scan-state-header">
+              <span class="scan-state-label" id="scan-state-label">SCANNING</span>
+              <span class="scan-progress-pct" id="scan-progress-pct">0%</span>
+            </div>
+            <div class="scan-progress-bar-wrap">
+              <div class="scan-progress-bar" id="scan-progress-bar" style="width: 0%"></div>
+            </div>
+            <div class="scan-progress-pos" id="scan-progress-pos">UAV: --, --</div>
+            <div class="kv-grid" style="margin-top:8px">
+              <div class="kv"><span class="kv-label">SAMPLES</span><span class="kv-val" id="stat-rfs-samples">0</span></div>
+              <div class="kv"><span class="kv-label">BEST RSSI</span><span class="kv-val" id="stat-rfs-best-rssi">--</span></div>
+              <div class="kv"><span class="kv-label">STATE</span><span class="kv-val" id="stat-rfs-state">IDLE</span></div>
+              <div class="kv"><span class="kv-label">NODES</span><span class="kv-val" id="stat-rfs-nodes">0</span></div>
+            </div>
+            <div id="rf-rssi-table-container" class="hidden" style="margin-top:8px">
+              <div class="kv-label" style="margin-bottom:4px">LATEST RSSI PER NODE</div>
+              <div id="rf-rssi-table"></div>
+            </div>
+          </div>
+          <p class="cs-hint" id="rf-survey-hint">Live data appears once the RF scan mission starts.</p>
+          <button id="btn-reset-rf-survey" class="btn btn-danger-outline btn-block" style="margin-top:6px">RESET SURVEY DATA</button>
+        </section>
+
+        <!-- Step 4: ANALYZE -->
+        <section class="cs" aria-label="RF survey: analyze">
+          <h3 class="cs-title"><span class="step-badge">04</span> ANALYZE</h3>
+          <button id="btn-analyze-rf" class="btn btn-primary btn-block">ANALYZE RF SURVEY</button>
+          <p class="cs-hint" id="rf-analysis-hint">Complete an RF scan, then analyze to generate the coverage map and candidates.</p>
+
+          <!-- Coverage summary -->
+          <div id="rf-coverage-summary" class="hidden" style="margin-top:10px">
+            <div class="kv-grid">
+              <div class="kv"><span class="kv-label">SAMPLES</span><span class="kv-val" id="rfa-samples">--</span></div>
+              <div class="kv"><span class="kv-label">CLUSTERS</span><span class="kv-val" id="rfa-clusters">--</span></div>
+              <div class="kv"><span class="kv-label" style="color:var(--rf-good)">GOOD</span><span class="kv-val" id="rfa-good">--</span></div>
+              <div class="kv"><span class="kv-label" style="color:var(--rf-mod)">MODERATE</span><span class="kv-val" id="rfa-moderate">--</span></div>
+              <div class="kv"><span class="kv-label" style="color:var(--rf-weak)">WEAK</span><span class="kv-val" id="rfa-weak">--</span></div>
+              <div class="kv"><span class="kv-label" style="color:var(--rf-gap)">GAP</span><span class="kv-val" id="rfa-gap">--</span></div>
+            </div>
+          </div>
+
+          <!-- Heatmap controls -->
+          <div id="rf-heatmap-controls" class="hidden" style="margin-top:12px">
+            <div class="layer-toggles">
+              <label class="layer-toggle">
+                <input type="checkbox" id="toggle-heatmap" checked>
+                <span>RF Coverage Map</span>
+              </label>
+              <label class="layer-toggle">
+                <input type="checkbox" id="toggle-gap-points" checked>
+                <span>Gap Points</span>
+              </label>
+              <label class="layer-toggle">
+                <input type="checkbox" id="toggle-rf-candidates" checked>
+                <span>Candidates</span>
+              </label>
+            </div>
+            <div class="opacity-row">
+              <span class="kv-label">OPACITY</span>
+              <input type="range" id="heatmap-opacity" min="10" max="90" value="55" aria-label="Heatmap opacity">
+              <span id="heatmap-opacity-val" class="opacity-val">55%</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Deployment Verification (Before/After) -->
+        <section class="cs" aria-label="Deployment verification">
+          <h3 class="cs-title">VERIFICATION</h3>
+          <p class="cs-hint" id="rf-verification-hint">Deploy a node at a candidate site, then run an AFTER survey to verify coverage impact.</p>
+
+          <div id="verif-invalidation-warning" class="alert-warn hidden">
+            <strong>CANNOT COMPARE:</strong> <span id="verif-invalidation-reason">Affected area changed.</span>
+          </div>
+
+          <!-- Heatmap view selector -->
+          <div id="heatmap-view-selector-container" class="hidden" style="margin-bottom:10px">
+            <div class="kv-label" style="margin-bottom:4px">HEATMAP VIEW</div>
+            <div class="btn-toggle-group">
+              <button id="btn-view-after-heatmap"   class="btn-toggle active" aria-pressed="true">AFTER</button>
+              <button id="btn-view-before-heatmap"  class="btn-toggle" aria-pressed="false">BEFORE</button>
+              <button id="btn-view-overlay-heatmap" class="btn-toggle" aria-pressed="false">OVERLAY</button>
+            </div>
+          </div>
+
+          <!-- Verification results table -->
+          <div id="verification-results" class="hidden">
+            <div id="remaining-gaps-banner" class="verification-badge gaps-remaining">
+              REMAINING GAPS: <span id="remaining-gaps-count">--</span>
+            </div>
+            <table class="verification-table" aria-label="Verification results">
               <thead>
                 <tr>
-                  <th style="text-align:left">METRIC</th>
-                  <th style="text-align:right" id="hist-th-a">SURVEY A</th>
-                  <th style="text-align:right" id="hist-th-b">SURVEY B</th>
-                  <th style="text-align:right">DELTA</th>
+                  <th>METRIC</th>
+                  <th>BEFORE</th>
+                  <th>AFTER</th>
+                  <th>ΔCHANGE</th>
                 </tr>
               </thead>
               <tbody>
                 <tr>
                   <td>Nodes</td>
-                  <td style="text-align:right" id="hist-nodes-a">--</td>
-                  <td style="text-align:right" id="hist-nodes-b">--</td>
-                  <td style="text-align:right" id="hist-nodes-delta">--</td>
+                  <td id="verif-nodes-before">--</td>
+                  <td id="verif-nodes-after">--</td>
+                  <td id="verif-nodes-change">--</td>
                 </tr>
                 <tr>
-                  <td>Samples</td>
-                  <td style="text-align:right" id="hist-samples-a">--</td>
-                  <td style="text-align:right" id="hist-samples-b">--</td>
-                  <td style="text-align:right" id="hist-samples-delta">--</td>
+                  <td style="color:var(--rf-good)">GOOD</td>
+                  <td id="verif-good-before">--</td>
+                  <td id="verif-good-after">--</td>
+                  <td id="verif-good-change">--</td>
                 </tr>
                 <tr>
-                  <td style="color:#3FDA7F">GOOD %</td>
-                  <td style="text-align:right" id="hist-good-a">--</td>
-                  <td style="text-align:right" id="hist-good-b">--</td>
-                  <td style="text-align:right" id="hist-good-delta">--</td>
+                  <td style="color:var(--rf-mod)">MODERATE</td>
+                  <td id="verif-mod-before">--</td>
+                  <td id="verif-mod-after">--</td>
+                  <td id="verif-mod-change">--</td>
                 </tr>
                 <tr>
-                  <td style="color:#F5A623">MODERATE %</td>
-                  <td style="text-align:right" id="hist-mod-a">--</td>
-                  <td style="text-align:right" id="hist-mod-b">--</td>
-                  <td style="text-align:right" id="hist-mod-delta">--</td>
+                  <td style="color:var(--rf-weak)">WEAK</td>
+                  <td id="verif-weak-before">--</td>
+                  <td id="verif-weak-after">--</td>
+                  <td id="verif-weak-change">--</td>
                 </tr>
                 <tr>
-                  <td style="color:#FF9500">WEAK %</td>
-                  <td style="text-align:right" id="hist-weak-a">--</td>
-                  <td style="text-align:right" id="hist-weak-b">--</td>
-                  <td style="text-align:right" id="hist-weak-delta">--</td>
-                </tr>
-                <tr>
-                  <td style="color:#FF5C5C">GAP %</td>
-                  <td style="text-align:right" id="hist-gap-a">--</td>
-                  <td style="text-align:right" id="hist-gap-b">--</td>
-                  <td style="text-align:right" id="hist-gap-delta">--</td>
+                  <td style="color:var(--rf-gap)">GAP</td>
+                  <td id="verif-gap-before">--</td>
+                  <td id="verif-gap-after">--</td>
+                  <td id="verif-gap-change">--</td>
                 </tr>
                 <tr>
                   <td>Gap Points</td>
-                  <td style="text-align:right" id="hist-gappoints-a">--</td>
-                  <td style="text-align:right" id="hist-gappoints-b">--</td>
-                  <td style="text-align:right" id="hist-gappoints-delta">--</td>
+                  <td id="verif-gappoints-before">--</td>
+                  <td id="verif-gappoints-after">--</td>
+                  <td id="verif-gappoints-change">--</td>
                 </tr>
                 <tr>
-                  <td>Gap Clusters</td>
-                  <td style="text-align:right" id="hist-gapclusters-a">--</td>
-                  <td style="text-align:right" id="hist-gapclusters-b">--</td>
-                  <td style="text-align:right" id="hist-gapclusters-delta">--</td>
+                  <td>Gap Regions</td>
+                  <td id="verif-gapclusters-before">--</td>
+                  <td id="verif-gapclusters-after">--</td>
+                  <td id="verif-gapclusters-change">--</td>
                 </tr>
               </tbody>
             </table>
           </div>
-        </div>
-      </div>
 
-      <div class="panel" id="panel-recommended">
-        <h2 class="panel-title">Recommended Locations</h2>
-        <p class="not-yet" id="recommended-empty">Analyze an area to generate and score candidate deployment sites.</p>
-        <div id="recommended-list"></div>
-      </div>
-
-      <div class="panel" id="panel-mission">
-        <h2 class="panel-title">Mission</h2>
-
-        <div class="field-row">
-          <label class="field-label">Target Latitude</label>
-          <input type="text" id="mission-lat" class="field-input" readonly value="--">
-        </div>
-        <div class="field-row">
-          <label class="field-label">Target Longitude</label>
-          <input type="text" id="mission-lon" class="field-input" readonly value="--">
-        </div>
-        <div class="field-row">
-          <label class="field-label">Target Altitude (m)</label>
-          <input type="number" id="mission-alt" class="field-input" value="15" min="1">
-        </div>
-
-        <div class="btn-row">
-          <button id="btn-generate-mission" class="btn btn-block" disabled>Generate Mission</button>
-        </div>
-        <div class="btn-row">
-          <button id="btn-upload-mission" class="btn btn-block" disabled>Upload Mission to PX4</button>
-        </div>
-        <div class="btn-row">
-          <button id="btn-start-mission" class="btn btn-block btn-primary" disabled>&#9654; Start Mission</button>
-        </div>
-        <div class="btn-row">
-          <button id="btn-abort-mission" class="btn btn-block btn-danger" disabled>&#9632; Abort (RTL)</button>
-        </div>
-        <div class="btn-row">
-          <button id="btn-return-home" class="btn btn-block btn-primary" disabled>&#8617; Return to Home</button>
-        </div>
-        <p class="hint" id="mission-hint">Select a recommended location to generate a mission.</p>
-
-        <!-- Physical Payload Release (Requirements 2, 3, 4, 5, 6, 7) -->
-        <div class="mission-release-section" style="margin-top:12px;border-top:1px solid #232c37;padding-top:10px;">
-          <div style="font-size:10px;font-weight:700;color:var(--text-muted);margin-bottom:6px;letter-spacing:0.05em">
-            PHYSICAL PAYLOAD RELEASE
-          </div>
-          <button id="btn-release-payload" class="btn btn-block btn-release" disabled>
-            &#x1F4E6; RELEASE (PHYSICAL DEPLOYMENT)
+          <button id="btn-reset-verification" class="btn btn-danger-outline btn-block" style="margin-top:6px">
+            RESET VERIFICATION
           </button>
-          <div id="release-interlock-status" class="hint" style="margin-top:4px;font-size:11px;color:#8A9AB0">
-            Awaiting UAV landing at target candidate coordinates.
-          </div>
-        </div>
+        </section>
 
-        <div class="stat-grid">
-          <div class="stat">
-            <span class="stat-label">Mission State</span>
-            <span class="stat-value" id="stat-mission-state">PLANNING</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Connection</span>
-            <span class="stat-value" id="stat-connection">DISCONNECTED</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Upload Status</span>
-            <span class="stat-value" id="stat-upload-status">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">PX4 ACK</span>
-            <span class="stat-value" id="stat-px4-ack">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Mission Items</span>
-            <span class="stat-value" id="stat-mission-items">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Current WP</span>
-            <span class="stat-value" id="stat-mission-current">--</span>
-          </div>
-        </div>
       </div>
+    </div>
 
-      <!-- ================================================================
-           Manual Override panel
-           ================================================================ -->
-      <div class="panel" id="panel-manual">
-        <h2 class="panel-title">Manual Override</h2>
+    <!-- ============================================================
+         TAB: DEPLOY
+         ============================================================ -->
+    <div class="cmd-pane" id="pane-deploy" role="tabpanel" aria-labelledby="tab-deploy">
+      <div class="cmd-scroll">
 
-        <div class="btn-row">
-          <button id="btn-manual-control" class="btn btn-block btn-warning" disabled>
-            &#x1F579; Manual Control
+        <!-- Placement candidates -->
+        <section class="cs" aria-label="Placement candidates">
+          <h3 class="cs-title">PLACEMENT CANDIDATES</h3>
+          <p class="not-yet" id="recommended-empty">Run an RF survey to generate candidates.</p>
+          <div id="recommended-list"></div>
+        </section>
+
+        <!-- AUTO DEPLOY -->
+        <section class="cs autodeploy-section" aria-label="Auto deploy">
+          <h3 class="cs-title">AUTO DEPLOY</h3>
+          <p class="cs-hint" id="deploy-hint">
+            Click the map or select a candidate, then AUTO DEPLOY to create a node immediately.
+          </p>
+          <div class="deploy-loc-display" id="deploy-location-display">
+            <span class="kv-label">SELECTED LOCATION</span>
+            <span class="kv-val font-data" id="deploy-location-text">None</span>
+          </div>
+          <button id="btn-auto-deploy" class="btn btn-deploy btn-block" disabled aria-label="Auto deploy node">
+            AUTO DEPLOY — CREATE NODE HERE
           </button>
-        </div>
-        <div class="btn-row">
-          <button id="btn-resume-mission" class="btn btn-block btn-primary" disabled>
-            &#9654; Resume Auto
+          <p class="cs-hint" style="margin-top:4px">Immediate logical deployment — no UAV flight, no RELEASE.</p>
+          <button id="btn-deploy-to-mission" class="btn btn-secondary btn-block" disabled style="margin-top:8px" aria-label="Generate UAV deployment mission">
+            GENERATE NODE MISSION
           </button>
-        </div>
+          <p class="cs-hint" style="margin-top:2px">Physical deployment — flies UAV to candidate, lands, and enables payload release.</p>
+          <div class="kv-grid" style="margin-top:8px">
+            <div class="kv"><span class="kv-label">DEPLOYED</span><span class="kv-val" id="stat-deployed-count">0</span></div>
+            <div class="kv"><span class="kv-label">SOURCE</span><span class="kv-val" id="stat-deploy-source">--</span></div>
+          </div>
+        </section>
 
-        <p class="hint" id="manual-hint">
-          Connect a gamepad, then click Manual Control during an active mission to take over.
-        </p>
+        <!-- Ground nodes list -->
+        <section class="cs" aria-label="Ground nodes">
+          <h3 class="cs-title">GROUND NODES</h3>
+          <p class="not-yet" id="nodes-empty-label" hidden>No deployed nodes.</p>
+          <div id="nodes-list" class="nodes-list"></div>
 
-        <div class="stat-grid">
-          <div class="stat">
-            <span class="stat-label">Override Mode</span>
-            <span class="stat-value" id="stat-override-mode">AUTO</span>
+          <!-- Delete node -->
+          <div id="deployed-nodes-container" style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+            <label class="field-label" for="select-delete-node" style="margin-bottom:6px;display:block">DELETE NODE</label>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <select id="select-delete-node" class="field-input" aria-label="Select node to delete">
+                <option value="">(No nodes deployed)</option>
+              </select>
+              <button id="btn-delete-node" class="btn btn-danger" disabled aria-label="Delete selected node">
+                DELETE NODE
+              </button>
+            </div>
           </div>
-          <div class="stat">
-            <span class="stat-label">Gamepad</span>
-            <span class="stat-value" id="stat-gamepad">NONE</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">vx (fwd)</span>
-            <span class="stat-value" id="stat-vx">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">vy (right)</span>
-            <span class="stat-value" id="stat-vy">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">vz (down)</span>
-            <span class="stat-value" id="stat-vz">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">yaw &#176;/s</span>
-            <span class="stat-value" id="stat-yaw-rate">--</span>
-          </div>
-        </div>
+        </section>
+
       </div>
+    </div>
 
-      <div class="panel" id="panel-telemetry">
-        <h2 class="panel-title">Live Telemetry</h2>
+    <!-- ============================================================
+         TAB: HISTORY
+         ============================================================ -->
+    <div class="cmd-pane" id="pane-history" role="tabpanel" aria-labelledby="tab-history">
+      <div class="cmd-scroll">
 
-        <div class="btn-row">
-          <button id="btn-arm" class="btn btn-block btn-primary" disabled>ARM</button>
-          <button id="btn-disarm" class="btn btn-block btn-danger" disabled>DISARM</button>
-        </div>
+        <section class="cs" aria-label="RF survey history">
+          <h3 class="cs-title">RF SURVEY HISTORY</h3>
+          <p class="not-yet" id="history-empty-label">No completed surveys yet.</p>
 
-        <div class="stat-grid">
-          <div class="stat">
-            <span class="stat-label">Connection</span>
-            <span class="stat-value" id="tel-connection">DISCONNECTED</span>
+          <!-- Survey list -->
+          <div id="history-list" class="history-list"></div>
+
+          <!-- Single survey view -->
+          <div style="margin-top:12px">
+            <div class="kv-label" style="margin-bottom:4px">VIEW SINGLE SURVEY</div>
+            <select id="select-history-survey" class="field-input" aria-label="Select survey to view">
+              <option value="">(No historical surveys yet)</option>
+            </select>
+            <button id="btn-view-history-survey" class="btn btn-secondary btn-block" style="margin-top:6px" disabled aria-label="View historical heatmap">
+              VIEW HISTORICAL HEATMAP
+            </button>
           </div>
-          <div class="stat">
-            <span class="stat-label">Armed</span>
-            <span class="stat-value" id="tel-armed">--</span>
+
+          <!-- Compare two surveys -->
+          <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:10px">
+            <div class="kv-label" style="margin-bottom:6px">COMPARE TWO SURVEYS</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px">
+              <select id="select-compare-a" class="field-input" aria-label="Survey A">
+                <option value="">Survey A…</option>
+              </select>
+              <select id="select-compare-b" class="field-input" aria-label="Survey B">
+                <option value="">Survey B…</option>
+              </select>
+            </div>
+            <button id="btn-run-history-compare" class="btn btn-primary btn-block" disabled aria-label="Compare surveys">
+              COMPARE A &amp; B
+            </button>
           </div>
-          <div class="stat">
-            <span class="stat-label">Mode</span>
-            <span class="stat-value" id="tel-mode">--</span>
+
+          <!-- History comparison results -->
+          <div id="history-compare-results" class="hidden" style="margin-top:10px">
+            <div id="history-compare-badge" class="verification-badge"></div>
+            <table class="verification-table" id="history-compare-table" aria-label="Survey comparison">
+              <thead>
+                <tr>
+                  <th>METRIC</th>
+                  <th id="hist-th-a">A</th>
+                  <th id="hist-th-b">B</th>
+                  <th>DELTA</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Nodes</td>
+                  <td id="hist-nodes-a">--</td>
+                  <td id="hist-nodes-b">--</td>
+                  <td id="hist-nodes-delta">--</td>
+                </tr>
+                <tr>
+                  <td>Samples</td>
+                  <td id="hist-samples-a">--</td>
+                  <td id="hist-samples-b">--</td>
+                  <td id="hist-samples-delta">--</td>
+                </tr>
+                <tr>
+                  <td style="color:var(--rf-good)">GOOD %</td>
+                  <td id="hist-good-a">--</td>
+                  <td id="hist-good-b">--</td>
+                  <td id="hist-good-delta">--</td>
+                </tr>
+                <tr>
+                  <td style="color:var(--rf-mod)">MOD %</td>
+                  <td id="hist-mod-a">--</td>
+                  <td id="hist-mod-b">--</td>
+                  <td id="hist-mod-delta">--</td>
+                </tr>
+                <tr>
+                  <td style="color:var(--rf-weak)">WEAK %</td>
+                  <td id="hist-weak-a">--</td>
+                  <td id="hist-weak-b">--</td>
+                  <td id="hist-weak-delta">--</td>
+                </tr>
+                <tr>
+                  <td style="color:var(--rf-gap)">GAP %</td>
+                  <td id="hist-gap-a">--</td>
+                  <td id="hist-gap-b">--</td>
+                  <td id="hist-gap-delta">--</td>
+                </tr>
+                <tr>
+                  <td>Gap Pts</td>
+                  <td id="hist-gappoints-a">--</td>
+                  <td id="hist-gappoints-b">--</td>
+                  <td id="hist-gappoints-delta">--</td>
+                </tr>
+                <tr>
+                  <td>Gap Clust</td>
+                  <td id="hist-gapclusters-a">--</td>
+                  <td id="hist-gapclusters-b">--</td>
+                  <td id="hist-gapclusters-delta">--</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
-          <div class="stat">
-            <span class="stat-label">GPS Fix</span>
-            <span class="stat-value" id="tel-gps-fix">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Latitude</span>
-            <span class="stat-value" id="tel-lat">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Longitude</span>
-            <span class="stat-value" id="tel-lon">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Altitude</span>
-            <span class="stat-value" id="tel-alt">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Relative Alt</span>
-            <span class="stat-value" id="tel-rel-alt">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Ground Speed</span>
-            <span class="stat-value" id="tel-ground-speed">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Heading</span>
-            <span class="stat-value" id="tel-heading">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Battery</span>
-            <span class="stat-value" id="tel-battery">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">Satellites</span>
-            <span class="stat-value" id="tel-satellites">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">WP Current</span>
-            <span class="stat-value" id="tel-mission-current">--</span>
-          </div>
-          <div class="stat">
-            <span class="stat-label">WP Reached</span>
-            <span class="stat-value" id="tel-mission-reached">--</span>
-          </div>
-        </div>
-        <p class="hint" id="telemetry-hint">Connecting to telemetry stream…</p>
+        </section>
+
       </div>
+    </div>
 
-    </aside>
+  </aside>
 
-  </main>
+</main>
 
-  <footer class="log-pane">
-    <div class="log-header">MISSION LOG</div>
-    <div id="log-body" class="log-body"></div>
-  </footer>
+<!-- ===================================================================
+     HISTORICAL SURVEY VIEWER — full-screen overlay
+     =================================================================== -->
+<div id="history-viewer" class="hist-viewer hidden" role="dialog" aria-modal="true" aria-label="Historical survey viewer">
+  <div class="hist-viewer-topbar">
+    <div class="hist-viewer-title" id="hist-viewer-title">HISTORICAL VIEW</div>
+    <button class="hist-viewer-close" id="btn-close-history-viewer" aria-label="Close historical view">✕ CLOSE</button>
+  </div>
+  <div class="hist-viewer-body" id="hist-viewer-body">
+    <!-- Populated by JS: single map or side-by-side -->
+  </div>
+</div>
+
+<!-- ===================================================================
+     BOTTOM LOG DRAWER
+     =================================================================== -->
+<footer class="log-drawer" role="contentinfo">
+  <div class="log-drawer-header">
+    <button class="log-drawer-toggle" id="log-drawer-toggle" aria-expanded="false" aria-controls="log-body">
+      <span>MISSION LOG</span>
+      <span class="log-chevron" id="log-chevron">▾</span>
+    </button>
+    <button class="log-clear-btn" id="btn-clear-log" aria-label="Clear mission log">CLEAR</button>
+  </div>
+  <div id="log-body" class="log-body" hidden></div>
+</footer>
+
+<!-- Hidden stat IDs required by app.js (mapped to visible counterparts) -->
+<!-- These are the old IDs app.js writes to; we keep them present but hidden,
+     and the new topbar/pane IDs mirror them via a sync script below. -->
+<div style="display:none" aria-hidden="true">
+  <span id="stat-state">IDLE</span>
+</div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-<script src="app.js?v=16"></script>
+<script src="app.js?v=17"></script>
 </body>
 </html>

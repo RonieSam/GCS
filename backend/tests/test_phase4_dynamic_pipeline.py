@@ -143,8 +143,9 @@ class TestPhase4HorizontalDistanceAndRSSIBehavior(unittest.TestCase):
         d = compute_distance_horizontal_m(152.4, 198.7, 150.0, 200.0)
         self.assertAlmostEqual(d, 2.729, places=2)
 
-    def test_altitude_included_in_rf_distance(self):
-        # In 3D distance model, higher altitude increases 3D distance and decreases RSSI
+    def test_altitude_excluded_from_rf_distance(self):
+        # Per Spec Phase 4 Item P, altitude is excluded from RF distance calculation
+        # to avoid elevation distortion in the horizontal 2D plane
         node = [{"id": "COMM-001", "x": 150.0, "y": 200.0, "alt": 10.0}]
 
         rssi_alt15 = calculate_node_rssi_vector(
@@ -154,7 +155,7 @@ class TestPhase4HorizontalDistanceAndRSSIBehavior(unittest.TestCase):
             uav_x=152.4, uav_y=198.7, uav_alt_m=50.0, deployed_nodes=node
         )
 
-        self.assertGreater(rssi_alt15["COMM-001"], rssi_alt50["COMM-001"])
+        self.assertEqual(rssi_alt15["COMM-001"], rssi_alt50["COMM-001"])
 
     def test_rssi_decreases_monotonically_with_distance(self):
         # Fixed node at (150, 200)

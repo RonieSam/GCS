@@ -1063,29 +1063,34 @@ function renderRecommendedPanel(top) {
     card.className = "location-card";
     card.innerHTML = `
       <div class="location-card-header">
-        <span class="location-card-label">Location ${label}</span>
+        <span class="location-card-label">Candidate ${String(i + 1).padStart(2, "0")} (${label})</span>
         <span class="location-card-score">Score ${c.score.toFixed(1)}</span>
       </div>
       <div class="location-card-metrics">
-        <span>Coverage +${c.coverage_improvement_pct.toFixed(1)}pp</span>
-        <span>${c.distance_to_home_m.toFixed(0)}m from home</span>
+        <span>${c.lat.toFixed(5)}, ${c.lon.toFixed(5)}</span>
+        <span>+${c.coverage_improvement_pct.toFixed(1)}% coverage</span>
       </div>
       <div class="btn-row">
-        <button class="btn btn-select" data-key="${candidateKey(c)}">&#x1F3AF; Select ${label}</button>
-        <button class="btn btn-primary btn-select-mission" data-key="${candidateKey(c)}">Mission</button>
+        <button class="btn btn-deploy btn-auto-deploy-cand" data-key="${candidateKey(c)}">AUTO DEPLOY</button>
+        <button class="btn btn-secondary btn-select-mission" data-key="${candidateKey(c)}">GENERATE NODE MISSION</button>
       </div>
     `;
     list.appendChild(card);
 
-    // "Select" → sets deployment location (does NOT immediately deploy)
-    card.querySelector(".btn-select").addEventListener("click", () =>
-      selectDeploymentLocation(c.lat, c.lon, "candidate")
-    );
+    // AUTO DEPLOY → immediately deploys node at candidate location
+    card.querySelector(".btn-auto-deploy-cand").addEventListener("click", () => {
+      selectDeploymentLocation(c.lat, c.lon, "candidate");
+      autoDeploy();
+    });
 
-    // "Mission" → existing mission-planning workflow (POST /api/select-target)
-    card.querySelector(".btn-select-mission").addEventListener("click", () =>
-      selectLocation(c, label)
-    );
+    // GENERATE NODE MISSION → select target, switch to MISSION tab, generate mission
+    card.querySelector(".btn-select-mission").addEventListener("click", () => {
+      selectLocation(c, label);
+      const missionTab = document.getElementById("tab-mission");
+      if (missionTab) missionTab.click();
+      const genBtn = document.getElementById("btn-generate-mission");
+      if (genBtn && !genBtn.disabled) genBtn.click();
+    });
   });
 }
 
@@ -2536,26 +2541,40 @@ function renderRfCandidates(candidates) {
     card.className = `rf-candidate-card${isTop ? " rank-1" : ""}`;
     card.id = `rf-cand-${idx}`;
     card.innerHTML =
-      `<div class="rf-candidate-rank${isTop ? " rank-1" : ""}">★ ${label}${isTop ? " (BEST)" : ""}</div>`
+      `<div class="rf-candidate-rank${isTop ? " rank-1" : ""}">`
+      + `<span>${String(c.rank || (idx + 1)).padStart(2, "0")} · ${label}${isTop ? " (BEST)" : ""}</span>`
+      + `<span style="font-family:var(--font-data)">SCORE ${c.score}</span>`
+      + `</div>`
       + `<div class="rf-candidate-meta">`
-      + `Score: ${c.score}&nbsp;&nbsp;|&nbsp;&nbsp;Gap pts: ${c.gap_points}<br>`
-      + `Nearest node: ${c.nearest_node_distance_m} m<br>`
-      + `Lat: ${c.latitude.toFixed(6)}&nbsp;&nbsp;Lon: ${c.longitude.toFixed(6)}`
+      + `<div style="color:var(--text);font-weight:600">${c.latitude.toFixed(5)}, ${c.longitude.toFixed(5)}</div>`
+      + `<div>${c.gap_points} gap points · nearest node ${c.nearest_node_distance_m}m</div>`
       + `</div>`
       + `<div class="rf-candidate-actions">`
-      + `<button class="btn btn-primary" id="rfcand-select-${idx}">Select for Mission</button>`
+      + `<button class="btn btn-deploy" id="rfcand-autodeploy-${idx}">AUTO DEPLOY</button>`
+      + `<button class="btn btn-secondary" id="rfcand-mission-${idx}">GENERATE NODE MISSION</button>`
       + `</div>`;
     if (listEl) listEl.appendChild(card);
 
-    // Wire "Select for Mission" button
+    // Wire buttons
     setTimeout(() => {
-      const btn = document.getElementById(`rfcand-select-${idx}`);
-      if (btn) {
-        btn.addEventListener("click", () => {
+      const autoBtn = document.getElementById(`rfcand-autodeploy-${idx}`);
+      if (autoBtn) {
+        autoBtn.addEventListener("click", () => {
+          selectDeploymentLocation(c.latitude, c.longitude, "candidate");
+          autoDeploy();
+        });
+      }
+
+      const missionBtn = document.getElementById(`rfcand-mission-${idx}`);
+      if (missionBtn) {
+        missionBtn.addEventListener("click", () => {
           selectLocation(c, label);
-          // Highlight selected card
           document.querySelectorAll(".rf-candidate-card").forEach(el => el.classList.remove("selected"));
           card.classList.add("selected");
+          const missionTab = document.getElementById("tab-mission");
+          if (missionTab) missionTab.click();
+          const genBtn = document.getElementById("btn-generate-mission");
+          if (genBtn && !genBtn.disabled) genBtn.click();
         });
       }
     }, 0);
@@ -3650,3 +3669,697 @@ async function boot() {
 }
 
 boot();
+
+/* ==========================================================================
+   GCS SHELL — Tab navigation, Log drawer, Collapsibles, Clock, Telemetry sync
+   ========================================================================== */
+
+(function initGcsShell() {
+
+  // -------------------------------------------------------------------------
+  // Tab switching with map resize
+  // -------------------------------------------------------------------------
+  const tabs    = document.querySelectorAll(".cmd-tab");
+  const panes   = document.querySelectorAll(".cmd-pane");
+
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      tabs.forEach((t) => {
+        t.classList.remove("active");
+        t.setAttribute("aria-selected", "false");
+      });
+      panes.forEach((p) => p.classList.remove("active"));
+
+      tab.classList.add("active");
+      tab.setAttribute("aria-selected", "true");
+      const target = document.getElementById(tab.getAttribute("aria-controls"));
+      if (target) target.classList.add("active");
+
+      // Invalidate map size so Leaflet recalculates bounds without artifacts
+      if (typeof map !== "undefined" && map) {
+        setTimeout(() => map.invalidateSize(), 50);
+      }
+    });
+  });
+
+  // Window resize -> invalidate map size
+  window.addEventListener("resize", () => {
+    if (typeof map !== "undefined" && map) map.invalidateSize();
+  });
+
+  // -------------------------------------------------------------------------
+  // Zoom In / Zoom Out map tools
+  // -------------------------------------------------------------------------
+  const zoomInBtn = document.getElementById("btn-map-zoom-in");
+  const zoomOutBtn = document.getElementById("btn-map-zoom-out");
+  if (zoomInBtn) {
+    zoomInBtn.addEventListener("click", () => {
+      if (typeof map !== "undefined" && map) map.zoomIn();
+    });
+  }
+  if (zoomOutBtn) {
+    zoomOutBtn.addEventListener("click", () => {
+      if (typeof map !== "undefined" && map) map.zoomOut();
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Map layers popover & checkboxes
+  // -------------------------------------------------------------------------
+  const layersBtn = document.getElementById("btn-map-layers");
+  const layersPopover = document.getElementById("map-layers-popover");
+  if (layersBtn && layersPopover) {
+    layersBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      layersPopover.classList.toggle("hidden");
+    });
+    document.addEventListener("click", (e) => {
+      if (!layersPopover.contains(e.target) && e.target !== layersBtn) {
+        layersPopover.classList.add("hidden");
+      }
+    });
+  }
+
+  function bindLayerCheckbox(chkId, getLayer) {
+    const chk = document.getElementById(chkId);
+    if (!chk) return;
+    chk.addEventListener("change", () => {
+      const layer = getLayer();
+      if (!layer || typeof map === "undefined" || !map) return;
+      if (chk.checked) {
+        if (!map.hasLayer(layer)) map.addLayer(layer);
+      } else {
+        if (map.hasLayer(layer)) map.removeLayer(layer);
+      }
+    });
+  }
+
+  bindLayerCheckbox("chk-layer-nodes", () => state.nodeLayerGroup);
+  bindLayerCheckbox("chk-layer-uav", () => state.uavMarker);
+  bindLayerCheckbox("chk-layer-mission", () => state.missionRoute);
+  bindLayerCheckbox("chk-layer-rfscan", () => state.rfScanLayer);
+  bindLayerCheckbox("chk-layer-rfheatmap", () => state.rfHeatmapLayer);
+  bindLayerCheckbox("chk-layer-candidates", () => state.rfCandidateLayer || state.candidateLayer);
+
+  // -------------------------------------------------------------------------
+  // Log drawer toggle & Clear
+  // -------------------------------------------------------------------------
+  const logToggle = document.getElementById("log-drawer-toggle");
+  const logBody   = document.getElementById("log-body");
+  const logChevron = document.getElementById("log-chevron");
+
+  if (logToggle && logBody) {
+    logToggle.addEventListener("click", () => {
+      const open = logBody.hidden === false;
+      logBody.hidden = open;
+      logToggle.setAttribute("aria-expanded", String(!open));
+      if (typeof map !== "undefined" && map) {
+        setTimeout(() => map.invalidateSize(), 150);
+      }
+    });
+  }
+
+  const clearLogBtn = document.getElementById("btn-clear-log");
+  if (clearLogBtn) {
+    clearLogBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (logBody) logBody.innerHTML = "";
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // "GENERATE NODE MISSION" in DEPLOY tab -> switches to MISSION tab
+  // -------------------------------------------------------------------------
+  const deployToMissionBtn = document.getElementById("btn-deploy-to-mission");
+  if (deployToMissionBtn) {
+    deployToMissionBtn.addEventListener("click", () => {
+      const missionTab = document.getElementById("tab-mission");
+      if (missionTab) missionTab.click();
+      const genBtn = document.getElementById("btn-generate-mission");
+      if (genBtn && !genBtn.disabled) {
+        genBtn.click();
+      }
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Mission Flight Hero Sync
+  // -------------------------------------------------------------------------
+  function syncMissionFlightSummary() {
+    const badge = document.getElementById("mission-hero-badge");
+    const destEl = document.getElementById("mission-summary-dest");
+    const distEl = document.getElementById("mission-summary-dist");
+    const altEl = document.getElementById("mission-summary-alt");
+    const spdEl = document.getElementById("mission-summary-spd");
+    const wpEl = document.getElementById("mission-summary-wp");
+
+    const mStateEl = document.getElementById("stat-mission-state");
+    const currentState = (mStateEl ? mStateEl.textContent : state.missionState) || "PLANNING";
+    if (badge) {
+      badge.textContent = currentState;
+      if (currentState === "EXECUTING" || currentState === "FLYING") {
+        badge.style.color = "var(--green)";
+        badge.style.background = "var(--green-dim)";
+        badge.style.borderColor = "var(--green)";
+      } else if (currentState === "ABORTED" || currentState === "FAILED") {
+        badge.style.color = "var(--red)";
+        badge.style.background = "var(--red-dim)";
+        badge.style.borderColor = "var(--red)";
+      } else {
+        badge.style.color = "var(--amber)";
+        badge.style.background = "var(--amber-glow)";
+        badge.style.borderColor = "var(--amber-dim)";
+      }
+    }
+
+    const target = state.selectedTarget;
+    if (destEl) {
+      if (target && target.lat != null && target.lon != null) {
+        destEl.textContent = `${target.lat.toFixed(5)}, ${target.lon.toFixed(5)}`;
+      } else {
+        destEl.textContent = "None";
+      }
+    }
+
+    const v = state.vehicle || {};
+    if (altEl) {
+      const alt = v.relative_altitude != null ? v.relative_altitude : v.altitude;
+      altEl.textContent = alt != null ? `${alt.toFixed(1)} m` : "--";
+    }
+    if (spdEl) {
+      spdEl.textContent = v.ground_speed != null ? `${v.ground_speed.toFixed(1)} m/s` : "--";
+    }
+
+    if (distEl) {
+      if (target && v.latitude != null && v.longitude != null) {
+        const d = haversineDistanceM(v.latitude, v.longitude, target.lat, target.lon);
+        distEl.textContent = d >= 1000 ? `${(d / 1000).toFixed(2)} km` : `${d.toFixed(1)} m`;
+      } else {
+        distEl.textContent = "--";
+      }
+    }
+
+    if (wpEl) {
+      const curWp = v.mission_item_current != null ? v.mission_item_current : (v.mission_current != null ? v.mission_current : "--");
+      const totalWp = state.lastMissionItems || (state.lastMission ? state.lastMission.length : "--");
+      wpEl.textContent = `${curWp} / ${totalWp}`;
+    }
+  }
+  setInterval(syncMissionFlightSummary, 500);
+
+  // -------------------------------------------------------------------------
+  // Collapsible section toggles
+  // -------------------------------------------------------------------------
+  document.querySelectorAll(".cs-collapsible").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const targetId = btn.getAttribute("aria-controls");
+      const content  = document.getElementById(targetId);
+      if (!content) return;
+      const isOpen = !content.hidden;
+      content.hidden = isOpen;
+      btn.setAttribute("aria-expanded", String(!isOpen));
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // UTC clock
+  // -------------------------------------------------------------------------
+  function updateClock() {
+    const el = document.getElementById("topbar-clock");
+    if (el) el.textContent = new Date().toUTCString().slice(17, 25) + " UTC";
+  }
+  updateClock();
+  setInterval(updateClock, 1000);
+
+  // -------------------------------------------------------------------------
+  // Topbar telemetry chip sync — mirror tel-* values into header chips
+  // -------------------------------------------------------------------------
+  function syncTopbarChips() {
+    const v = state.vehicle;
+    if (!v) return;
+
+    const altEl  = document.getElementById("hdr-alt");
+    const spdEl  = document.getElementById("hdr-spd");
+    const batEl  = document.getElementById("hdr-bat");
+    const gpsEl  = document.getElementById("hdr-gps");
+
+    if (altEl) altEl.textContent = v.relative_altitude != null ? `${v.relative_altitude.toFixed(1)}m` : "--";
+    if (spdEl) spdEl.textContent = v.ground_speed      != null ? `${v.ground_speed.toFixed(1)}m/s` : "--";
+    if (batEl) batEl.textContent = v.battery            != null ? `${Math.round(v.battery)}%` : "--";
+    if (gpsEl) gpsEl.textContent = v.satellites         != null ? `${v.satellites}sat` : "--";
+
+    // Connection status pill
+    const connDot   = document.getElementById("status-conn-dot");
+    const connLabel = document.getElementById("status-conn-label");
+    const socketUp  = state.telemetrySocketOpen;
+    const fresh     = typeof isTelemetryFresh === "function" ? isTelemetryFresh() : true;
+    const connected = socketUp && fresh && v.connected;
+
+    if (connDot) {
+      connDot.className = "status-dot" + (connected ? " status-dot--ok" : (socketUp ? " status-dot--warn" : ""));
+    }
+    if (connLabel) {
+      connLabel.textContent = connected ? "CONNECTED" : (socketUp ? "LINKING…" : "DISCONNECTED");
+    }
+
+    // Armed pill
+    const armedDot   = document.getElementById("status-armed-dot");
+    const armedLabel = document.getElementById("status-armed-label");
+    if (armedDot) {
+      armedDot.className = "status-dot" + (v.armed ? " status-dot--danger status-dot--active" : " status-dot--warn");
+    }
+    if (armedLabel) armedLabel.textContent = v.armed ? "ARMED" : "DISARMED";
+
+    // Mission label in topbar
+    const missionLabel = document.getElementById("status-mission-label");
+    if (missionLabel) {
+      const mStateEl = document.getElementById("stat-mission-state");
+      if (mStateEl) missionLabel.textContent = mStateEl.textContent || "IDLE";
+    }
+  }
+
+  // Hook into telemetry by patching renderTelemetryPanel via interval
+  setInterval(syncTopbarChips, 500);
+
+  // -------------------------------------------------------------------------
+  // Alias: stat-state-rf mirrors stat-state (for RF tab draw state display)
+  // -------------------------------------------------------------------------
+  const statState   = document.getElementById("stat-state");       // hidden canonical
+  const statStateRf = document.getElementById("stat-state-rf");    // visible in RF tab
+
+  if (statState && statStateRf) {
+    const obs = new MutationObserver(() => {
+      statStateRf.textContent = statState.textContent;
+    });
+    obs.observe(statState, { childList: true, characterData: true, subtree: true });
+  }
+
+  // -------------------------------------------------------------------------
+  // Alias: stat-nodes-rf mirrors stat-nodes (for RF tab node count)
+  // -------------------------------------------------------------------------
+  const statNodes   = document.getElementById("stat-nodes");
+  const statNodesRf = document.getElementById("stat-nodes-rf");
+  if (statNodes && statNodesRf) {
+    const obs2 = new MutationObserver(() => {
+      statNodesRf.textContent = statNodes.textContent;
+    });
+    obs2.observe(statNodes, { childList: true, characterData: true, subtree: true });
+  }
+
+  // -------------------------------------------------------------------------
+  // Map fit button — fits map view to the affected area polygon
+  // -------------------------------------------------------------------------
+  const fitBtn = document.getElementById("btn-map-fit");
+  if (fitBtn) {
+    fitBtn.addEventListener("click", () => {
+      if (state.areaPolygon && typeof map !== "undefined" && map) {
+        try {
+          map.fitBounds(state.areaPolygon.getBounds(), { padding: [20, 20] });
+        } catch (e) { /* bounds not ready */ }
+      } else if (state.uavMarker) {
+        map.setView(state.uavMarker.getLatLng(), 16);
+      }
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // RF legend visibility — show when heatmap active
+  // -------------------------------------------------------------------------
+  function syncRfLegend() {
+    const legend = document.getElementById("rf-legend-overlay");
+    if (!legend) return;
+    const hasHeatmap = state.rfAnalysis && state.rfHeatmapVisible;
+    const hasHistorical = document.getElementById("history-viewer") &&
+                          !document.getElementById("history-viewer").classList.contains("hidden");
+    if (hasHeatmap || hasHistorical) {
+      legend.classList.remove("hidden");
+    } else {
+      legend.classList.add("hidden");
+    }
+  }
+  setInterval(syncRfLegend, 1000);
+
+  // -------------------------------------------------------------------------
+  // Area quick-stats overlay — show when area is defined
+  // -------------------------------------------------------------------------
+  function syncAreaStats() {
+    const overlay = document.getElementById("map-area-stats");
+    if (!overlay) return;
+    if (state.areaClosed || state.drawing) {
+      overlay.classList.remove("hidden");
+    } else {
+      overlay.classList.add("hidden");
+    }
+  }
+  setInterval(syncAreaStats, 500);
+
+  // -------------------------------------------------------------------------
+  // Nodes list — render compact node list in DEPLOY tab
+  // -------------------------------------------------------------------------
+  function renderNodesList() {
+    const listEl = document.getElementById("nodes-list");
+    const emptyEl = document.getElementById("nodes-empty-label");
+    if (!listEl) return;
+
+    if (!state.deployedNodes || state.deployedNodes.length === 0) {
+      listEl.innerHTML = "";
+      if (emptyEl) emptyEl.hidden = false;
+      return;
+    }
+
+    if (emptyEl) emptyEl.hidden = true;
+    listEl.innerHTML = state.deployedNodes.map(n => {
+      const isNew = state.newlyDeployedNodeId && n.id === state.newlyDeployedNodeId;
+      const lat = (n.lat != null ? n.lat : n.latitude) ?? 0;
+      const lon = (n.lon != null ? n.lon : n.longitude) ?? 0;
+      return `<div class="node-list-item" data-node-id="${n.id}" data-lat="${lat}" data-lon="${lon}" style="cursor:pointer" title="Click to pan to node">
+        <span class="node-list-id" style="${isNew ? "color:var(--cyan)" : ""}">${n.id}</span>
+        <span class="node-list-badge" style="${isNew ? "color:var(--cyan);background:var(--cyan-dim);border-color:var(--cyan)" : ""}">
+          ${isNew ? "NEW" : "ACTIVE"}
+        </span>
+      </div>`;
+    }).join("");
+
+    listEl.querySelectorAll(".node-list-item").forEach(item => {
+      item.addEventListener("click", () => {
+        const nodeId = item.getAttribute("data-node-id");
+        const lat = parseFloat(item.getAttribute("data-lat"));
+        const lon = parseFloat(item.getAttribute("data-lon"));
+        if (typeof map !== "undefined" && map && !isNaN(lat) && !isNaN(lon)) {
+          map.setView([lat, lon], 17);
+        }
+        const delSelect = document.getElementById("select-delete-node");
+        const delBtn = document.getElementById("btn-delete-node");
+        if (delSelect && nodeId) {
+          delSelect.value = nodeId;
+          if (delBtn) delBtn.disabled = false;
+        }
+      });
+    });
+  }
+  setInterval(renderNodesList, 1000);
+
+  // -------------------------------------------------------------------------
+  // History list — compact survey list in HISTORY tab with direct VIEW action
+  // -------------------------------------------------------------------------
+  function renderHistoryList() {
+    const listEl  = document.getElementById("history-list");
+    const emptyEl = document.getElementById("history-empty-label");
+    if (!listEl) return;
+
+    const surveys = state.surveyHistory || [];
+    if (surveys.length === 0) {
+      listEl.innerHTML = "";
+      if (emptyEl) emptyEl.style.display = "";
+      return;
+    }
+
+    if (emptyEl) emptyEl.style.display = "none";
+
+    listEl.innerHTML = surveys.map((s, idx) => {
+      const label = s.label || (idx === 0 ? "BEFORE" : "AFTER");
+      const time  = s.timestamp ? new Date(s.timestamp * 1000).toLocaleTimeString() : "--";
+      return `<div class="history-item">
+        <span class="history-item-id">${String(idx + 1).padStart(3, "0")}</span>
+        <div class="history-item-info">
+          <div class="history-item-label">${label} · ${s.id || ("SURVEY-" + (idx + 1))}</div>
+          <div class="history-item-meta">${s.node_count || 0} nodes · ${s.survey_samples || 0} samples · ${time}</div>
+        </div>
+        <button class="btn-hist-view" data-survey-id="${s.id || ''}">VIEW</button>
+      </div>`;
+    }).join("");
+
+    listEl.querySelectorAll(".btn-hist-view").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const surveyId = btn.getAttribute("data-survey-id");
+        if (!surveyId) return;
+        try {
+          const data = await apiGet(`/api/rf-survey/history/${surveyId}`);
+          if (data && !data.error) {
+            window.openHistoricalViewer(data);
+          }
+        } catch (err) {
+          logEvent(`History view failed: ${err.message}`);
+        }
+      });
+    });
+  }
+  setInterval(renderHistoryList, 2000);
+
+  // -------------------------------------------------------------------------
+  // Historical survey VIEWER (full-screen overlay)
+  // -------------------------------------------------------------------------
+  const histViewer = document.getElementById("history-viewer");
+  const closeBtn   = document.getElementById("btn-close-history-viewer");
+
+  if (closeBtn && histViewer) {
+    closeBtn.addEventListener("click", () => {
+      histViewer.classList.add("hidden");
+      syncRfLegend();
+      // Clean up any historical Leaflet maps
+      if (window._histMapA) {
+        window._histMapA.remove();
+        window._histMapA = null;
+      }
+      if (window._histMapB) {
+        window._histMapB.remove();
+        window._histMapB = null;
+      }
+    });
+  }
+
+  /**
+   * openHistoricalViewer — opens the full-screen side-by-side historical view.
+   * Accepts one or two survey data objects.
+   */
+  window.openHistoricalViewer = function(surveyA, surveyB) {
+    if (!histViewer) return;
+
+    const titleEl = document.getElementById("hist-viewer-title");
+    const bodyEl  = document.getElementById("hist-viewer-body");
+
+    // Clean previous maps
+    if (window._histMapA) { try { window._histMapA.remove(); } catch(e){} window._histMapA = null; }
+    if (window._histMapB) { try { window._histMapB.remove(); } catch(e){} window._histMapB = null; }
+
+    const surveys = surveyB ? [surveyA, surveyB] : [surveyA];
+    const tags    = surveyB ? ["BEFORE", "AFTER"] : [surveyA.label || "SURVEY"];
+
+    if (titleEl) {
+      titleEl.textContent = surveyB
+        ? `SIDE-BY-SIDE: ${surveyA.id || "A"} · ${surveyB.id || "B"}`
+        : `HISTORICAL VIEW: ${surveyA.id || "SURVEY"}`;
+    }
+
+    bodyEl.style.gridTemplateColumns = surveys.length === 2 ? "1fr 1fr" : "1fr";
+    bodyEl.innerHTML = "";
+
+    surveys.forEach((s, idx) => {
+      const stats = s.coverage_statistics || {};
+      const paneId = `hist-map-container-${idx}`;
+      const tagClass = tags[idx] === "BEFORE" ? "hist-map-tag--before" : "hist-map-tag--after";
+
+      const pane = document.createElement("div");
+      pane.className = "hist-map-pane";
+      pane.innerHTML = `
+        <div class="hist-map-header">
+          <span class="hist-map-survey-id">${s.id || ("SURVEY " + (idx + 1))}</span>
+          <span class="hist-map-tag ${tagClass}">${tags[idx]}</span>
+        </div>
+        <div class="hist-map-container" id="${paneId}"></div>
+        <div class="hist-map-stats">
+          <div class="hist-stat"><div class="hist-stat-label">NODES</div><div class="hist-stat-val">${s.node_count || 0}</div></div>
+          <div class="hist-stat"><div class="hist-stat-label">SAMPLES</div><div class="hist-stat-val">${s.survey_samples || 0}</div></div>
+          <div class="hist-stat" style="color:var(--rf-good)"><div class="hist-stat-label">GOOD</div><div class="hist-stat-val">${stats.good_pct != null ? stats.good_pct.toFixed(1) + "%" : "--"}</div></div>
+          <div class="hist-stat" style="color:var(--rf-mod)"><div class="hist-stat-label">MOD</div><div class="hist-stat-val">${stats.moderate_pct != null ? stats.moderate_pct.toFixed(1) + "%" : "--"}</div></div>
+          <div class="hist-stat" style="color:var(--rf-weak)"><div class="hist-stat-label">WEAK</div><div class="hist-stat-val">${stats.weak_pct != null ? stats.weak_pct.toFixed(1) + "%" : "--"}</div></div>
+          <div class="hist-stat" style="color:var(--rf-gap)"><div class="hist-stat-label">GAP</div><div class="hist-stat-val">${stats.gap_pct != null ? stats.gap_pct.toFixed(1) + "%" : "--"}</div></div>
+        </div>
+      `;
+      bodyEl.appendChild(pane);
+    });
+
+    histViewer.classList.remove("hidden");
+
+    // Initialize Leaflet maps after DOM is in place
+    requestAnimationFrame(() => {
+      const RF_STATUS_COLOR = {
+        GOOD:       "#3BDB7A",
+        MODERATE:   "#F5A623",
+        WEAK:       "#FF8C00",
+        GAP:        "#FF4D4D",
+        UNMEASURED: "#3D4A5A",
+      };
+
+      const center = surveys[0].heatmap && surveys[0].heatmap[0]
+        ? [surveys[0].heatmap[0].latitude, surveys[0].heatmap[0].longitude]
+        : [FALLBACK_CENTER.lat, FALLBACK_CENTER.lon];
+
+      const mapKeys = ["_histMapA", "_histMapB"];
+
+      surveys.forEach((s, idx) => {
+        const containerId = `hist-map-container-${idx}`;
+        const container = document.getElementById(containerId);
+        if (!container) return;
+
+        const m = L.map(container, { zoomControl: idx === 0, attributionControl: false })
+                   .setView(center, 16);
+
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          maxZoom: 19,
+          attribution: "© OSM",
+        }).addTo(m);
+
+        const heatmapLayer = L.layerGroup().addTo(m);
+        const renderer = L.canvas({ padding: 0.3 });
+
+        if (Array.isArray(s.heatmap)) {
+          s.heatmap.forEach((pt) => {
+            const color = RF_STATUS_COLOR[pt.status] || RF_STATUS_COLOR.UNMEASURED;
+            L.circleMarker([pt.latitude, pt.longitude], {
+              renderer,
+              radius: 5,
+              color,
+              fillColor: color,
+              fillOpacity: 0.6,
+              weight: 0,
+            }).addTo(heatmapLayer);
+          });
+        }
+
+        // Render historical nodes
+        if (Array.isArray(s.nodes)) {
+          s.nodes.forEach((n) => {
+            const lat = n.lat ?? n.latitude;
+            const lon = n.lon ?? n.longitude;
+            if (lat == null || lon == null) return;
+            L.circleMarker([lat, lon], {
+              radius: 7, color: "#3BDB7A", fillColor: "#3BDB7A",
+              fillOpacity: 0.9, weight: 2,
+            }).bindTooltip(n.id, { permanent: true, direction: "top",
+              offset: [0, -8], className: "node-label" }).addTo(m);
+          });
+        }
+
+        window[mapKeys[idx]] = m;
+
+        // Sync zoom between two maps
+        if (idx === 1 && window._histMapA) {
+          window._histMapA.on("moveend", () => {
+            if (window._histMapB) {
+              window._histMapB.setView(window._histMapA.getCenter(), window._histMapA.getZoom(), { animate: false });
+            }
+          });
+          window._histMapB.on("moveend", () => {
+            if (window._histMapA) {
+              window._histMapA.setView(window._histMapB.getCenter(), window._histMapB.getZoom(), { animate: false });
+            }
+          });
+        }
+
+        // Fit bounds
+        if (heatmapLayer.getLayers().length > 0) {
+          try {
+            const group = L.featureGroup(heatmapLayer.getLayers());
+            m.fitBounds(group.getBounds(), { padding: [10, 10] });
+            if (idx === 0 && surveys.length === 2 && window._histMapB) {
+              window._histMapB.setView(m.getCenter(), m.getZoom(), { animate: false });
+            }
+          } catch(e) { /* bounds not ready */ }
+        }
+
+        m.invalidateSize();
+      });
+    });
+
+    syncRfLegend();
+  };
+
+  // -------------------------------------------------------------------------
+  // Patch existing "View Historical Heatmap" button to use new viewer
+  // -------------------------------------------------------------------------
+  const viewHistBtn = document.getElementById("btn-view-history-survey");
+  if (viewHistBtn) {
+    // Remove old handler and add new one
+    const oldBtn = viewHistBtn.cloneNode(true);
+    viewHistBtn.parentNode.replaceChild(oldBtn, viewHistBtn);
+    oldBtn.addEventListener("click", async () => {
+      const sel = document.getElementById("select-history-survey");
+      if (!sel || !sel.value) return;
+      try {
+        const data = await apiGet(`/api/rf-survey/history/${sel.value}`);
+        if (data && !data.error) {
+          window.openHistoricalViewer(data);
+        }
+      } catch (err) {
+        logEvent(`History view failed: ${err.message}`);
+      }
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Patch existing "Compare Surveys A & B" button to use new viewer
+  // -------------------------------------------------------------------------
+  const compareBtn = document.getElementById("btn-run-history-compare");
+  if (compareBtn) {
+    const oldCompare = compareBtn.cloneNode(true);
+    compareBtn.parentNode.replaceChild(oldCompare, compareBtn);
+    oldCompare.addEventListener("click", async () => {
+      const selA = document.getElementById("select-compare-a");
+      const selB = document.getElementById("select-compare-b");
+      if (!selA || !selB || !selA.value || !selB.value) return;
+      try {
+        const [dataA, dataB] = await Promise.all([
+          apiGet(`/api/rf-survey/history/${selA.value}`),
+          apiGet(`/api/rf-survey/history/${selB.value}`),
+        ]);
+        if (dataA && dataB && !dataA.error && !dataB.error) {
+          window.openHistoricalViewer(dataA, dataB);
+        }
+      } catch (err) {
+        logEvent(`History compare failed: ${err.message}`);
+      }
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // RF scan live section visibility
+  // -------------------------------------------------------------------------
+  function syncRfScanLive() {
+    const liveEl = document.getElementById("rf-scan-live");
+    if (!liveEl) return;
+    const scanning = state.rfScanState === "RUNNING";
+    if (scanning) {
+      liveEl.classList.remove("hidden");
+    } else {
+      liveEl.classList.add("hidden");
+    }
+    const scanLabel = document.getElementById("scan-state-label");
+    if (scanLabel) scanLabel.textContent = state.rfScanState || "IDLE";
+
+    // Live position
+    const posEl = document.getElementById("scan-progress-pos");
+    const v = state.vehicle;
+    if (posEl) {
+      if (v && v.latitude != null && v.longitude != null) {
+        posEl.textContent = `UAV: ${v.latitude.toFixed(5)}, ${v.longitude.toFixed(5)}`;
+      } else {
+        posEl.textContent = "UAV: --, --";
+      }
+    }
+
+    // Progress percentage
+    const bar = document.getElementById("scan-progress-bar");
+    const pctEl = document.getElementById("scan-progress-pct");
+    const totalWp = state.rfScanMission ? state.rfScanMission.waypoint_count : 0;
+    const curWp = v ? (v.mission_item_current || 0) : 0;
+    if (totalWp > 0 && curWp > 0) {
+      const pct = Math.min(100, Math.round((curWp / totalWp) * 100));
+      if (bar) bar.style.width = pct + "%";
+      if (pctEl) pctEl.textContent = pct + "%";
+    }
+  }
+  setInterval(syncRfScanLive, 500);
+
+})();
