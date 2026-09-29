@@ -1232,3 +1232,373 @@ class TestPhase6TwoDeploymentMechanisms(unittest.TestCase):
             self.assertIn("aborted", rel.json()["detail"].lower())
             self.assertEqual(len(list_nodes()), 0)
 
+
+class TestPhase6BugFixHistoricalAndReleaseInterlock(unittest.TestCase):
+    """
+    Dedicated regression test suite for Phase 6 Bug Fix:
+      1. Historical Heatmap coordinates & validation.
+      2. Historical Survey Percentages (measured = good + mod + weak + gap).
+      3. Comparison API contract (survey_a, survey_b, delta with pp).
+      4. Historical data read-only safety.
+      5. Release landing interlock (telemetry-based, normalized altitude, negative altitude safe).
+      6. AUTO DEPLOY remains independent.
+    """
+
+    def setUp(self):
+        clear_nodes()
+        init_db()
+        self.client = TestClient(app)
+        self.collector = get_rf_collector()
+        self.collector.reset()
+        session_state.clear()
+        session_state["mission_state"] = "IDLE"
+        session_state["deployment_released"] = False
+        session_state["polygon"] = [
+            {"lat": 12.9710, "lon": 77.5940},
+            {"lat": 12.9730, "lon": 77.5940},
+            {"lat": 12.9730, "lon": 77.5960},
+            {"lat": 12.9710, "lon": 77.5960},
+        ]
+        session_state["rf_survey_history"] = []
+        session_state["rf_survey_history_counter"] = 0
+
+    def tearDown(self):
+        clear_nodes()
+        self.collector.reset()
+        session_state.clear()
+
+    def test_historical_survey_contains_valid_lat_lon_coordinates(self):
+        """Bug 1A: Historical survey contains valid lat/lon coordinates."""
+        samples = [
+            {"latitude": 12.9715, "longitude": 77.5945, "best_rssi": -55.0},
+            {"latitude": 12.9725, "longitude": 77.5955, "best_rssi": -90.0},
+        ]
+        self.collector._samples = samples
+        self.collector._state = SCAN_STATE_COMPLETE
+        res = self.client.post("/api/rf-survey/analyze")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        survey_id = data["survey_id"]
+
+        hist_res = self.client.get(f"/api/rf-survey/history/{survey_id}")
+        self.assertEqual(hist_res.status_code, 200)
+        hist = hist_res.json()
+
+        # Both lat/lon and latitude/longitude must be present and finite floats
+        self.assertGreater(len(hist["heatmap"]), 0)
+        for pt in hist["heatmap"]:
+            self.assertIn("lat", pt)
+            self.assertIn("lon", pt)
+            self.assertIn("latitude", pt)
+            self.assertIn("longitude", pt)
+            self.assertIsInstance(pt["lat"], (int, float))
+            self.assertIsInstance(pt["lon"], (int, float))
+            self.assertTrue(math.isfinite(pt["lat"]))
+            self.assertTrue(math.isfinite(pt["lon"]))
+
+        self.assertGreater(len(hist["gaps"]["gap_points"]), 0)
+        for gp in hist["gaps"]["gap_points"]:
+            self.assertIn("lat", gp)
+            self.assertIn("lon", gp)
+            self.assertTrue(math.isfinite(gp["lat"]))
+            self.assertTrue(math.isfinite(gp["lon"]))
+
+    def test_coverage_percentages_nonzero_and_sum_to_100_percent(self):
+        """Bug 1B: Coverage percentages are non-zero when classified points exist,
+        and good + moderate + weak + gap sum to approx 100%."""
+        samples = []
+        # 100 GOOD
+        for _ in range(100):
+            samples.append({"latitude": 12.9715, "longitude": 77.5945, "best_rssi": -55.0})
+        # 150 MODERATE
+        for _ in range(150):
+            samples.append({"latitude": 12.9716, "longitude": 77.5946, "best_rssi": -70.0})
+        # 100 WEAK
+        for _ in range(100):
+            samples.append({"latitude": 12.9717, "longitude": 77.5947, "best_rssi": -80.0})
+        # 217 GAP (total 567 samples)
+        for _ in range(217):
+            samples.append({"latitude": 12.9725, "longitude": 77.5955, "best_rssi": -92.0})
+
+        self.collector._samples = samples
+        self.collector._state = SCAN_STATE_COMPLETE
+        res = self.client.post("/api/rf-survey/analyze")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+
+        stats = data["coverage_percentages"]
+        good_pct = stats["good_percentage"]
+        mod_pct = stats["moderate_percentage"]
+        weak_pct = stats["weak_percentage"]
+        gap_pct = stats["gap_percentage"]
+
+        self.assertGreater(good_pct, 0.0)
+        self.assertGreater(mod_pct, 0.0)
+        self.assertGreater(weak_pct, 0.0)
+        self.assertGreater(gap_pct, 0.0)
+
+        total_pct = good_pct + mod_pct + weak_pct + gap_pct
+        self.assertAlmostEqual(total_pct, 100.0, delta=0.5)
+
+        # Check expected percentages: 217 / 567 * 100 = 38.3%
+        self.assertAlmostEqual(gap_pct, round(217 / 567 * 100, 1), places=1)
+
+        # Verify history record preserves these exact values
+        hist = self.client.get(f"/api/rf-survey/history/{data['survey_id']}").json()
+        h_stats = hist["coverage_statistics"]
+        self.assertEqual(h_stats["good_percentage"], good_pct)
+        self.assertEqual(h_stats["gap_percentage"], gap_pct)
+
+    def test_comparison_api_canonical_response_structure_and_percentage_points(self):
+        """Bug 1C: POST /api/rf-survey/history/compare returns canonical structure with delta in percentage points."""
+        # Survey 1: 50 GOOD, 50 GAP
+        samples_1 = [
+            {"latitude": 12.9715, "longitude": 77.5945, "best_rssi": -55.0} for _ in range(50)
+        ] + [
+            {"latitude": 12.9725, "longitude": 77.5955, "best_rssi": -92.0} for _ in range(50)
+        ]
+        self.collector._samples = samples_1
+        self.collector._state = SCAN_STATE_COMPLETE
+        res1 = self.client.post("/api/rf-survey/analyze")
+        id_1 = res1.json()["survey_id"]
+
+        # Deploy a node
+        insert_node("COMM-001", lat=12.9725, lon=77.5955, coverage_radius_m=250.0)
+
+        # Survey 2: 80 GOOD, 20 GAP
+        samples_2 = [
+            {"latitude": 12.9715, "longitude": 77.5945, "best_rssi": -55.0} for _ in range(80)
+        ] + [
+            {"latitude": 12.9725, "longitude": 77.5955, "best_rssi": -92.0} for _ in range(20)
+        ]
+        self.collector._samples = samples_2
+        self.collector._state = SCAN_STATE_COMPLETE
+        res2 = self.client.post("/api/rf-survey/analyze")
+        id_2 = res2.json()["survey_id"]
+
+        comp_res = self.client.post("/api/rf-survey/history/compare", json={
+            "survey_id_1": id_1,
+            "survey_id_2": id_2,
+        })
+        self.assertEqual(comp_res.status_code, 200)
+        comp = comp_res.json()
+
+        # Check canonical response fields
+        self.assertIn("survey_a", comp)
+        self.assertIn("survey_b", comp)
+        self.assertIn("delta", comp)
+
+        s_a = comp["survey_a"]
+        s_b = comp["survey_b"]
+        delta = comp["delta"]
+
+        self.assertEqual(s_a["survey_id"], id_1)
+        self.assertEqual(s_a["sample_count"], 100)
+        self.assertEqual(s_a["good_percentage"], 50.0)
+        self.assertEqual(s_a["gap_percentage"], 50.0)
+        self.assertEqual(s_a["gap_count"], 50)
+
+        self.assertEqual(s_b["survey_id"], id_2)
+        self.assertEqual(s_b["sample_count"], 100)
+        self.assertEqual(s_b["good_percentage"], 80.0)
+        self.assertEqual(s_b["gap_percentage"], 20.0)
+        self.assertEqual(s_b["gap_count"], 20)
+
+        # Delta must use percentage points (pp), not ratio
+        self.assertEqual(delta["good_percentage_pp"], 30.0)  # 80.0 - 50.0 = +30.0 pp
+        self.assertEqual(delta["gap_percentage_pp"], -30.0)  # 20.0 - 50.0 = -30.0 pp
+        self.assertEqual(delta["gap_count"], -30)
+
+    def test_historical_survey_remains_read_only(self):
+        """Bug 1D: Viewing historical survey does not alter system state."""
+        samples = [{"latitude": 12.9715, "longitude": 77.5945, "best_rssi": -55.0}]
+        self.collector._samples = samples
+        self.collector._state = SCAN_STATE_COMPLETE
+        res = self.client.post("/api/rf-survey/analyze")
+        survey_id = res.json()["survey_id"]
+
+        session_state["rf_phase6_state"] = "BEFORE_ANALYZED"
+        session_state["selected_target"] = {"lat": 12.9720, "lon": 77.5950}
+        nodes_before = list_nodes()
+
+        # View historical survey
+        view_res = self.client.get(f"/api/rf-survey/history/{survey_id}")
+        self.assertEqual(view_res.status_code, 200)
+
+        # Ensure state is completely unchanged
+        self.assertEqual(session_state["rf_phase6_state"], "BEFORE_ANALYZED")
+        self.assertEqual(session_state["selected_target"], {"lat": 12.9720, "lon": 77.5950})
+        self.assertEqual(list_nodes(), nodes_before)
+
+    def test_regression_release_with_negative_altitude_and_executing_mission(self):
+        """Bug 2 Exact Live Reproduction:
+        in_air = false
+        altitude = -0.013
+        mission_state = 'EXECUTING'
+        vehicle at candidate coordinates
+        deployment destination reached
+        Expected: can_release = true, release succeeds and creates exactly one node.
+        """
+        cand_lat = 12.9725
+        cand_lon = 77.5955
+        self.client.post("/api/select-target", json={"lat": cand_lat, "lon": cand_lon})
+        session_state["mission_state"] = "EXECUTING"
+
+        # PX4 SITL telemetry with small numerical negative altitude
+        sitl_telemetry = {
+            "connected": True,
+            "in_air": False,
+            "landed_state": "ON_GROUND",
+            "latitude": cand_lat,
+            "longitude": cand_lon,
+            "altitude": -0.013,
+            "relative_altitude": -0.013,
+            "flight_mode": "AUTO_MISSION",
+            "armed": True,
+            "mission_item_reached": 5,
+        }
+
+        with patch.object(mav_manager, "get_vehicle_state", return_value=sitl_telemetry), \
+             patch.object(mav_manager, "is_connected", return_value=True), \
+             patch.object(mav_manager, "get_mission_upload_state", return_value={"items": 6, "status": "UPLOADED"}):
+
+            status_res = self.client.get("/api/deployment/status")
+            self.assertEqual(status_res.status_code, 200)
+            status = status_res.json()
+            self.assertTrue(status["can_release"], f"Expected can_release=True, got reason: {status.get('reason')}")
+            self.assertFalse(status["is_airborne"])
+            self.assertTrue(status["is_landed"])
+            self.assertTrue(status["within_tolerance"])
+
+            # POST /api/deployment/release must succeed
+            rel_res = self.client.post("/api/deployment/release")
+            self.assertEqual(rel_res.status_code, 200)
+            node = rel_res.json()
+            self.assertEqual(node["lat"], cand_lat)
+            self.assertEqual(node["lon"], cand_lon)
+            self.assertEqual(len(list_nodes()), 1)
+
+    def test_regression_release_disabled_when_genuinely_airborne(self):
+        """Bug 2E: Genuine airborne conditions must keep RELEASE disabled."""
+        cand_lat = 12.9725
+        cand_lon = 77.5955
+        self.client.post("/api/select-target", json={"lat": cand_lat, "lon": cand_lon})
+        session_state["mission_state"] = "EXECUTING"
+
+        # Case 1: in_air=True, altitude=15m
+        airborne_high = {
+            "connected": True,
+            "in_air": True,
+            "landed_state": "IN_AIR",
+            "latitude": cand_lat,
+            "longitude": cand_lon,
+            "altitude": 15.0,
+            "relative_altitude": 15.0,
+            "flight_mode": "AUTO_MISSION",
+            "armed": True,
+            "mission_item_reached": 3,
+        }
+        with patch.object(mav_manager, "get_vehicle_state", return_value=airborne_high), \
+             patch.object(mav_manager, "is_connected", return_value=True):
+            status = self.client.get("/api/deployment/status").json()
+            self.assertFalse(status["can_release"])
+            self.assertTrue(status["is_airborne"])
+            self.assertIn("airborne", status["reason"].lower())
+
+            rel = self.client.post("/api/deployment/release")
+            self.assertEqual(rel.status_code, 400)
+            self.assertIn("airborne", rel.json()["detail"].lower())
+
+        # Case 2: in_air=True, altitude=0.5m (hovering near ground)
+        airborne_low = {
+            "connected": True,
+            "in_air": True,
+            "landed_state": "LANDING",
+            "latitude": cand_lat,
+            "longitude": cand_lon,
+            "altitude": 0.5,
+            "relative_altitude": 0.5,
+            "flight_mode": "AUTO_LAND",
+            "armed": True,
+            "mission_item_reached": 5,
+        }
+        with patch.object(mav_manager, "get_vehicle_state", return_value=airborne_low), \
+             patch.object(mav_manager, "is_connected", return_value=True):
+            status = self.client.get("/api/deployment/status").json()
+            self.assertFalse(status["can_release"])
+            self.assertTrue(status["is_airborne"])
+
+        # Case 3: in_air=False, altitude=8m (telemetry lag or false flag while flying)
+        airborne_altitude_override = {
+            "connected": True,
+            "in_air": False,
+            "landed_state": "ON_GROUND",
+            "latitude": cand_lat,
+            "longitude": cand_lon,
+            "altitude": 8.0,
+            "relative_altitude": 8.0,
+            "flight_mode": "AUTO_MISSION",
+            "armed": True,
+            "mission_item_reached": 4,
+        }
+        with patch.object(mav_manager, "get_vehicle_state", return_value=airborne_altitude_override), \
+             patch.object(mav_manager, "is_connected", return_value=True):
+            status = self.client.get("/api/deployment/status").json()
+            self.assertFalse(status["can_release"])
+            self.assertTrue(status["is_airborne"])
+
+    def test_regression_release_off_target_reason_is_off_target_not_airborne(self):
+        """Bug 2 Section 4:
+        in_air = false, altitude = 0, mission_state = 'EXECUTING', distance = 25m
+        Expected: can_release = false. Reason must be OFF_TARGET, not AIRBORNE.
+        """
+        cand_lat = 12.9725
+        cand_lon = 77.5955
+        self.client.post("/api/select-target", json={"lat": cand_lat, "lon": cand_lon})
+        session_state["mission_state"] = "EXECUTING"
+
+        # 25m offset (approx 0.000225 deg latitude)
+        off_target_state = {
+            "connected": True,
+            "in_air": False,
+            "landed_state": "ON_GROUND",
+            "latitude": cand_lat + 0.00025,  # ~27.8m away
+            "longitude": cand_lon,
+            "altitude": 0.0,
+            "relative_altitude": 0.0,
+            "flight_mode": "AUTO_LAND",
+            "armed": True,
+            "mission_item_reached": 5,
+        }
+
+        with patch.object(mav_manager, "get_vehicle_state", return_value=off_target_state), \
+             patch.object(mav_manager, "is_connected", return_value=True):
+            status = self.client.get("/api/deployment/status").json()
+            self.assertFalse(status["can_release"])
+            self.assertFalse(status["is_airborne"])
+            self.assertTrue(status["is_landed"])
+            self.assertFalse(status["within_tolerance"])
+            self.assertIn("off-target", status["reason"].lower())
+            self.assertNotIn("airborne", status["reason"].lower())
+
+            rel = self.client.post("/api/deployment/release")
+            self.assertEqual(rel.status_code, 400)
+            self.assertIn("off-target", rel.json()["detail"].lower())
+            self.assertNotIn("airborne", rel.json()["detail"].lower())
+
+    def test_auto_deploy_remains_independent_of_mission_and_release(self):
+        """Section 3: AUTO DEPLOY must create node immediately without mission or release."""
+        node_req = {
+            "id": "COMM-001",
+            "lat": 12.9720,
+            "lon": 77.5950,
+            "coverage_radius_m": 250.0,
+        }
+        res = self.client.post("/api/nodes", json=node_req)
+        self.assertEqual(res.status_code, 200)
+        node = res.json()
+        self.assertEqual(node["id"], "COMM-001")
+        self.assertEqual(node["lat"], 12.9720)
+        self.assertEqual(node["lon"], 77.5950)
+        self.assertEqual(len(list_nodes()), 1)
+

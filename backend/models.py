@@ -49,6 +49,9 @@ class VehicleStateOut(BaseModel):
     # Phase 8 — mission progress (None when no mission is executing)
     mission_current: Optional[int] = None
     mission_item_reached: Optional[int] = None
+    # Physical landing telemetry (EXTENDED_SYS_STATE)
+    in_air: Optional[bool] = None
+    landed_state: Optional[str] = None
 
 
 class TelemetryMessage(BaseModel):

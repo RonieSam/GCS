@@ -625,9 +625,22 @@ function updateReleaseInterlockButton() {
   }
 
   if (v && v.connected) {
-    const relAlt = v.relative_altitude;
-    const isAirborne = (relAlt != null && relAlt > 0.3) || state.missionExecuting;
-    const isLanded = (relAlt != null && relAlt <= 0.3) && !isAirborne;
+    const rawAlt = v.relative_altitude != null ? v.relative_altitude : v.altitude;
+    const normAlt = rawAlt != null ? Math.max(0, rawAlt) : 0;
+    const inAir = v.in_air != null ? v.in_air : (v.landed_state ? v.landed_state !== "ON_GROUND" : null);
+
+    let isAirborne = false;
+    if (inAir === true) {
+      isAirborne = true;
+    } else if (inAir === false) {
+      isAirborne = normAlt > 1.0;
+    } else if (v.landed_state) {
+      isAirborne = v.landed_state === "ON_GROUND" ? normAlt > 1.0 : true;
+    } else {
+      isAirborne = normAlt > 1.0;
+    }
+
+    const isLanded = !isAirborne && normAlt <= 1.0;
 
     const targetLat = target.latitude != null ? target.latitude : target.lat;
     const targetLon = target.longitude != null ? target.longitude : target.lon;
@@ -639,15 +652,17 @@ function updateReleaseInterlockButton() {
       withinTolerance = distM <= 10.0; // 10 metre tolerance
     }
 
+    const destinationReached = withinTolerance || state.missionCompleted || (!state.missionExecuting && state.lastMissionItems > 0);
+
     if (isAirborne) {
       releaseBtn.disabled = true;
       releaseBtn.classList.remove("ready");
-      const altStr = relAlt != null ? `${relAlt.toFixed(1)}m` : "airborne";
+      const altStr = rawAlt != null ? `${rawAlt.toFixed(1)}m` : "airborne";
       if (interlockEl) interlockEl.textContent = `AIRBORNE - RELEASE DISABLED (alt ${altStr}).`;
-    } else if (state.missionExecuting) {
+    } else if (!destinationReached) {
       releaseBtn.disabled = true;
       releaseBtn.classList.remove("ready");
-      if (interlockEl) interlockEl.textContent = "FLYING TO DESTINATION - RELEASE DISABLED.";
+      if (interlockEl) interlockEl.textContent = "EN ROUTE TO DESTINATION - RELEASE DISABLED.";
     } else if (!isLanded) {
       releaseBtn.disabled = true;
       releaseBtn.classList.remove("ready");
@@ -2934,12 +2949,26 @@ async function viewHistoricalSurvey(surveyId) {
     // Render historical heatmap
     if (s.heatmap && s.heatmap.length > 0) {
       s.heatmap.forEach((cell) => {
+        const lat = cell.lat != null ? cell.lat : cell.latitude;
+        const lon = cell.lon != null ? cell.lon : (cell.lng != null ? cell.lng : cell.longitude);
+
+        // Validation guard: do not allow [undefined, undefined] to reach Leaflet
+        if (
+          typeof lat !== "number" ||
+          typeof lon !== "number" ||
+          !Number.isFinite(lat) ||
+          !Number.isFinite(lon)
+        ) {
+          console.warn("Skipping historical point with invalid coordinates", cell);
+          return;
+        }
+
         let color = "#3FDA7F";
         if (cell.status === "MODERATE") color = "#F5A623";
         else if (cell.status === "WEAK") color = "#FF9500";
         else if (cell.status === "GAP") color = "#FF5C5C";
 
-        const marker = L.circleMarker([cell.lat, cell.lon], {
+        const marker = L.circleMarker([lat, lon], {
           radius: 6,
           color: color,
           fillColor: color,
@@ -2947,11 +2976,14 @@ async function viewHistoricalSurvey(surveyId) {
           weight: 1.5,
         }).addTo(state.rfHistoricalLayer);
 
+        const rssiVal = cell.rssi != null ? cell.rssi : (cell.best_rssi != null ? cell.best_rssi : null);
+        const rssiStr = rssiVal != null && Number.isFinite(rssiVal) ? `${rssiVal.toFixed(1)} dBm` : "--";
+
         marker.bindTooltip(
           `<div style="font-family:var(--font-data); font-size:11px;">
             <strong>${surveyId} (HISTORICAL)</strong><br>
-            RSSI: ${cell.rssi != null ? cell.rssi.toFixed(1) : "--"} dBm (${cell.status})<br>
-            Lat: ${cell.lat.toFixed(5)}, Lon: ${cell.lon.toFixed(5)}
+            RSSI: ${rssiStr} (${cell.status || "--"})<br>
+            Lat: ${lat.toFixed(5)}, Lon: ${lon.toFixed(5)}
           </div>`,
           { direction: "top", offset: [0, -4] }
         );
@@ -2961,14 +2993,27 @@ async function viewHistoricalSurvey(surveyId) {
     // Render historical gap points
     if (s.gaps && s.gaps.gap_points) {
       s.gaps.gap_points.forEach((gp) => {
-        L.circleMarker([gp.lat, gp.lon], {
+        const lat = gp.lat != null ? gp.lat : gp.latitude;
+        const lon = gp.lon != null ? gp.lon : (gp.lng != null ? gp.lng : gp.longitude);
+
+        if (
+          typeof lat !== "number" ||
+          typeof lon !== "number" ||
+          !Number.isFinite(lat) ||
+          !Number.isFinite(lon)
+        ) {
+          console.warn("Skipping historical gap point with invalid coordinates", gp);
+          return;
+        }
+
+        L.circleMarker([lat, lon], {
           radius: 4,
           color: "#FF5C5C",
           fillColor: "#0A0D11",
           fillOpacity: 0.9,
           weight: 2,
         }).addTo(state.rfHistoricalLayer).bindTooltip(
-          `<strong>${surveyId} GAP POINT</strong><br>Lat: ${gp.lat.toFixed(5)}, Lon: ${gp.lon.toFixed(5)}`,
+          `<strong>${surveyId} GAP POINT</strong><br>Lat: ${lat.toFixed(5)}, Lon: ${lon.toFixed(5)}`,
           { direction: "top", offset: [0, -3] }
         );
       });
@@ -3028,55 +3073,85 @@ async function compareHistoricalSurveys() {
       }
     }
 
+    const s1 = comp.survey_a || comp.survey_1;
+    const s2 = comp.survey_b || comp.survey_2;
+    const d = comp.delta;
+
+    const roleA = s1.survey_role || "SURVEY";
+    const roleB = s2.survey_role || "SURVEY";
     const thA = document.getElementById("hist-th-a");
     const thB = document.getElementById("hist-th-b");
-    if (thA) thA.textContent = `${idA} [${comp.survey_1.survey_role}]`;
-    if (thB) thB.textContent = `${idB} [${comp.survey_2.survey_role}]`;
-
-    const s1 = comp.survey_1;
-    const s2 = comp.survey_2;
-    const d = comp.delta;
+    if (thA) thA.textContent = `${idA} [${roleA}]`;
+    if (thB) thB.textContent = `${idB} [${roleB}]`;
 
     const setField = (id, val) => {
       const el = document.getElementById(id);
       if (el) el.textContent = val;
     };
 
+    const s1_good = s1.good_percentage != null ? s1.good_percentage : (s1.good_pct != null ? s1.good_pct : 0);
+    const s2_good = s2.good_percentage != null ? s2.good_percentage : (s2.good_pct != null ? s2.good_pct : 0);
+    const d_good = d.good_percentage_pp != null ? d.good_percentage_pp : (d.good_pct_change != null ? d.good_pct_change : 0);
+
+    const s1_mod = s1.moderate_percentage != null ? s1.moderate_percentage : (s1.moderate_pct != null ? s1.moderate_pct : 0);
+    const s2_mod = s2.moderate_percentage != null ? s2.moderate_percentage : (s2.moderate_pct != null ? s2.moderate_pct : 0);
+    const d_mod = d.moderate_percentage_pp != null ? d.moderate_percentage_pp : (d.moderate_pct_change != null ? d.moderate_pct_change : 0);
+
+    const s1_weak = s1.weak_percentage != null ? s1.weak_percentage : (s1.weak_pct != null ? s1.weak_pct : 0);
+    const s2_weak = s2.weak_percentage != null ? s2.weak_percentage : (s2.weak_pct != null ? s2.weak_pct : 0);
+    const d_weak = d.weak_percentage_pp != null ? d.weak_percentage_pp : (d.weak_pct_change != null ? d.weak_pct_change : 0);
+
+    const s1_gap = s1.gap_percentage != null ? s1.gap_percentage : (s1.gap_pct != null ? s1.gap_pct : 0);
+    const s2_gap = s2.gap_percentage != null ? s2.gap_percentage : (s2.gap_pct != null ? s2.gap_pct : 0);
+    const d_gap = d.gap_percentage_pp != null ? d.gap_percentage_pp : (d.gap_pct_change != null ? d.gap_pct_change : 0);
+
+    const s1_gap_count = s1.gap_count != null ? s1.gap_count : (s1.gap_points_count != null ? s1.gap_points_count : 0);
+    const s2_gap_count = s2.gap_count != null ? s2.gap_count : (s2.gap_points_count != null ? s2.gap_points_count : 0);
+    const d_gap_count = d.gap_count != null ? d.gap_count : (s2_gap_count - s1_gap_count);
+
+    const s1_clusters = s1.gap_cluster_count != null ? s1.gap_cluster_count : (s1.gap_clusters_count != null ? s1.gap_clusters_count : 0);
+    const s2_clusters = s2.gap_cluster_count != null ? s2.gap_cluster_count : (s2.gap_clusters_count != null ? s2.gap_clusters_count : 0);
+    const d_clusters = d.gap_cluster_count != null ? d.gap_cluster_count : (d.gap_clusters_change != null ? d.gap_clusters_change : 0);
+
+    const d_nodes = d.node_count != null ? d.node_count : (d.node_count_change != null ? d.node_count_change : 0);
+    const d_samples = d.sample_count != null ? d.sample_count : (d.sample_count_change != null ? d.sample_count_change : 0);
+
     setField("hist-nodes-a", s1.node_count);
     setField("hist-nodes-b", s2.node_count);
-    setField("hist-nodes-delta", (d.node_count_change >= 0 ? "+" : "") + d.node_count_change);
+    setField("hist-nodes-delta", (d_nodes >= 0 ? "+" : "") + d_nodes);
 
     setField("hist-samples-a", s1.sample_count);
     setField("hist-samples-b", s2.sample_count);
-    setField("hist-samples-delta", (d.sample_count_change >= 0 ? "+" : "") + d.sample_count_change);
+    setField("hist-samples-delta", (d_samples >= 0 ? "+" : "") + d_samples);
 
-    setField("hist-good-a", `${s1.good_pct}%`);
-    setField("hist-good-b", `${s2.good_pct}%`);
-    setField("hist-good-delta", `${d.good_pct_change >= 0 ? "+" : ""}${d.good_pct_change}%`);
+    setField("hist-good-a", `${s1_good}%`);
+    setField("hist-good-b", `${s2_good}%`);
+    setField("hist-good-delta", `${d_good >= 0 ? "+" : ""}${d_good}%`);
 
-    setField("hist-mod-a", `${s1.moderate_pct}%`);
-    setField("hist-mod-b", `${s2.moderate_pct}%`);
-    setField("hist-mod-delta", `${d.moderate_pct_change >= 0 ? "+" : ""}${d.moderate_pct_change}%`);
+    setField("hist-mod-a", `${s1_mod}%`);
+    setField("hist-mod-b", `${s2_mod}%`);
+    setField("hist-mod-delta", `${d_mod >= 0 ? "+" : ""}${d_mod}%`);
 
-    setField("hist-weak-a", `${s1.weak_pct}%`);
-    setField("hist-weak-b", `${s2.weak_pct}%`);
-    setField("hist-weak-delta", `${d.weak_pct_change >= 0 ? "+" : ""}${d.weak_pct_change}%`);
+    setField("hist-weak-a", `${s1_weak}%`);
+    setField("hist-weak-b", `${s2_weak}%`);
+    setField("hist-weak-delta", `${d_weak >= 0 ? "+" : ""}${d_weak}%`);
 
-    setField("hist-gap-a", `${s1.gap_pct}%`);
-    setField("hist-gap-b", `${s2.gap_pct}%`);
-    setField("hist-gap-delta", `${d.gap_pct_change >= 0 ? "+" : ""}${d.gap_pct_change}%`);
+    setField("hist-gap-a", `${s1_gap}%`);
+    setField("hist-gap-b", `${s2_gap}%`);
+    setField("hist-gap-delta", `${d_gap >= 0 ? "+" : ""}${d_gap}%`);
 
-    setField("hist-gappoints-a", s1.gap_points_count);
-    setField("hist-gappoints-b", s2.gap_points_count);
-    setField("hist-gappoints-delta", `${s2.gap_points_count - s1.gap_points_count >= 0 ? "+" : ""}${s2.gap_points_count - s1.gap_points_count}`);
+    setField("hist-gappoints-a", s1_gap_count);
+    setField("hist-gappoints-b", s2_gap_count);
+    setField("hist-gappoints-delta", (d_gap_count >= 0 ? "+" : "") + d_gap_count);
 
-    setField("hist-gapclusters-a", s1.gap_clusters_count);
-    setField("hist-gapclusters-b", s2.gap_clusters_count);
-    setField("hist-gapclusters-delta", `${d.gap_clusters_change >= 0 ? "+" : ""}${d.gap_clusters_change}`);
+    setField("hist-gapclusters-a", s1_clusters);
+    setField("hist-gapclusters-b", s2_clusters);
+    setField("hist-gapclusters-delta", (d_clusters >= 0 ? "+" : "") + d_clusters);
 
+    const gapsResolved = d.gaps_resolved != null ? d.gaps_resolved : Math.max(0, s1_gap_count - s2_gap_count);
     logEvent(
-      `Comparison complete: ${idA} -> ${idB} | GAP %: ${s1.gap_pct}% -> ${s2.gap_pct}% ` +
-      `(${d.gap_pct_change >= 0 ? "+" : ""}${d.gap_pct_change}%), Gaps resolved: ${d.gaps_resolved}`
+      `Comparison complete: ${idA} -> ${idB} | GAP %: ${s1_gap}% -> ${s2_gap}% ` +
+      `(${d_gap >= 0 ? "+" : ""}${d_gap}%), Gaps resolved: ${gapsResolved}`
     );
   } catch (err) {
     logEvent(`History comparison failed: ${err.message}`);

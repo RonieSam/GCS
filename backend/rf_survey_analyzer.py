@@ -284,8 +284,11 @@ def analyze_rf_survey(
         status = classify_rssi(best_rssi)
 
         heatmap_points.append({
+            "lat": lat,
+            "lon": lon,
             "latitude": lat,
             "longitude": lon,
+            "rssi": round(best_rssi, 2) if best_rssi is not None else None,
             "best_rssi": round(best_rssi, 2) if best_rssi is not None else None,
             "status": status,
         })
@@ -299,8 +302,11 @@ def analyze_rf_survey(
         elif status == STATUS_GAP:
             gap_count += 1
             gap_point_list.append({
+                "lat": lat,
+                "lon": lon,
                 "latitude": lat,
                 "longitude": lon,
+                "rssi": round(best_rssi, 2) if best_rssi is not None else None,
                 "best_rssi": round(best_rssi, 2) if best_rssi is not None else None,
             })
         else:  # UNMEASURED
@@ -372,6 +378,23 @@ def analyze_rf_survey(
             "score": c["score"],
         })
 
+    coverage_counts = {
+        "good": good_count,
+        "moderate": moderate_count,
+        "weak": weak_count,
+        "gap": gap_count,
+        "unmeasured": unmeasured_count,
+    }
+    counts_for_pct = {
+        "good_count": good_count,
+        "moderate_count": moderate_count,
+        "weak_count": weak_count,
+        "gap_count": gap_count,
+        "unmeasured_count": unmeasured_count,
+        "survey_samples": len(heatmap_points),
+    }
+    cov_percentages = calculate_coverage_percentages(counts_for_pct)
+
     return {
         "survey_samples": len(heatmap_points),
         "good_count": good_count,
@@ -379,6 +402,16 @@ def analyze_rf_survey(
         "weak_count": weak_count,
         "gap_count": gap_count,
         "unmeasured_count": unmeasured_count,
+        "coverage_counts": coverage_counts,
+        "coverage_percentages": cov_percentages,
+        "good_percentage": cov_percentages["good_percentage"],
+        "moderate_percentage": cov_percentages["moderate_percentage"],
+        "weak_percentage": cov_percentages["weak_percentage"],
+        "gap_percentage": cov_percentages["gap_percentage"],
+        "good_pct": cov_percentages["good_pct"],
+        "moderate_pct": cov_percentages["moderate_pct"],
+        "weak_pct": cov_percentages["weak_pct"],
+        "gap_pct": cov_percentages["gap_pct"],
         "gap_cluster_count": len(clusters),
         "gap_cluster_distance_m": round(gap_cluster_distance_m, 1),
         "rf_range_scale": rf_range_scale,
@@ -395,22 +428,59 @@ def analyze_rf_survey(
 
 
 def calculate_coverage_percentages(result: Dict) -> Dict:
-    """Calculate exact coverage percentages from analysis counts."""
-    total = result.get("survey_samples", 0)
-    if total <= 0:
+    """Calculate exact coverage percentages from actual survey classification data.
+
+    Measured total:
+        measured = good + moderate + weak + gap
+    Percentages:
+        good_percentage     = good / measured * 100
+        moderate_percentage = moderate / measured * 100
+        weak_percentage     = weak / measured * 100
+        gap_percentage      = gap / measured * 100
+    If measured == 0: all percentages = 0.0.
+    """
+    good = result.get("good_count", 0)
+    moderate = result.get("moderate_count", 0)
+    weak = result.get("weak_count", 0)
+    gap = result.get("gap_count", 0)
+    unmeasured = result.get("unmeasured_count", 0)
+
+    measured = good + moderate + weak + gap
+    if measured <= 0:
         return {
+            "good_percentage": 0.0,
+            "moderate_percentage": 0.0,
+            "weak_percentage": 0.0,
+            "gap_percentage": 0.0,
             "good_pct": 0.0,
             "moderate_pct": 0.0,
             "weak_pct": 0.0,
             "gap_pct": 0.0,
             "unmeasured_pct": 0.0,
+            "measured_count": 0,
+            "unmeasured_count": unmeasured,
         }
+
+    good_pct = round((good / measured) * 100.0, 1)
+    mod_pct = round((moderate / measured) * 100.0, 1)
+    weak_pct = round((weak / measured) * 100.0, 1)
+    gap_pct = round((gap / measured) * 100.0, 1)
+
+    total_with_unmeasured = measured + unmeasured
+    unmeasured_pct = round((unmeasured / total_with_unmeasured) * 100.0, 1) if total_with_unmeasured > 0 else 0.0
+
     return {
-        "good_pct": round((result.get("good_count", 0) / total) * 100.0, 1),
-        "moderate_pct": round((result.get("moderate_count", 0) / total) * 100.0, 1),
-        "weak_pct": round((result.get("weak_count", 0) / total) * 100.0, 1),
-        "gap_pct": round((result.get("gap_count", 0) / total) * 100.0, 1),
-        "unmeasured_pct": round((result.get("unmeasured_count", 0) / total) * 100.0, 1),
+        "good_percentage": good_pct,
+        "moderate_percentage": mod_pct,
+        "weak_percentage": weak_pct,
+        "gap_percentage": gap_pct,
+        "good_pct": good_pct,
+        "moderate_pct": mod_pct,
+        "weak_pct": weak_pct,
+        "gap_pct": gap_pct,
+        "unmeasured_pct": unmeasured_pct,
+        "measured_count": measured,
+        "unmeasured_count": unmeasured,
     }
 
 
@@ -446,7 +516,7 @@ def package_analysis_snapshot(
     ]
     total_samples = analysis_result.get("survey_samples", 0)
     gap_count = analysis_result.get("gap_count", 0)
-    gap_pct = percentages["gap_pct"]
+    gap_pct = percentages.get("gap_percentage", percentages.get("gap_pct", 0.0))
 
     return {
         "survey_sample_count": total_samples,
@@ -461,8 +531,15 @@ def package_analysis_snapshot(
             "unmeasured": analysis_result.get("unmeasured_count", 0),
         },
         "coverage_percentages": percentages,
-        "gap_count": gap_count,
+        "good_percentage": percentages.get("good_percentage", percentages.get("good_pct", 0.0)),
+        "moderate_percentage": percentages.get("moderate_percentage", percentages.get("moderate_pct", 0.0)),
+        "weak_percentage": percentages.get("weak_percentage", percentages.get("weak_pct", 0.0)),
         "gap_percentage": gap_pct,
+        "good_pct": percentages.get("good_pct", 0.0),
+        "moderate_pct": percentages.get("moderate_pct", 0.0),
+        "weak_pct": percentages.get("weak_pct", 0.0),
+        "gap_pct": gap_pct,
+        "gap_count": gap_count,
         "gap_cluster_count": analysis_result.get("gap_cluster_count", 0),
         "gap_points": list(analysis_result.get("gap_points", [])),
         "candidates": list(analysis_result.get("candidates", [])),

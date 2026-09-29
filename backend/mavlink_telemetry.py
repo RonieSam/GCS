@@ -40,6 +40,9 @@ def new_vehicle_state():
         # Phase 8 — active mission progress (None when no mission is executing)
         "mission_current": None,       # sequence number of current waypoint
         "mission_item_reached": None,  # sequence number of last reached waypoint
+        # Physical landing telemetry (EXTENDED_SYS_STATE)
+        "in_air": None,
+        "landed_state": None,
     }
 
 
@@ -165,5 +168,22 @@ def update_from_message(state, msg, mav_connection=None):
     elif msg_type == "MISSION_ITEM_REACHED":
         # PX4 sends this each time it successfully reaches a waypoint.
         state["mission_item_reached"] = int(msg.seq)
+
+    elif msg_type == "EXTENDED_SYS_STATE":
+        # PX4 landed_state: 0=UNDEFINED, 1=ON_GROUND, 2=IN_AIR, 3=TAKEOFF, 4=LANDING
+        ls = getattr(msg, "landed_state", None)
+        if ls is not None:
+            mapping = {
+                0: "UNDEFINED",
+                1: "ON_GROUND",
+                2: "IN_AIR",
+                3: "TAKEOFF",
+                4: "LANDING",
+            }
+            state["landed_state"] = mapping.get(ls, str(ls))
+            if ls == 1:
+                state["in_air"] = False
+            elif ls in (2, 3, 4):
+                state["in_air"] = True
 
     return state

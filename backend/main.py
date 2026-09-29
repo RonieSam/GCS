@@ -1628,6 +1628,12 @@ def api_rf_survey_analyze():
     if state_val != SCAN_STATE_ABORTED:
         session_state["rf_survey_history_counter"] = session_state.get("rf_survey_history_counter", 0) + 1
         survey_id = f"SURVEY-{session_state['rf_survey_history_counter']:03d}"
+        cov_pcts = result.get("coverage_percentages") or rf_survey_analyzer.calculate_coverage_percentages(result)
+        good_pct = cov_pcts.get("good_percentage", cov_pcts.get("good_pct", 0.0))
+        moderate_pct = cov_pcts.get("moderate_percentage", cov_pcts.get("moderate_pct", 0.0))
+        weak_pct = cov_pcts.get("weak_percentage", cov_pcts.get("weak_pct", 0.0))
+        gap_pct = cov_pcts.get("gap_percentage", cov_pcts.get("gap_pct", 0.0))
+
         history_record = {
             "survey_id": survey_id,
             "survey_role": survey_role,
@@ -1636,9 +1642,39 @@ def api_rf_survey_analyze():
             "affected_area": [dict(p) for p in (session_state.get("polygon") or [])],
             "node_set": [dict(n) for n in deployed_nodes],
             "node_count": len(deployed_nodes),
-            "samples": [dict(s) for s in samples],
+            "samples": [
+                {
+                    "lat": s.get("lat") if s.get("lat") is not None else s.get("latitude"),
+                    "lon": s.get("lon") if s.get("lon") is not None else s.get("longitude"),
+                    "latitude": s.get("latitude") if s.get("latitude") is not None else s.get("lat"),
+                    "longitude": s.get("longitude") if s.get("longitude") is not None else s.get("lon"),
+                    "rssi": s.get("rssi"),
+                    "best_rssi": s.get("best_rssi"),
+                    "status": s.get("status"),
+                }
+                for s in samples
+            ],
             "sample_count": len(samples),
-            "heatmap": [dict(c) for c in (result.get("heatmap") or [])],
+            "heatmap": [
+                {
+                    "lat": c.get("lat") if c.get("lat") is not None else c.get("latitude"),
+                    "lon": c.get("lon") if c.get("lon") is not None else c.get("longitude"),
+                    "latitude": c.get("latitude") if c.get("latitude") is not None else c.get("lat"),
+                    "longitude": c.get("longitude") if c.get("longitude") is not None else c.get("lon"),
+                    "rssi": c.get("rssi") if c.get("rssi") is not None else c.get("best_rssi"),
+                    "best_rssi": c.get("best_rssi") if c.get("best_rssi") is not None else c.get("rssi"),
+                    "status": c.get("status"),
+                }
+                for c in (result.get("heatmap") or [])
+            ],
+            "good_percentage": good_pct,
+            "moderate_percentage": moderate_pct,
+            "weak_percentage": weak_pct,
+            "gap_percentage": gap_pct,
+            "good_pct": good_pct,
+            "moderate_pct": moderate_pct,
+            "weak_pct": weak_pct,
+            "gap_pct": gap_pct,
             "coverage_statistics": {
                 "good_count": result.get("good_count", 0),
                 "moderate_count": result.get("moderate_count", 0),
@@ -1646,15 +1682,29 @@ def api_rf_survey_analyze():
                 "gap_count": result.get("gap_count", 0),
                 "unmeasured_count": result.get("unmeasured_count", 0),
                 "total_samples": result.get("survey_samples", len(samples)),
-                "good_pct": result.get("coverage_percentages", {}).get("good_pct", 0.0),
-                "moderate_pct": result.get("coverage_percentages", {}).get("moderate_pct", 0.0),
-                "weak_pct": result.get("coverage_percentages", {}).get("weak_pct", 0.0),
-                "gap_pct": result.get("coverage_percentages", {}).get("gap_pct", 0.0),
+                "good_percentage": good_pct,
+                "moderate_percentage": moderate_pct,
+                "weak_percentage": weak_pct,
+                "gap_percentage": gap_pct,
+                "good_pct": good_pct,
+                "moderate_pct": moderate_pct,
+                "weak_pct": weak_pct,
+                "gap_pct": gap_pct,
             },
             "gaps": {
                 "gap_count": result.get("gap_count", 0),
                 "gap_cluster_count": result.get("gap_cluster_count", 0),
-                "gap_points": [dict(p) for p in (result.get("gap_points") or [])],
+                "gap_points": [
+                    {
+                        "lat": p.get("lat") if p.get("lat") is not None else p.get("latitude"),
+                        "lon": p.get("lon") if p.get("lon") is not None else p.get("longitude"),
+                        "latitude": p.get("latitude") if p.get("latitude") is not None else p.get("lat"),
+                        "longitude": p.get("longitude") if p.get("longitude") is not None else p.get("lon"),
+                        "rssi": p.get("rssi") if p.get("rssi") is not None else p.get("best_rssi"),
+                        "best_rssi": p.get("best_rssi") if p.get("best_rssi") is not None else p.get("rssi"),
+                    }
+                    for p in (result.get("gap_points") or [])
+                ],
                 "gap_clusters": [dict(c) for c in (result.get("gap_clusters") or [])],
             },
             "candidates": [dict(c) for c in (result.get("candidates") or [])],
@@ -1771,54 +1821,100 @@ def _execute_history_comparison(survey_id_1: str, survey_id_2: str) -> dict:
     s1_gaps = s1["gaps"]
     s2_gaps = s2["gaps"]
 
-    delta_good = round(s2_stats["good_pct"] - s1_stats["good_pct"], 2)
-    delta_mod = round(s2_stats["moderate_pct"] - s1_stats["moderate_pct"], 2)
-    delta_weak = round(s2_stats["weak_pct"] - s1_stats["weak_pct"], 2)
-    delta_gap = round(s2_stats["gap_pct"] - s1_stats["gap_pct"], 2)
+    s1_good = s1_stats.get("good_percentage", s1_stats.get("good_pct", 0.0))
+    s1_mod = s1_stats.get("moderate_percentage", s1_stats.get("moderate_pct", 0.0))
+    s1_weak = s1_stats.get("weak_percentage", s1_stats.get("weak_pct", 0.0))
+    s1_gap = s1_stats.get("gap_percentage", s1_stats.get("gap_pct", 0.0))
+
+    s2_good = s2_stats.get("good_percentage", s2_stats.get("good_pct", 0.0))
+    s2_mod = s2_stats.get("moderate_percentage", s2_stats.get("moderate_pct", 0.0))
+    s2_weak = s2_stats.get("weak_percentage", s2_stats.get("weak_pct", 0.0))
+    s2_gap = s2_stats.get("gap_percentage", s2_stats.get("gap_pct", 0.0))
+
+    delta_good_pp = round(s2_good - s1_good, 1)
+    delta_mod_pp = round(s2_mod - s1_mod, 1)
+    delta_weak_pp = round(s2_weak - s1_weak, 1)
+    delta_gap_pp = round(s2_gap - s1_gap, 1)
+
+    s1_gap_count = s1_gaps.get("gap_count", 0)
+    s2_gap_count = s2_gaps.get("gap_count", 0)
+    s1_clusters = s1_gaps.get("gap_cluster_count", 0)
+    s2_clusters = s2_gaps.get("gap_cluster_count", 0)
+
+    survey_a = {
+        "survey_id": s1["survey_id"],
+        "survey_role": s1.get("survey_role", "SURVEY"),
+        "timestamp": s1["timestamp"],
+        "sample_count": s1["sample_count"],
+        "node_count": s1["node_count"],
+        "good_percentage": s1_good,
+        "moderate_percentage": s1_mod,
+        "weak_percentage": s1_weak,
+        "gap_percentage": s1_gap,
+        "gap_count": s1_gap_count,
+        "gap_cluster_count": s1_clusters,
+        # backward compat aliases:
+        "good_pct": s1_good,
+        "moderate_pct": s1_mod,
+        "weak_pct": s1_weak,
+        "gap_pct": s1_gap,
+        "gap_points_count": s1_gap_count,
+        "gap_clusters_count": s1_clusters,
+        "gap_points": s1_gaps.get("gap_points", []),
+        "gap_clusters": s1_gaps.get("gap_clusters", []),
+        "heatmap": s1.get("heatmap", []),
+    }
+
+    survey_b = {
+        "survey_id": s2["survey_id"],
+        "survey_role": s2.get("survey_role", "SURVEY"),
+        "timestamp": s2["timestamp"],
+        "sample_count": s2["sample_count"],
+        "node_count": s2["node_count"],
+        "good_percentage": s2_good,
+        "moderate_percentage": s2_mod,
+        "weak_percentage": s2_weak,
+        "gap_percentage": s2_gap,
+        "gap_count": s2_gap_count,
+        "gap_cluster_count": s2_clusters,
+        # backward compat aliases:
+        "good_pct": s2_good,
+        "moderate_pct": s2_mod,
+        "weak_pct": s2_weak,
+        "gap_pct": s2_gap,
+        "gap_points_count": s2_gap_count,
+        "gap_clusters_count": s2_clusters,
+        "gap_points": s2_gaps.get("gap_points", []),
+        "gap_clusters": s2_gaps.get("gap_clusters", []),
+        "heatmap": s2.get("heatmap", []),
+    }
+
+    delta = {
+        "good_percentage_pp": delta_good_pp,
+        "moderate_percentage_pp": delta_mod_pp,
+        "weak_percentage_pp": delta_weak_pp,
+        "gap_percentage_pp": delta_gap_pp,
+        "sample_count": s2["sample_count"] - s1["sample_count"],
+        "node_count": s2["node_count"] - s1["node_count"],
+        "gap_count": s2_gap_count - s1_gap_count,
+        "gap_cluster_count": s2_clusters - s1_clusters,
+        # backward compat aliases:
+        "good_pct_change": delta_good_pp,
+        "moderate_pct_change": delta_mod_pp,
+        "weak_pct_change": delta_weak_pp,
+        "gap_pct_change": delta_gap_pp,
+        "sample_count_change": s2["sample_count"] - s1["sample_count"],
+        "node_count_change": s2["node_count"] - s1["node_count"],
+        "gaps_resolved": max(0, s1_gap_count - s2_gap_count),
+        "gap_clusters_change": s2_clusters - s1_clusters,
+    }
 
     return {
-        "survey_1": {
-            "survey_id": s1["survey_id"],
-            "survey_role": s1.get("survey_role", "SURVEY"),
-            "timestamp": s1["timestamp"],
-            "node_count": s1["node_count"],
-            "sample_count": s1["sample_count"],
-            "good_pct": s1_stats["good_pct"],
-            "moderate_pct": s1_stats["moderate_pct"],
-            "weak_pct": s1_stats["weak_pct"],
-            "gap_pct": s1_stats["gap_pct"],
-            "gap_points_count": s1_gaps["gap_count"],
-            "gap_clusters_count": s1_gaps["gap_cluster_count"],
-            "gap_points": s1_gaps.get("gap_points", []),
-            "gap_clusters": s1_gaps.get("gap_clusters", []),
-            "heatmap": s1.get("heatmap", []),
-        },
-        "survey_2": {
-            "survey_id": s2["survey_id"],
-            "survey_role": s2.get("survey_role", "SURVEY"),
-            "timestamp": s2["timestamp"],
-            "node_count": s2["node_count"],
-            "sample_count": s2["sample_count"],
-            "good_pct": s2_stats["good_pct"],
-            "moderate_pct": s2_stats["moderate_pct"],
-            "weak_pct": s2_stats["weak_pct"],
-            "gap_pct": s2_stats["gap_pct"],
-            "gap_points_count": s2_gaps["gap_count"],
-            "gap_clusters_count": s2_gaps["gap_cluster_count"],
-            "gap_points": s2_gaps.get("gap_points", []),
-            "gap_clusters": s2_gaps.get("gap_clusters", []),
-            "heatmap": s2.get("heatmap", []),
-        },
-        "delta": {
-            "node_count_change": s2["node_count"] - s1["node_count"],
-            "sample_count_change": s2["sample_count"] - s1["sample_count"],
-            "good_pct_change": delta_good,
-            "moderate_pct_change": delta_mod,
-            "weak_pct_change": delta_weak,
-            "gap_pct_change": delta_gap,
-            "gaps_resolved": max(0, s1_gaps["gap_count"] - s2_gaps["gap_count"]),
-            "gap_clusters_change": s2_gaps["gap_cluster_count"] - s1_gaps["gap_cluster_count"],
-        },
+        "survey_a": survey_a,
+        "survey_b": survey_b,
+        "survey_1": survey_a,
+        "survey_2": survey_b,
+        "delta": delta,
         "comparable": comparable,
         "invalidation_reason": invalidation_reason,
     }
@@ -1834,16 +1930,24 @@ def api_rf_survey_history_list():
     surveys_summary = []
     for s in history:
         stats = s["coverage_statistics"]
+        good_pct = stats.get("good_percentage", stats.get("good_pct", 0.0))
+        mod_pct = stats.get("moderate_percentage", stats.get("moderate_pct", 0.0))
+        weak_pct = stats.get("weak_percentage", stats.get("weak_pct", 0.0))
+        gap_pct = stats.get("gap_percentage", stats.get("gap_pct", 0.0))
         surveys_summary.append({
             "survey_id": s["survey_id"],
             "survey_role": s.get("survey_role", "SURVEY"),
             "timestamp": s["timestamp"],
             "node_count": s["node_count"],
             "sample_count": s["sample_count"],
-            "good_pct": stats["good_pct"],
-            "moderate_pct": stats["moderate_pct"],
-            "weak_pct": stats["weak_pct"],
-            "gap_pct": stats["gap_pct"],
+            "good_percentage": good_pct,
+            "moderate_percentage": mod_pct,
+            "weak_percentage": weak_pct,
+            "gap_percentage": gap_pct,
+            "good_pct": good_pct,
+            "moderate_pct": mod_pct,
+            "weak_pct": weak_pct,
+            "gap_pct": gap_pct,
             "gap_count": s["gaps"]["gap_count"],
             "gap_cluster_count": s["gaps"]["gap_cluster_count"],
             "candidate_count": len(s.get("candidates", [])),
@@ -1926,21 +2030,48 @@ def api_deployment_status():
     """
     Phase 6 Requirements 3-6: Deployment RELEASE status and gate evaluation.
     RELEASE must only become enabled after:
-      - deployment mission is no longer flying
-      - UAV is actually landed
-      - UAV is within configured distance tolerance of selected candidate
-    If UAV lands somewhere else or is airborne, RELEASE remains disabled.
+      - deployment mission has reached intended destination / deployment phase
+      - UAV is physically landed/on ground (authoritative telemetry in_air/landed_state)
+      - altitude is at or below configured landing threshold (1.0m, handling negative altitudes safely)
+      - UAV is within configured distance tolerance of selected candidate (10.0m)
+      - deployment has not already been released
+    Mission state "EXECUTING" does NOT classify the UAV as airborne.
     """
     target = session_state.get("selected_target")
     released = session_state.get("deployment_released", False)
     uav_state = mav_manager.get_vehicle_state()
     rel_alt = uav_state.get("relative_altitude")
+    raw_alt = rel_alt if rel_alt is not None else uav_state.get("altitude")
+    normalized_altitude = max(0.0, raw_alt) if raw_alt is not None else 0.0
+
+    in_air = uav_state.get("in_air")
+    landed_state = uav_state.get("landed_state")
+    flight_mode = str(uav_state.get("flight_mode") or uav_state.get("mode") or "").upper()
     mission_state = session_state.get("mission_state", "IDLE")
 
-    is_airborne = (rel_alt is not None and rel_alt > 0.3) or (mission_state == "EXECUTING")
-    is_landed = (rel_alt is not None and rel_alt <= 0.3) and not is_airborne
-    flight_mode = uav_state.get("flight_mode") or uav_state.get("mode") or ""
-    is_aborted = mission_state in ("ABORTED", "FAILED") or "RTL" in str(flight_mode).upper()
+    # Authoritative physical flight state:
+    # 1. Telemetry in_air flag
+    # 2. Telemetry landed_state (EXTENDED_SYS_STATE)
+    # 3. Altitude threshold (<= 1.0m, normalized)
+    # NOTE: mission_state == "EXECUTING" must NEVER override confirmed physical landed state!
+    if in_air is True:
+        is_airborne = True
+    elif in_air is False:
+        is_airborne = False if normalized_altitude <= 1.0 else True
+    elif landed_state is not None:
+        if landed_state == "ON_GROUND":
+            is_airborne = False if normalized_altitude <= 1.0 else True
+        else:
+            is_airborne = True
+    else:
+        is_airborne = normalized_altitude > 1.0
+
+    is_landed = (not is_airborne) and (normalized_altitude <= 1.0)
+    is_aborted = mission_state in ("ABORTED", "FAILED") or "RTL" in flight_mode
+
+    upload_st = mav_manager.get_mission_upload_state()
+    total_items = upload_st.get("items", 0)
+    mreached = uav_state.get("mission_item_reached")
 
     dist_m = None
     within_tolerance = False
@@ -1957,11 +2088,21 @@ def api_deployment_status():
         is_landed = True
         is_airborne = False
 
+    destination_reached = within_tolerance or (
+        total_items > 0 and mreached is not None and mreached >= total_items - 1
+    ) or (not mav_manager.is_connected())
+
+    # Synchronize mission_state if UAV landed at destination
+    if destination_reached and is_landed and mission_state == "EXECUTING":
+        session_state["mission_state"] = "COMPLETED"
+        mission_state = "COMPLETED"
+
     can_release = bool(
         (target is not None)
         and (not is_airborne)
         and is_landed
         and within_tolerance
+        and destination_reached
         and (not released)
         and (not is_aborted)
     )
@@ -1974,13 +2115,29 @@ def api_deployment_status():
     elif is_aborted:
         reason = f"RELEASE disabled: Deployment mission was aborted or entered RTL (state={mission_state})"
     elif is_airborne:
-        alt_str = f"{rel_alt:.1f}m" if rel_alt is not None else "airborne"
+        alt_str = f"{raw_alt:.1f}m" if raw_alt is not None else "airborne"
         reason = f"RELEASE disabled: UAV is airborne ({alt_str})"
     elif not within_tolerance:
         dist_str = f"{dist_m:.1f}m" if dist_m is not None else "unknown"
         reason = f"RELEASE disabled: UAV landed off-target ({dist_str} > {config.CANDIDATE_DEPLOY_TOLERANCE_M}m tolerance)"
+    elif not destination_reached:
+        reason = "RELEASE disabled: Deployment destination has not been reached"
     elif not is_landed:
-        reason = "RELEASE disabled: UAV is not landed"
+        reason = f"RELEASE disabled: UAV is not landed (normalized_alt={normalized_altitude:.2f}m)"
+
+    # Live diagnostic log (Bug 2 Requirement 5)
+    logger.info(
+        "RELEASE CHECK:\n"
+        f"in_air={str(in_air).lower() if in_air is not None else 'unknown'}\n"
+        f"landed_state={landed_state or 'UNKNOWN'}\n"
+        f"altitude={f'{raw_alt:.3f}m' if raw_alt is not None else 'unknown'}\n"
+        f"normalized_altitude={normalized_altitude:.3f}m\n"
+        f"mission_state={mission_state}\n"
+        f"distance_to_candidate={f'{dist_m:.1f}m' if dist_m is not None else 'unknown'}\n"
+        f"destination_reached={str(destination_reached).lower()}\n"
+        f"already_released={str(released).lower()}\n"
+        f"can_release={str(can_release).lower()}"
+    )
 
     return {
         "can_release": can_release,
@@ -1989,6 +2146,7 @@ def api_deployment_status():
         "is_landed": is_landed,
         "is_aborted": is_aborted,
         "within_tolerance": within_tolerance,
+        "destination_reached": destination_reached,
         "distance_to_candidate_m": round(dist_m, 2) if dist_m is not None else None,
         "candidate_tolerance_m": config.CANDIDATE_DEPLOY_TOLERANCE_M,
         "selected_target": target,
@@ -2001,10 +2159,10 @@ def api_deployment_release(payload: Optional[DeploymentReleaseRequest] = None):
     """
     Phase 6 Requirements 3-6: Command node physical release.
     Enforces all release interlocks:
-      1. UAV must not be airborne.
+      1. UAV must not be airborne (authoritative flight telemetry).
       2. Mission must no longer be flying and not aborted.
-      3. UAV must actually be landed.
-      4. UAV must be within distance tolerance of selected candidate.
+      3. UAV must actually be landed (altitude <= 1.0m, normalized).
+      4. UAV must be within distance tolerance of selected candidate (10.0m).
       5. Exactly one node is created at candidate coordinates.
       6. Repeated release cannot create duplicates.
     """
@@ -2023,32 +2181,108 @@ def api_deployment_release(payload: Optional[DeploymentReleaseRequest] = None):
 
     uav_state = mav_manager.get_vehicle_state()
     rel_alt = uav_state.get("relative_altitude")
-    mission_state = session_state.get("mission_state", "IDLE")
-    flight_mode = uav_state.get("flight_mode") or uav_state.get("mode") or ""
+    raw_alt = rel_alt if rel_alt is not None else uav_state.get("altitude")
+    normalized_altitude = max(0.0, raw_alt) if raw_alt is not None else 0.0
 
-    if mission_state in ("ABORTED", "FAILED") or "RTL" in str(flight_mode).upper():
+    in_air = uav_state.get("in_air")
+    landed_state = uav_state.get("landed_state")
+    flight_mode = str(uav_state.get("flight_mode") or uav_state.get("mode") or "").upper()
+    mission_state = session_state.get("mission_state", "IDLE")
+
+    if in_air is True:
+        is_airborne = True
+    elif in_air is False:
+        is_airborne = False if normalized_altitude <= 1.0 else True
+    elif landed_state is not None:
+        if landed_state == "ON_GROUND":
+            is_airborne = False if normalized_altitude <= 1.0 else True
+        else:
+            is_airborne = True
+    else:
+        is_airborne = normalized_altitude > 1.0
+
+    is_landed = (not is_airborne) and (normalized_altitude <= 1.0)
+    is_aborted = mission_state in ("ABORTED", "FAILED") or "RTL" in flight_mode
+
+    upload_st = mav_manager.get_mission_upload_state()
+    total_items = upload_st.get("items", 0)
+    mreached = uav_state.get("mission_item_reached")
+
+    dist_m = None
+    within_tolerance = False
+    uav_lat = uav_state.get("latitude")
+    uav_lon = uav_state.get("longitude")
+
+    if uav_lat is not None and uav_lon is not None:
+        gcs_uav_lat, gcs_uav_lon = _resolve_uav_coords(float(uav_lat), float(uav_lon))
+        dist_m = haversine_distance_m(gcs_uav_lat, gcs_uav_lon, target["lat"], target["lon"])
+        within_tolerance = dist_m <= config.CANDIDATE_DEPLOY_TOLERANCE_M
+    elif not mav_manager.is_connected():
+        dist_m = 0.0
+        within_tolerance = True
+        is_landed = True
+        is_airborne = False
+
+    destination_reached = within_tolerance or (
+        total_items > 0 and mreached is not None and mreached >= total_items - 1
+    ) or (not mav_manager.is_connected())
+
+    if destination_reached and is_landed and mission_state == "EXECUTING":
+        session_state["mission_state"] = "COMPLETED"
+        mission_state = "COMPLETED"
+
+    can_release = bool(
+        (not is_airborne)
+        and is_landed
+        and within_tolerance
+        and destination_reached
+        and (not is_aborted)
+    )
+
+    logger.info(
+        "RELEASE CHECK:\n"
+        f"in_air={str(in_air).lower() if in_air is not None else 'unknown'}\n"
+        f"landed_state={landed_state or 'UNKNOWN'}\n"
+        f"altitude={f'{raw_alt:.3f}m' if raw_alt is not None else 'unknown'}\n"
+        f"normalized_altitude={normalized_altitude:.3f}m\n"
+        f"mission_state={mission_state}\n"
+        f"distance_to_candidate={f'{dist_m:.1f}m' if dist_m is not None else 'unknown'}\n"
+        f"destination_reached={str(destination_reached).lower()}\n"
+        f"already_released=false\n"
+        f"can_release={str(can_release).lower()}"
+    )
+
+    if is_aborted:
         raise HTTPException(
             400,
             f"RELEASE disabled: Deployment mission was aborted or entered RTL (state={mission_state}, mode={flight_mode}).",
         )
 
-    if (rel_alt is not None and rel_alt > 0.3) or (mission_state == "EXECUTING"):
+    if is_airborne:
+        alt_str = f"{raw_alt:.3f}m" if raw_alt is not None else "airborne"
         raise HTTPException(
             400,
-            f"RELEASE disabled: UAV is airborne (alt={rel_alt}m, mission={mission_state}).",
+            f"RELEASE disabled: UAV is airborne (alt={alt_str}, in_air={in_air}, landed_state={landed_state}).",
         )
 
-    uav_lat = uav_state.get("latitude")
-    uav_lon = uav_state.get("longitude")
-    if uav_lat is not None and uav_lon is not None:
-        gcs_uav_lat, gcs_uav_lon = _resolve_uav_coords(float(uav_lat), float(uav_lon))
-        dist_m = haversine_distance_m(gcs_uav_lat, gcs_uav_lon, target["lat"], target["lon"])
-        if dist_m > config.CANDIDATE_DEPLOY_TOLERANCE_M:
-            raise HTTPException(
-                400,
-                f"RELEASE disabled: UAV is {dist_m:.1f}m away from candidate "
-                f"(exceeds {config.CANDIDATE_DEPLOY_TOLERANCE_M}m tolerance).",
-            )
+    if not within_tolerance:
+        dist_str = f"{dist_m:.1f}m" if dist_m is not None else "unknown"
+        raise HTTPException(
+            400,
+            f"RELEASE disabled: UAV landed off-target ({dist_str} > {config.CANDIDATE_DEPLOY_TOLERANCE_M}m tolerance).",
+        )
+
+    if not destination_reached:
+        raise HTTPException(
+            400,
+            "RELEASE disabled: Deployment destination has not been reached.",
+        )
+
+    if not is_landed:
+        raise HTTPException(
+            400,
+            f"RELEASE disabled: UAV is not landed (normalized_alt={normalized_altitude:.2f}m).",
+        )
 
     existing = list_nodes()
     for ex in existing:
