@@ -10,15 +10,17 @@
 % Key Features:
 %   1. Dynamic Node Handling: Exactly N nodes deployed -> exactly N RSSI values.
 %      No hardcoded 3-node fallback.
-%   2. RFRangeScale = 0.25: Calibrates effective coverage distance to ~1/4 range
-%      without altering UAV altitude or flight path.
+%   2. RFRangeScale = 0.30: Calibrates effective coverage distance to ~3/10 range.
 %   3. Dynamic Affected Area: Adapts areaSize to the actual user polygon geometry.
 %   4. Real RF Survey: Uses real GPS + RSSI points collected by the UAV.
 %   5. Direct Model Integration: Configures and opens EmergencyNetwork.slx directly.
+%   6. NO stale MAT fallback: if backend is unavailable, setup stops cleanly.
+%   7. maxSurveyPoints = numSamples (no padding to 25 for real data).
+%   8. simStopTime = 2*maxSurveyPoints - 1 (BEFORE + AFTER survey passes).
 
 clear; clc;
 
-%% ---- Determine Scpt Location and Add functions/ to MATLAB Path ----
+%% ---- Determine Script Location and Add functions/ to MATLAB Path ----
 % This MUST happen before any System Object classes are referenced,
 % including EnvironmentVisualizer, SurveyDataLoggerAfter, RFModel, etc.
 projectDir   = fileparts(mfilename('fullpath'));
@@ -34,7 +36,7 @@ BACKEND_URL  = sprintf('http://%s:%d', BACKEND_HOST, BACKEND_PORT);
 SURVEY_DATA_ENDPOINT = [BACKEND_URL '/api/rf-survey/data'];
 NODES_ENDPOINT       = [BACKEND_URL '/api/nodes'];
 
-% Phase 4 Final: Configurable RF range scale (1.0 = normal, 0.30 = 3/10 effective range)
+% RF range scale (1.0 = normal, 0.30 = 3/10 effective range)
 RFRangeScale = 0.30;
 
 % Local tangent-plane conversion constant (matching backend/coordinate_mapper.py)
@@ -58,20 +60,20 @@ options = weboptions('Timeout', 10, 'ContentType', 'json');
 
 surveyJson = [];
 deployedNodesList = [];
+backendAvailable = false;
+
 try
     surveyJson = webread(SURVEY_DATA_ENDPOINT, options);
+    backendAvailable = true;
     fprintf('Connected to backend survey API. State: %s | Samples: %d\n', ...
         surveyJson.state, surveyJson.sample_count);
 catch ME
-    warning('Could not read survey data from %s: %s', SURVEY_DATA_ENDPOINT, ME.message);
-    if exist('gcs_survey_data.mat', 'file')
-        load('gcs_survey_data.mat');
-        fprintf('Loaded cached survey data from gcs_survey_data.mat\n');
-    else
-        surveyJson = struct('state', 'IDLE', 'sample_count', 0, ...
-            'scan_start_position', [], 'affected_area', [], ...
-            'deployed_nodes', [], 'samples', []);
-    end
+    fprintf('ERROR: Could not connect to backend at %s\n', SURVEY_DATA_ENDPOINT);
+    fprintf('  Reason: %s\n', ME.message);
+    fprintf('  Please ensure the GCS backend is running before calling setupGCS.\n');
+    fprintf('  No stale MAT file will be loaded as a fallback.\n');
+    fprintf('  Setup aborted.\n');
+    return;
 end
 
 %% ---- Check Backend Survey State (SCAN_COMPLETE required for valid data) ----
@@ -83,7 +85,6 @@ if isfield(surveyJson, 'state')
         fprintf('  Sample count: %d (partial).\n', surveyJson.sample_count);
         fprintf('  This dataset will NOT be treated as a valid completed survey.\n');
         fprintf('  Please run a complete RF scan (SCAN_COMPLETE) before analysis.\n');
-        % Allow setup to continue with partial data for inspection, but mark it
         surveyJson.is_complete = false;
     elseif strcmp(backendState, 'SCAN_COMPLETE')
         fprintf('Survey state: SCAN_COMPLETE (%d samples) - Valid completed survey.\n', ...
@@ -136,13 +137,13 @@ if ~isempty(polyLats)
     maxLat    = max(polyLats);
     maxLon    = max(polyLons);
     cosLat    = cosd((originLat + maxLat) / 2);
-    
+
     widthM  = max((maxLon - originLon) * METRES_PER_DEG_LAT * cosLat, 80);
     heightM = max((maxLat - originLat) * METRES_PER_DEG_LAT, 80);
-    
+
     % Pad dimensions slightly for visualization borders (10% padding)
     areaSize = [ceil(widthM * 1.1), ceil(heightM * 1.1)];
-    
+
     affectedAreaPolyM = [ ...
         (polyLons - originLon) * METRES_PER_DEG_LAT * cosLat, ...
         (polyLats - originLat) * METRES_PER_DEG_LAT ...
@@ -214,6 +215,18 @@ for i = 1:numNodesTotal
         i, nodeLabels{i}, nodePositions(i, 1), nodePositions(i, 2), nodePositions(i, 3));
 end
 
+%% ---- Zero Node Guard ----
+if numNodesTotal == 0
+    fprintf('\n');
+    fprintf('========================================================\n');
+    fprintf('  No deployed communication nodes.\n');
+    fprintf('  Deploy at least one node before running the\n');
+    fprintf('  Simulink analysis (EmergencyNetwork.slx).\n');
+    fprintf('========================================================\n');
+    % Do not fabricate a node, do not fabricate RSSI, do not open SLX.
+    return;
+end
+
 %% ---- Process Scan Start Position (scanStartPosition) ----
 if isfield(surveyJson, 'scan_start_position') && ~isempty(surveyJson.scan_start_position)
     sp = surveyJson.scan_start_position;
@@ -236,6 +249,7 @@ if isfield(surveyJson, 'samples') && ~isempty(surveyJson.samples)
 end
 
 if numSamples > 0
+    % ---- Real survey data path ----
     surveyTimestamp = zeros(numSamples, 1);
     surveyLat       = zeros(numSamples, 1);
     surveyLon       = zeros(numSamples, 1);
@@ -244,8 +258,9 @@ if numSamples > 0
     surveyY         = zeros(numSamples, 1);
     surveyBestRSSI  = zeros(numSamples, 1);
     surveyWaypoint  = zeros(numSamples, 1);
-    surveyRSSI      = -100 * ones(numSamples, max(numNodesTotal, 1));
-    
+    % surveyRSSI: columns = deployed nodes; RF values come from backend, NOT modified here.
+    surveyRSSI      = -100 * ones(numSamples, numNodesTotal);
+
     for k = 1:numSamples
         if iscell(rawSamples)
             s = rawSamples{k};
@@ -258,10 +273,10 @@ if numSamples > 0
         surveyAlt(k)       = s.altitude;
         if isfield(s, 'best_rssi'), surveyBestRSSI(k) = s.best_rssi; end
         if isfield(s, 'current_waypoint'), surveyWaypoint(k) = s.current_waypoint; end
-        
+
         surveyX(k) = (s.longitude - originLon) * METRES_PER_DEG_LAT * cosLat;
         surveyY(k) = (s.latitude  - originLat) * METRES_PER_DEG_LAT;
-        
+
         if isfield(s, 'rssi') && ~isempty(s.rssi)
             rDict = s.rssi;
             for nIdx = 1:numNodesTotal
@@ -275,19 +290,20 @@ if numSamples > 0
             end
         end
     end
-    
-    % Recompute bestRSSI as max across actual deployed nodes
-    if numNodesTotal > 0
-        surveyBestRSSI = max(surveyRSSI(:, 1:numNodesTotal), [], 2);
-    else
-        surveyBestRSSI = -100 * ones(numSamples, 1);
-    end
-    
+
+    % Recompute bestRSSI as max across actual deployed nodes.
+    % surveyRSSI values are NOT multiplied by RFRangeScale -- they are real measured values.
+    surveyBestRSSI = max(surveyRSSI(:, 1:numNodesTotal), [], 2);
+
     surveyPoints = [surveyX, surveyY, surveyAlt];
     fprintf('Loaded %d real survey samples from RF Scan.\n', numSamples);
+
+    % maxSurveyPoints = exact number of real samples (no padding to 25).
+    maxSurveyPoints = numSamples;
+
 else
+    % ---- No backend samples: generate a demonstration grid ----
     fprintf('No survey samples in backend yet. Creating sample grid for demonstration...\n');
-    % Generate a grid over the actual affected area for dry-run
     gridRes = 30;
     xSteps = 20:gridRes:(areaSize(1)-20);
     ySteps = 20:gridRes:(areaSize(2)-20);
@@ -300,8 +316,8 @@ else
     surveyLat = originLat + surveyY / METRES_PER_DEG_LAT;
     surveyLon = originLon + surveyX / (METRES_PER_DEG_LAT * cosLat);
     surveyPoints = [surveyX, surveyY, surveyAlt];
-    
-    surveyRSSI = -100 * ones(numSamples, max(numNodesTotal, 1));
+
+    surveyRSSI = -100 * ones(numSamples, numNodesTotal);
     for k = 1:numSamples
         for nIdx = 1:numNodesTotal
             d = norm([surveyX(k), surveyY(k), surveyAlt(k)] - nodePositions(nIdx, :));
@@ -309,15 +325,18 @@ else
             surveyRSSI(k, nIdx) = -30.0 - (10.0 * 2.2 * log10(dEff));
         end
     end
-    if numNodesTotal > 0
-        surveyBestRSSI = max(surveyRSSI(:, 1:numNodesTotal), [], 2);
-    else
-        surveyBestRSSI = -100 * ones(numSamples, 1);
-    end
+    surveyBestRSSI = max(surveyRSSI(:, 1:numNodesTotal), [], 2);
+    surveyWaypoint = zeros(numSamples, 1);
+
+    % maxSurveyPoints = exact demo sample count.
+    maxSurveyPoints = numSamples;
 end
 
-maxSurveyPoints = max(numSamples, 25);
-simStopTime     = max(numSamples, 49);
+% Simulation stop time: one pass BEFORE survey + one pass AFTER survey.
+simStopTime = 2 * maxSurveyPoints - 1;
+
+fprintf('maxSurveyPoints = %d\n', maxSurveyPoints);
+fprintf('simStopTime     = %d\n', simStopTime);
 
 %% ---- Coverage Classification & Gap Detection ----
 % Status codes: 3 = GOOD, 2 = MODERATE, 1 = WEAK, 0 = GAP
@@ -353,7 +372,7 @@ fprintf('  GAP (<= -85 dBm):      %4d (%5.1f%%)\n', gapCount, 100 * gapCount / n
 
 %% ---- Candidate Placement Algorithm (Phase 4) ----
 % Cluster gap points using single-link clustering scaled by RFRangeScale
-GapClusterDistance = 250 * RFRangeScale; % e.g. 62.5 m
+GapClusterDistance = 250 * RFRangeScale; % e.g. 75 m at 0.30
 candidates = [];
 
 if gapCount > 0
@@ -378,34 +397,34 @@ if gapCount > 0
         nextRegion = nextRegion + 1;
     end
     numRegions = nextRegion - 1;
-    
+
     candX     = zeros(numRegions, 1);
     candY     = zeros(numRegions, 1);
     candGaps  = zeros(numRegions, 1);
     candDist  = zeros(numRegions, 1);
     candScore = zeros(numRegions, 1);
-    
+
     for r = 1:numRegions
         idx = (regionId == r);
         cx = mean(gapX(idx));
         cy = mean(gapY(idx));
         cx = min(max(cx, 10), areaSize(1) - 10);
         cy = min(max(cy, 10), areaSize(2) - 10);
-        
+
         candX(r) = cx;
         candY(r) = cy;
         candGaps(r) = sum(idx);
-        
+
         if numNodesTotal > 0
             dists = hypot(nodePositions(:,1) - cx, nodePositions(:,2) - cy);
             candDist(r) = min(dists);
         else
             candDist(r) = 100.0;
         end
-        
+
         candScore(r) = candGaps(r) * 10.0 + candDist(r) * 0.1;
     end
-    
+
     % Rank descending by score (Candidate 1 is best)
     [~, sortOrder] = sort(candScore, 'descend');
     candX     = candX(sortOrder);
@@ -413,9 +432,9 @@ if gapCount > 0
     candGaps  = candGaps(sortOrder);
     candDist  = candDist(sortOrder);
     candScore = candScore(sortOrder);
-    
+
     candidates = [candX, candY, 10 * ones(numRegions, 1)];
-    
+
     fprintf('\n---- Ranked Candidate Locations ----\n');
     fprintf('Detected %d gap cluster(s):\n', numRegions);
     for c = 1:numRegions
@@ -452,7 +471,6 @@ for k = 1:numSamples
 end
 
 % Plot deployed ground nodes with coverage circles
-
 for nIdx = 1:numNodesTotal
     plot(axCov, nodePositions(nIdx, 1), nodePositions(nIdx, 2), 'o', ...
         'MarkerFaceColor', 'b', 'MarkerEdgeColor', 'k', 'MarkerSize', 10);
@@ -508,7 +526,6 @@ if ~isempty(candidates)
     numCand = size(candidates, 1);
     for c = 1:numCand
         if c == 1
-            % Best candidate prominently highlighted
             plot(axGap, candidates(c, 1), candidates(c, 2), 'p', ...
                 'MarkerFaceColor', [1 0.8 0], 'MarkerEdgeColor', [0 0.2 0.8], ...
                 'MarkerSize', 24, 'LineWidth', 2.5, ...
@@ -528,7 +545,8 @@ if ~isempty(candidates)
 end
 legend(axGap, 'Location', 'bestoutside');
 
-%% ---- Save Workspace Variables & Open EmergencyNetwork.slx ----
+%% ---- Save Workspace Variables ----
+% Note: 'buildings' variable has been completely removed from this project.
 save('gcs_survey_data.mat', ...
     'areaSize', 'nodePositions', 'nodeLabels', 'dronePosition', ...
     'scanStartPosition', 'affectedAreaPolyM', ...
@@ -539,6 +557,19 @@ save('gcs_survey_data.mat', ...
 
 fprintf('\nWorkspace variables loaded for EmergencyNetwork.slx:\n');
 fprintf('  areaSize, nodePositions, nodeLabels, dronePosition, surveyPoints, RFRangeScale, simStopTime\n');
+
+%% ---- Set EmergencyNetwork.slx StopTime Programmatically ----
+modelName = 'EmergencyNetwork';
+modelPath = fullfile(projectDir, [modelName '.slx']);
+if bdIsLoaded(modelName)
+    set_param(modelName, 'StopTime', num2str(simStopTime));
+    fprintf('Set %s StopTime = %d\n', modelName, simStopTime);
+elseif exist(modelPath, 'file')
+    % Load the model silently to set the parameter, then leave it loaded
+    load_system(modelPath);
+    set_param(modelName, 'StopTime', num2str(simStopTime));
+    fprintf('Set %s StopTime = %d\n', modelName, simStopTime);
+end
 
 %% ---- Validate Required System Object Classes ----
 % All required .m files must be resolvable on the MATLAB path before
@@ -577,9 +608,7 @@ if ~allFound
 end
 fprintf('All required System Object classes resolved successfully.\n');
 
-% Open the existing EmergencyNetwork.slx model directly
-modelName = 'EmergencyNetwork';
-modelPath = fullfile(projectDir, [modelName '.slx']);
+% Open the existing EmergencyNetwork.slx model
 if exist(modelPath, 'file')
     fprintf('Opening %s.slx...\n', modelName);
     open_system(modelPath);

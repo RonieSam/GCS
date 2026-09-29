@@ -6,7 +6,7 @@ classdef SurveyDataLogger < matlab.System
     %
     % Inputs:
     %   dronePosition - 1x3, current drone position [x y z]
-    %   rssiValues    - 1x3, RSSI (dBm) from each ground node at this position
+    %   rssiValues    - 1xN, RSSI (dBm) from each ground node at this position
     %
     % Outputs (all 1 x MaxPoints, in survey order; unfilled slots = NaN):
     %   surveyX      - x coordinate of each survey point
@@ -17,7 +17,7 @@ classdef SurveyDataLogger < matlab.System
     %                  (reused via composition, thresholds never duplicated)
     %   pointCount   - scalar, how many points have been recorded so far
 
-    properties
+    properties (Nontunable)
         MaxPoints = 25
     end
 
@@ -32,9 +32,8 @@ classdef SurveyDataLogger < matlab.System
 
     methods (Access = protected)
         function setupImpl(obj)
-            if evalin('base', 'exist(''maxSurveyPoints'', ''var'')')
-                obj.MaxPoints = max(evalin('base', 'maxSurveyPoints'), 25);
-            end
+            % MaxPoints is provided through the block dialog (e.g. MaxPoints = maxSurveyPoints).
+            % No evalin access to base workspace.
             obj.Classifier   = CoverageClassifier();
             obj.SurveyX      = NaN(1, obj.MaxPoints);
             obj.SurveyY      = NaN(1, obj.MaxPoints);
@@ -77,6 +76,40 @@ classdef SurveyDataLogger < matlab.System
         end
         function num = getNumOutputsImpl(~)
             num = 5;
+        end
+
+        % Explicit output propagation methods
+        function varargout = getOutputSizeImpl(obj)
+            mp = obj.MaxPoints;
+            varargout{1} = [1 mp];   % surveyX
+            varargout{2} = [1 mp];   % surveyY
+            varargout{3} = [1 mp];   % surveyRSSI
+            varargout{4} = [1 mp];   % surveyStatus
+            varargout{5} = [1 1];    % pointCount (scalar)
+        end
+
+        function varargout = getOutputDataTypeImpl(~)
+            varargout{1} = 'double';
+            varargout{2} = 'double';
+            varargout{3} = 'double';
+            varargout{4} = 'double';
+            varargout{5} = 'double';
+        end
+
+        function varargout = isOutputComplexImpl(~)
+            varargout{1} = false;
+            varargout{2} = false;
+            varargout{3} = false;
+            varargout{4} = false;
+            varargout{5} = false;
+        end
+
+        function varargout = isOutputFixedSizeImpl(~)
+            varargout{1} = true;
+            varargout{2} = true;
+            varargout{3} = true;
+            varargout{4} = true;
+            varargout{5} = true;
         end
     end
 end

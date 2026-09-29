@@ -6,7 +6,7 @@ classdef CandidatePlacement < matlab.System
     % Inputs:
     %   gapX, gapY    - 1xMaxPoints (from GapDetector), NaN-padded
     %   gapCount      - scalar, number of valid gap points
-    %   nodePositions - 3x3 existing ground node positions (for the
+    %   nodePositions - Nx3 existing ground node positions (for the
     %                   distance-from-existing-network ranking factor)
     %
     % Outputs (all 1 x MaxCandidates, NaN-padded beyond candidateCount):
@@ -14,10 +14,7 @@ classdef CandidatePlacement < matlab.System
     %                                        at SurveyAltitude)
     %   candidateGapCount    - how many gap points this candidate represents
     %   candidateScore       - simple priority score (higher = higher priority)
-    %   candidateInBuilding  - 1 if the candidate centroid falls inside a
-    %                          known building footprint, else 0 (flagged,
-    %                          not auto-relocated -- keeps this deterministic
-    %                          and easy to reason about)
+    %   candidateInBuilding  - permanently zero (no building model in project)
     %   candidateCount       - scalar, number of candidates generated
     %
     % METHOD (deliberately simple -- spatial engineering, not ML/optimization):
@@ -31,42 +28,41 @@ classdef CandidatePlacement < matlab.System
     %     ranks higher. Weights are plain tunable numbers, not a claim of
     %     mathematical optimality.
 
-    properties
-        GapClusterDistance = 250    % metres -- points this close join one region
+    properties (Nontunable)
+        GapClusterDistance = 75     % metres -- derived as 250 * RFRangeScale in setupImpl
         MaxPoints          = 25
         MaxCandidates      = 25
         SurveyAltitude     = 30     % metres, Z for every candidate
         AreaSize           = [1000 1000]
         GapCountWeight     = 10
         DistanceWeight     = 0.1
-        RFRangeScale       = 0.25
+        RFRangeScale       = 0.30
     end
 
     methods (Access = protected)
         function setupImpl(obj)
-            if evalin('base', 'exist(''areaSize'', ''var'')')
-                obj.AreaSize = evalin('base', 'areaSize');
-            end
-            if evalin('base', 'exist(''maxSurveyPoints'', ''var'')')
-                obj.MaxPoints = max(evalin('base', 'maxSurveyPoints'), 25);
-                obj.MaxCandidates = obj.MaxPoints;
-            end
-            if evalin('base', 'exist(''RFRangeScale'', ''var'')')
-                obj.RFRangeScale = evalin('base', 'RFRangeScale');
-                obj.GapClusterDistance = 250 * obj.RFRangeScale;
-            end
+            % All parameters come through block dialog -- no evalin.
+            % Derive GapClusterDistance from the Nontunable RFRangeScale property.
+            % NOTE: Nontunable properties cannot be changed after setup,
+            % so GapClusterDistance must be used directly in stepImpl via
+            % obj.RFRangeScale instead of being overwritten here.
+            % (Cannot write to a Nontunable property in setupImpl after
+            %  the object is locked.)
         end
 
         function [candidateX, candidateY, candidateZ, candidateGapCount, ...
                 candidateScore, candidateInBuilding, candidateCount] = ...
                 stepImpl(obj, gapX, gapY, gapCount, nodePositions)
 
+            % Effective cluster distance derived from RFRangeScale
+            clusterDist = 250 * obj.RFRangeScale;
+
             candidateX          = NaN(1, obj.MaxCandidates);
             candidateY          = NaN(1, obj.MaxCandidates);
             candidateZ          = NaN(1, obj.MaxCandidates);
             candidateGapCount   = zeros(1, obj.MaxCandidates);
             candidateScore      = NaN(1, obj.MaxCandidates);
-            candidateInBuilding = zeros(1, obj.MaxCandidates);
+            candidateInBuilding = zeros(1, obj.MaxCandidates);  % always 0: no buildings
             candidateCount      = 0;
 
             if gapCount == 0
@@ -96,7 +92,7 @@ classdef CandidatePlacement < matlab.System
                         inRegionIdx = find(regionId == nextRegion);
                         d = hypot(pointsX(inRegionIdx) - pointsX(j), ...
                                   pointsY(inRegionIdx) - pointsY(j));
-                        if any(d <= obj.GapClusterDistance)
+                        if any(d <= clusterDist)
                             regionId(j) = nextRegion;
                             changed = true;
                         end
@@ -114,8 +110,6 @@ classdef CandidatePlacement < matlab.System
                 cx = min(max(cx, 0), obj.AreaSize(1));   % keep inside the area
                 cy = min(max(cy, 0), obj.AreaSize(2));
 
-               
-
                 nodeDistances = sqrt((nodePositions(:,1) - cx).^2 + ...
                                       (nodePositions(:,2) - cy).^2);
                 nearestNodeDist = min(nodeDistances);
@@ -129,7 +123,7 @@ classdef CandidatePlacement < matlab.System
                 candidateZ(r)          = obj.SurveyAltitude;
                 candidateGapCount(r)   = gapPointsInRegion;
                 candidateScore(r)      = score;
-                candidateInBuilding(r) = 0;
+                candidateInBuilding(r) = 0;   % no building model
             end
             candidateCount = numRegions;
 
@@ -150,6 +144,36 @@ classdef CandidatePlacement < matlab.System
         end
         function num = getNumOutputsImpl(~)
             num = 7;
+        end
+
+        % Explicit output propagation methods
+        function varargout = getOutputSizeImpl(obj)
+            mc = obj.MaxCandidates;
+            varargout{1} = [1 mc];   % candidateX
+            varargout{2} = [1 mc];   % candidateY
+            varargout{3} = [1 mc];   % candidateZ
+            varargout{4} = [1 mc];   % candidateGapCount
+            varargout{5} = [1 mc];   % candidateScore
+            varargout{6} = [1 mc];   % candidateInBuilding
+            varargout{7} = [1 1];    % candidateCount (scalar)
+        end
+
+        function varargout = getOutputDataTypeImpl(~)
+            for k = 1:7
+                varargout{k} = 'double';
+            end
+        end
+
+        function varargout = isOutputComplexImpl(~)
+            for k = 1:7
+                varargout{k} = false;
+            end
+        end
+
+        function varargout = isOutputFixedSizeImpl(~)
+            for k = 1:7
+                varargout{k} = true;
+            end
         end
     end
 end

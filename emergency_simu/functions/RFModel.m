@@ -2,29 +2,28 @@ classdef RFModel < matlab.System
     % RFModel  Simplified log-distance path-loss RSSI calculator.
     %
     % Inputs:
-    %   nodePositions - 3x3 matrix, [x y z] per ground node
+    %   nodePositions - Nx3 matrix, [x y z] per ground node
     %   dronePosition - 1x3 vector, [x y z]
     %
     % Output:
-    %   rssiValues - 1x3 vector, simulated RSSI (dBm) from drone to each node
+    %   rssiValues - 1xN vector, simulated RSSI (dBm) from drone to each node
     %
-    % DEMO ASSUMPTIONS (not real Wi-Fi specs):
-    %   ReferenceRSSI      = -40 dBm at ReferenceDistance
-    %   ReferenceDistance  = 1 m
-    %   PathLossExponent   = 3 (moderate outdoor/obstructed environment)
+    % Distance is purely horizontal (X-Y plane only).
+    %   d        = hypot(droneX-nodeX, droneY-nodeY)
+    %   d        = max(d, ReferenceDistance)
+    %   dEff     = d / RFRangeScale
+    %   RSSI     = ReferenceRSSI - 10*PathLossExponent*log10(dEff/ReferenceDistance)
 
-    properties
-        ReferenceRSSI     = -30
+    properties (Nontunable)
+        ReferenceRSSI     = -30.0
+        ReferenceDistance = 1.0
         PathLossExponent  = 2.2
-        ReferenceDistance = 1
-        RFRangeScale      = 0.25
+        RFRangeScale      = 0.30
     end
 
     methods (Access = protected)
-        function setupImpl(obj)
-            if evalin('base', 'exist(''RFRangeScale'', ''var'')')
-                obj.RFRangeScale = evalin('base', 'RFRangeScale');
-            end
+        function setupImpl(~)
+            % No base-workspace access. All parameters come through block dialog.
         end
 
         function rssiValues = stepImpl(obj, nodePositions, dronePosition)
@@ -32,7 +31,8 @@ classdef RFModel < matlab.System
             rssiValues = zeros(1, numNodes);
             scale = max(obj.RFRangeScale, 1e-6);
             for i = 1:numNodes
-                d = norm(dronePosition - nodePositions(i, :));
+                d = hypot(dronePosition(1) - nodePositions(i, 1), ...
+                          dronePosition(2) - nodePositions(i, 2));
                 d = max(d, obj.ReferenceDistance);
                 dEff = d / scale;
                 rssiValues(i) = obj.ReferenceRSSI - ...
@@ -45,6 +45,23 @@ classdef RFModel < matlab.System
         end
         function num = getNumOutputsImpl(~)
             num = 1;
+        end
+
+        function sizeOut = getOutputSizeImpl(obj)
+            inputSize = propagatedInputSize(obj, 1);
+            sizeOut = [1 inputSize(1)];
+        end
+
+        function typeOut = getOutputDataTypeImpl(~)
+            typeOut = 'double';
+        end
+
+        function c = isOutputComplexImpl(~)
+            c = false;
+        end
+
+        function f = isOutputFixedSizeImpl(~)
+            f = true;
         end
     end
 end

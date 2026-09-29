@@ -4,7 +4,7 @@ classdef GapVisualizer < matlab.System
     % EnvironmentVisualizer and CoverageMap -- both keep working unchanged.
     %
     % Inputs:
-    %   nodePositions  - 3x3, existing ground node positions
+    %   nodePositions  - Nx3, existing ground node positions
     %   gapX, gapY     - 1xMaxPoints (NaN-padded), from GapDetector
     %   gapCount       - scalar
     %   candidateX, candidateY - 1xMaxCandidates (NaN-padded), from CandidatePlacement
@@ -16,7 +16,7 @@ classdef GapVisualizer < matlab.System
     % squares, candidate locations = black stars (larger, sized/labeled by
     % rank so higher-priority candidates stand out).
 
-    properties
+    properties (Nontunable)
         AreaSize  = [1000 1000]
     end
 
@@ -27,9 +27,8 @@ classdef GapVisualizer < matlab.System
 
     methods (Access = protected)
         function setupImpl(obj)
-            if evalin('base', 'exist(''areaSize'', ''var'')')
-                obj.AreaSize = evalin('base', 'areaSize');
-            end
+            % AreaSize is provided through the block dialog (e.g. AreaSize = areaSize).
+            % No evalin access to base workspace.
             obj.FigureHandle = figure('Name', 'EmergencyNetwork - Gap Analysis', ...
                 'NumberTitle', 'off', 'Color', 'w');
             obj.AxesHandle = axes('Parent', obj.FigureHandle);
@@ -46,8 +45,6 @@ classdef GapVisualizer < matlab.System
             ylabel(ax, 'Y (metres)');
             title(ax, sprintf('Gap Analysis - %d gap points, %d candidate(s)', ...
                 gapCount, candidateCount));
-
-            
 
             % --- Existing ground nodes: blue circles ---
             plot(ax, nodePositions(:,1), nodePositions(:,2), 'o', ...

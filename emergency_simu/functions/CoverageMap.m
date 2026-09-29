@@ -4,18 +4,22 @@ classdef CoverageMap < matlab.System
     %
     % Inputs:
     %   dronePosition - 1x3, current drone position [x y z]
-    %   rssiValues    - 1x3, RSSI (dBm) from each ground node at this position
+    %   rssiValues    - 1xN, RSSI (dBm) from each ground node at this position
     %
     % No outputs -- draws its own figure, same pattern as EnvironmentVisualizer.
     %
+    % Block parameters (dialog, provided from base workspace):
+    %   AreaSize  - [width height] in metres
+    %   MaxPoints - total survey points, used only for the progress title
+    %
     % DESIGN NOTE (assumption): a survey point's coverage is classified using
-    % the STRONGEST (max) of the 3 per-node RSSI values at that position --
+    % the STRONGEST (max) of the per-node RSSI values at that position --
     % i.e. "the best connection quality available here." Classification
     % reuses CoverageClassifier's exact thresholds via composition (it holds
     % and calls a real CoverageClassifier instance -- not a second, separately
     % maintained copy of the threshold logic).
 
-    properties
+    properties (Nontunable)
         AreaSize  = [1000 1000]
         MaxPoints = 25   % total survey points, only used for the progress title
     end
@@ -32,12 +36,8 @@ classdef CoverageMap < matlab.System
 
     methods (Access = protected)
         function setupImpl(obj)
-            if evalin('base', 'exist(''areaSize'', ''var'')')
-                obj.AreaSize = evalin('base', 'areaSize');
-            end
-            if evalin('base', 'exist(''maxSurveyPoints'', ''var'')')
-                obj.MaxPoints = max(evalin('base', 'maxSurveyPoints'), 25);
-            end
+            % AreaSize and MaxPoints are provided through the block dialog.
+            % No evalin access to base workspace.
             obj.FigureHandle = figure('Name', 'EmergencyNetwork - Coverage Map', ...
                 'NumberTitle', 'off', 'Color', 'w');
             obj.AxesHandle = axes('Parent', obj.FigureHandle);

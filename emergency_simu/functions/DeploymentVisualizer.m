@@ -3,18 +3,18 @@ classdef DeploymentVisualizer < matlab.System
     % the simulated new node clearly marked in the AFTER panel only.
     %
     % Inputs:
-    %   nodePositions         - 3x3, ORIGINAL ground nodes (shown in both panels)
-    %   deployedNodePositions - 4x3, row 4 is the simulated new node (drawn
-    %                           only if it isn't NaN -- i.e. only if Phase 5
-    %                           actually produced a candidate)
-    %   beforeX, beforeY, beforeStatus, beforeCount - BEFORE survey (3 nodes)
-    %   afterX,  afterY,  afterStatus,  afterCount  - AFTER survey (4 nodes)
+    %   nodePositions         - Nx3, ORIGINAL ground nodes (shown in both panels)
+    %   deployedNodePositions - (N+1)x3, the final row is the simulated new node
+    %                           (drawn only if it is not NaN -- i.e. only if Phase 5
+    %                           actually produced a candidate).
+    %                           Row count is dynamic; do NOT assume row 4.
+    %   beforeX, beforeY, beforeStatus, beforeCount - BEFORE survey (N nodes)
+    %   afterX,  afterY,  afterStatus,  afterCount  - AFTER survey (N+1 nodes)
     %
     % No outputs -- draws its own figure with two subplots.
 
     properties (Nontunable)
         AreaSize  = [1000 1000]
-        Buildings = zeros(0, 4)
     end
 
     properties (Access = private)
@@ -40,7 +40,15 @@ classdef DeploymentVisualizer < matlab.System
             obj.drawPanel(obj.AxesBefore, 'BEFORE Deployment', nodePositions, ...
                 beforeX, beforeY, beforeStatus, beforeCount, statusColors, [], false);
 
-            newNode = deployedNodePositions(4, :);
+            % The newly deployed node is the LAST row of deployedNodePositions.
+            % This is dynamic: it works regardless of N (do NOT hardcode row 4).
+            nRows = size(deployedNodePositions, 1);
+            if nRows > 0
+                newNode = deployedNodePositions(nRows, :);
+            else
+                newNode = [NaN NaN NaN];
+            end
+
             obj.drawPanel(obj.AxesAfter, 'AFTER Deployment', nodePositions, ...
                 afterX, afterY, afterStatus, afterCount, statusColors, newNode, true);
 
@@ -69,12 +77,7 @@ classdef DeploymentVisualizer < matlab.System
             ylabel(ax, 'Y (metres)');
             title(ax, panelTitle);
 
-            for i = 1:size(obj.Buildings, 1)
-                x = obj.Buildings(i, 1); y = obj.Buildings(i, 2);
-                w = obj.Buildings(i, 3); d = obj.Buildings(i, 4);
-                rectangle(ax, 'Position', [x y w d], ...
-                    'FaceColor', [0.6 0.6 0.6], 'EdgeColor', 'k');
-            end
+            % No Buildings: the project has no building model.
 
             for i = 1:pointCount
                 idx = pointStatus(i) + 1;
@@ -85,7 +88,7 @@ classdef DeploymentVisualizer < matlab.System
             plot(ax, nodePositions(:, 1), nodePositions(:, 2), 'o', ...
                 'MarkerFaceColor', 'b', 'MarkerEdgeColor', 'k', 'MarkerSize', 9);
 
-            if showNewNode && ~isnan(newNode(1))
+            if showNewNode && ~isempty(newNode) && ~isnan(newNode(1))
                 plot(ax, newNode(1), newNode(2), 'p', ...
                     'MarkerFaceColor', 'g', 'MarkerEdgeColor', 'k', 'MarkerSize', 16);
                 text(ax, newNode(1) + 15, newNode(2), 'Deployed Node', ...

@@ -15,15 +15,14 @@ classdef GapDetector < matlab.System
     %   gapCount   - scalar, number of gap points found (calculated, never
     %                hard-coded)
 
-    properties
+    properties (Nontunable)
         MaxPoints = 25
     end
 
     methods (Access = protected)
-        function setupImpl(obj)
-            if evalin('base', 'exist(''maxSurveyPoints'', ''var'')')
-                obj.MaxPoints = max(evalin('base', 'maxSurveyPoints'), 25);
-            end
+        function setupImpl(~)
+            % MaxPoints is provided through the block dialog (e.g. MaxPoints = maxSurveyPoints).
+            % No evalin access to base workspace.
         end
 
         function [gapX, gapY, gapCount] = stepImpl(obj, surveyX, surveyY, surveyStatus, pointCount)
@@ -45,6 +44,32 @@ classdef GapDetector < matlab.System
         end
         function num = getNumOutputsImpl(~)
             num = 3;
+        end
+
+        % Explicit output propagation methods
+        function varargout = getOutputSizeImpl(obj)
+            mp = obj.MaxPoints;
+            varargout{1} = [1 mp];   % gapX
+            varargout{2} = [1 mp];   % gapY
+            varargout{3} = [1 1];    % gapCount (scalar)
+        end
+
+        function varargout = getOutputDataTypeImpl(~)
+            varargout{1} = 'double';
+            varargout{2} = 'double';
+            varargout{3} = 'double';
+        end
+
+        function varargout = isOutputComplexImpl(~)
+            varargout{1} = false;
+            varargout{2} = false;
+            varargout{3} = false;
+        end
+
+        function varargout = isOutputFixedSizeImpl(~)
+            varargout{1} = true;
+            varargout{2} = true;
+            varargout{3} = true;
         end
     end
 end

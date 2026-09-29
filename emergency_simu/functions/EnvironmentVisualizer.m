@@ -8,12 +8,11 @@ classdef EnvironmentVisualizer < matlab.System
     %   status        - 1xN vector, coverage code per node
     %                   (3=GOOD, 2=MODERATE, 1=WEAK, 0=GAP; from CoverageClassifier)
     %
-    % Block parameters (dialog, tunable from base workspace):
+    % Block parameters (dialog, provided from base workspace):
     %   AreaSize    - [width height] in metres
     %   NodeLabels  - cell array of label strings
-    %   Buildings   - Nx4 matrix [x y width depth]
 
-    properties
+    properties (Nontunable)
         AreaSize   = [1000 1000]
         NodeLabels = {'Node 1', 'Node 2', 'Node 3'}
     end
@@ -25,12 +24,8 @@ classdef EnvironmentVisualizer < matlab.System
 
     methods (Access = protected)
         function setupImpl(obj)
-            if evalin('base', 'exist(''areaSize'', ''var'')')
-                obj.AreaSize = evalin('base', 'areaSize');
-            end
-            if evalin('base', 'exist(''nodeLabels'', ''var'')')
-                obj.NodeLabels = evalin('base', 'nodeLabels');
-            end
+            % AreaSize and NodeLabels are provided through the block dialog.
+            % No evalin access to base workspace.
             obj.FigureHandle = figure('Name', 'EmergencyNetwork - Coverage', ...
                 'NumberTitle', 'off', 'Color', 'w');
             obj.AxesHandle = axes('Parent', obj.FigureHandle);
@@ -46,13 +41,12 @@ classdef EnvironmentVisualizer < matlab.System
             ylabel(ax, 'Y (metres)');
             title(ax, 'Emergency Network Environment - Coverage Status');
 
-            
-
             % --- Status -> color / name lookup (index = status code + 1) ---
             statusColors = {[0.85 0 0], [1 0.55 0], [0.90 0.75 0], [0 0.6 0]}; % GAP WEAK MODERATE GOOD
             statusNames  = {'GAP', 'WEAK', 'MODERATE', 'GOOD'};
 
             % --- Ground nodes: colored marker + RSSI/status text ---
+            % Dynamic: works for N = 1, 2, 3, or any supported number.
             for i = 1:size(nodePositions, 1)
                 idx = status(i) + 1;
                 nodeColor = statusColors{idx};
