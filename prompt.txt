@@ -1,0 +1,121 @@
+<USER_REQUEST>
+PHASE 6/7 — COMPLETE MISSION COORDINATION, STATE-MACHINE, ABORT, RTL, RETURN-HOME AND RELEASE RELIABILITY AUDIT
+
+This is NOT a cosmetic task.
+
+The GCS currently has mission-coordination problems when:
+- an RF survey finishes and the operator tries to run another RF survey;
+- a node deployment mission reaches its destination but RELEASE is pressed late;
+- ABORT/RTL is used;
+- RETURN TO HOME is used;
+- mission completion state and physical UAV state become inconsistent.
+
+Do NOT guess at the causes.
+
+You must inspect the existing backend + frontend + MAVLink telemetry handling and identify the exact root causes before changing the code.
+
+The goal is to make mission execution deterministic and recoverable.
+
+========================================================
+1. CURRENT OBSERVED PROBLEMS
+========================================================
+
+Problem A — Re-running an RF mission after completion
+
+Example:
+
+RF survey mission
+→ generated
+→ uploaded
+→ started
+→ completed
+
+Then operator attempts:
+
+Generate RF Survey Mission
+→ Upload
+→ Start
+
+but the system reports something equivalent to:
+
+"MISSION COMPLETED"
+
+or behaves as though the previous mission is still active/completed.
+
+Determine exactly why this happens.
+
+Possible causes to investigate:
+
+- stale backend mission_state;
+- old PX4 mission ID/state being reused;
+- current_waypoint not reset;
+- mission_uploaded flag not reset;
+- mission_started flag not reset;
+- mission_complete flag not reset;
+- RF collector state not reset;
+- old mission type still stored;
+- old mission items still associated with current mission;
+- frontend caching an old mission state;
+- start endpoint checking a terminal state from the previous mission;
+- asynchronous telemetry overwriting newly requested state;
+- PX4 mission sequence not synchronized after a new upload;
+- old WebSocket state arriving after the new mission state;
+- mission completion event being treated as global UAV state.
+
+DO N
+<truncated 35182 bytes>
+iginal-position behavior remains unchanged.
+
+20. Historical RF survey data remains immutable.
+
+========================================================
+49. FINAL REPORT FORMAT
+========================================================
+
+After implementation, report:
+
+A. Every bug discovered.
+B. Root cause of each bug.
+C. Exact files/functions involved.
+D. New mission state machine.
+E. Physical UAV state model.
+F. Release state model.
+G. Mission ID mechanism.
+H. How old completed missions are separated from new missions.
+I. How stale telemetry is prevented from corrupting state.
+J. How RF collector reset works.
+K. How RELEASE remains available after a long wait.
+L. Abort behavior.
+M. RTL behavior.
+N. Return Home behavior.
+O. Command serialization.
+P. Recovery/timeout behavior.
+Q. Unit/integration test results.
+R. Full pytest count.
+S. Actual PX4/Gazebo runtime results.
+T. Any remaining issues.
+
+Do not simply report that tests pass.
+
+For each of the original observed bugs, show:
+
+BEFORE
+→ ROOT CAUSE
+→ FIX
+→ TEST
+→ RUNTIME RESULT.
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-09-29T20:47:14+05:30.
+
+The user's current state is as follows:
+Other open documents:
+- c:\Users\Ronie Samuel\Documents\Code\gcs\backend\mavlink_mission.py (LANGUAGE_PYTHON)
+- c:\Users\Ronie Samuel\Documents\Code\gcs\backend\tests\test_phase4_corrections.py (LANGUAGE_PYTHON)
+- c:\Users\Ronie Samuel\Documents\Code\gcs\backend\database.py (LANGUAGE_PYTHON)
+- c:\Users\Ronie Samuel\Documents\Code\gcs\emergency_simu\functions\SurveyDataLogger.m (LANGUAGE_MATLAB)
+- c:\Users\Ronie Samuel\Documents\Code\gcs\emergency_simu\functions\DroneSurvey.m (LANGUAGE_MATLAB)
+</ADDITIONAL_METADATA>
+<USER_SETTINGS_CHANGE>
+The user changed setting `Model Selection` from Gemini 3.8 Flash (High) to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.
+</USER_SETTINGS_CHANGE>

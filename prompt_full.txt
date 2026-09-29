@@ -1,0 +1,1907 @@
+<USER_REQUEST>
+PHASE 6/7 — COMPLETE MISSION COORDINATION, STATE-MACHINE, ABORT, RTL, RETURN-HOME AND RELEASE RELIABILITY AUDIT
+
+This is NOT a cosmetic task.
+
+The GCS currently has mission-coordination problems when:
+- an RF survey finishes and the operator tries to run another RF survey;
+- a node deployment mission reaches its destination but RELEASE is pressed late;
+- ABORT/RTL is used;
+- RETURN TO HOME is used;
+- mission completion state and physical UAV state become inconsistent.
+
+Do NOT guess at the causes.
+
+You must inspect the existing backend + frontend + MAVLink telemetry handling and identify the exact root causes before changing the code.
+
+The goal is to make mission execution deterministic and recoverable.
+
+========================================================
+1. CURRENT OBSERVED PROBLEMS
+========================================================
+
+Problem A — Re-running an RF mission after completion
+
+Example:
+
+RF survey mission
+→ generated
+→ uploaded
+→ started
+→ completed
+
+Then operator attempts:
+
+Generate RF Survey Mission
+→ Upload
+→ Start
+
+but the system reports something equivalent to:
+
+"MISSION COMPLETED"
+
+or behaves as though the previous mission is still active/completed.
+
+Determine exactly why this happens.
+
+Possible causes to investigate:
+
+- stale backend mission_state;
+- old PX4 mission ID/state being reused;
+- current_waypoint not reset;
+- mission_uploaded flag not reset;
+- mission_started flag not reset;
+- mission_complete flag not reset;
+- RF collector state not reset;
+- old mission type still stored;
+- old mission items still associated with current mission;
+- frontend caching an old mission state;
+- start endpoint checking a terminal state from the previous mission;
+- asynchronous telemetry overwriting newly requested state;
+- PX4 mission sequence not synchronized after a new upload;
+- old WebSocket state arriving after the new mission state;
+- mission completion event being treated as global UAV state.
+
+DO NOT simply clear random flags until the exact state flow is understood.
+
+========================================================
+2. PROBLEM B — RELEASE CAN MISS ITS WINDOW
+========================================================
+
+Current behavior:
+
+Node deployment mission starts.
+UAV flies toward destination.
+UAV reaches destination / lands.
+RELEASE becomes available or should become available.
+
+But if the operator waits too long before pressing RELEASE:
+
+RELEASE may stop working.
+
+This is incorrect.
+
+The release opportunity should not depend on the operator pressing the button within a narrow timing window.
+
+Once the UAV has successfully reached the deployment destination and is confirmed landed/on-target:
+
+RELEASE_READY must become a persistent/latching state.
+
+Example:
+
+MISSION FLYING
+↓
+DESTINATION REACHED
+↓
+LANDING
+↓
+LANDED + ON TARGET
+↓
+RELEASE_READY = TRUE
+↓
+WAIT 5 seconds
+↓
+WAIT 30 seconds
+↓
+WAIT 2 minutes
+↓
+RELEASE still READY
+↓
+operator presses RELEASE
+↓
+release succeeds
+
+The operator should not lose the release opportunity merely because they were slow.
+
+========================================================
+3. IMPORTANT — RELEASE STATE IS NOT THE SAME AS MISSION STATE
+========================================================
+
+Separate:
+
+A. mission lifecycle
+
+from:
+
+B. release lifecycle.
+
+Example:
+
+MISSION:
+DEPLOYMENT_FLYING
+→ DEPLOYMENT_LANDED
+→ DEPLOYMENT_COMPLETE
+
+RELEASE:
+NOT_READY
+→ READY
+→ RELEASED
+
+After landing:
+
+mission_state = DEPLOYMENT_COMPLETE
+release_state = READY
+
+The fact that mission_state is COMPLETE must NOT automatically disable RELEASE.
+
+After successful release:
+
+mission_state = DEPLOYMENT_COMPLETE
+release_state = RELEASED
+
+This is a valid stable state.
+
+========================================================
+4. RELEASE MUST BE LATCHED
+========================================================
+
+Once all release conditions are satisfied, set something like:
+
+release_ready = true
+
+and preserve it until one of these happens:
+
+1. RELEASE succeeds.
+2. Deployment is explicitly cancelled.
+3. A new deployment mission is started.
+4. The selected deployment target is changed.
+5. A safety condition invalidates the deployment.
+
+DO NOT clear release_ready merely because:
+- the mission moved from EXECUTING → COMPLETED;
+- current waypoint changed;
+- PX4 stopped reporting a mission event;
+- a telemetry update arrived;
+- the operator waited;
+- the UI refreshed.
+
+========================================================
+5. RELEASE CONDITIONS
+========================================================
+
+RELEASE becomes READY only when ALL required physical conditions are satisfied.
+
+For the current deployment target:
+
+- correct deployment mission is active/just completed;
+- destination has been reached;
+- UAV is physically landed;
+- UAV is not in_air;
+- altitude is at/below landing threshold;
+- UAV is within configured target tolerance;
+- no abort/RTL/return-home operation is active;
+- node has not already been released.
+
+Once these conditions become true:
+
+release_ready = TRUE
+
+and this state remains latched.
+
+Do not require mission_state == "EXECUTING".
+
+Do not require a specific exact current waypoint after landing.
+
+Do not require the operator to click immediately.
+
+========================================================
+6. PHYSICAL UAV STATE VS MISSION STATE
+========================================================
+
+Create a clear separation between:
+
+PHYSICAL STATE
+
+Examples:
+
+UNKNOWN
+ON_GROUND
+TAKING_OFF
+AIRBORNE
+LANDING
+
+and:
+
+MISSION STATE
+
+Examples:
+
+IDLE
+GENERATED
+UPLOADED
+STARTING
+EXECUTING
+DESTINATION_REACHED
+COMPLETED
+ABORTED
+FAILED
+
+These must not be treated as synonyms.
+
+Example valid state:
+
+physical_state = ON_GROUND
+mission_state = COMPLETED
+
+This is normal.
+
+Another valid state:
+
+physical_state = AIRBORNE
+mission_state = EXECUTING
+
+Normal.
+
+Potentially invalid state for release:
+
+physical_state = AIRBORNE
+mission_state = COMPLETED
+
+This must be investigated/reconciled rather than blindly used as release permission.
+
+========================================================
+7. ONE AUTHORITATIVE MISSION CONTROLLER
+========================================================
+
+Inspect the existing architecture.
+
+If mission state is currently updated independently from:
+- main.py;
+- mavlink manager;
+- telemetry broadcaster;
+- frontend;
+- RF collector;
+
+centralize mission lifecycle decisions.
+
+Create or refactor into one authoritative mission coordinator/service.
+
+For example:
+
+MissionCoordinator
+
+Responsibilities:
+
+- create mission instance;
+- identify mission type;
+- track mission ID;
+- track mission state;
+- track mission destination;
+- track start/completion;
+- track abort;
+- track RTL;
+- track return-home;
+- reconcile PX4 telemetry;
+- expose current state to frontend;
+- protect against stale events.
+
+Frontend must display the state from this source of truth.
+
+Frontend must NOT invent mission state independently.
+
+========================================================
+8. EVERY MISSION MUST HAVE A UNIQUE MISSION ID
+========================================================
+
+Do not identify missions only by:
+
+mission_state
+
+or mission type.
+
+Every generated mission instance should receive a unique ID.
+
+Example:
+
+RF-SURVEY-001
+RF-SURVEY-002
+DEPLOY-001
+DEPLOY-002
+
+or UUIDs.
+
+State must belong to the mission ID.
+
+Example:
+
+current_mission = {
+    id: "RF-SURVEY-002",
+    type: "RF_SURVEY",
+    state: "EXECUTING",
+    ...
+}
+
+When RF-SURVEY-001 completes:
+
+its state becomes:
+
+COMPLETED
+
+That must NOT prevent creation of:
+
+RF-SURVEY-002
+
+A terminal state belongs to the old mission instance.
+
+========================================================
+9. NEW MISSION MUST CREATE A CLEAN MISSION INSTANCE
+========================================================
+
+When:
+
+Generate RF Survey Mission
+
+is clicked:
+
+create a NEW mission object.
+
+Do not reuse the old completed object.
+
+Reset only the state that belongs to the NEW mission.
+
+Example:
+
+old:
+RF-SURVEY-001
+COMPLETED
+
+new:
+RF-SURVEY-002
+GENERATED
+
+Then:
+
+Upload:
+UPLOADED
+
+Start:
+STARTING → EXECUTING
+
+Survey:
+SCANNING
+
+Finish:
+COMPLETED
+
+The new mission must never inherit:
+
+- old mission_complete;
+- old current_waypoint;
+- old start timestamp;
+- old mission items;
+- old RF collector completion;
+- old release state.
+
+========================================================
+10. MISSION TYPE MUST ALSO BE EXPLICIT
+========================================================
+
+Supported mission types should remain distinct:
+
+RF_SURVEY
+NODE_DEPLOYMENT
+RETURN_HOME
+
+Do NOT infer mission type from a generic mission state.
+
+For example:
+
+mission.type = RF_SURVEY
+mission.state = COMPLETED
+
+is very different from:
+
+mission.type = NODE_DEPLOYMENT
+mission.state = COMPLETED
+
+The frontend must show the correct workflow for the current mission type.
+
+========================================================
+11. PX4 MISSION SEQUENCE MANAGEMENT
+========================================================
+
+Inspect how the current backend handles:
+
+- mission upload;
+- mission items;
+- mission start;
+- current waypoint;
+- mission completion;
+- mission clear;
+- replacement/upload of a new mission.
+
+Determine whether the next mission is being rejected because PX4 still has:
+- old mission items;
+- old mission sequence;
+- old current sequence;
+- old completion event.
+
+Do not blindly issue MISSION_CLEAR_ALL unless it is safe and compatible with the existing architecture.
+
+Instead determine:
+
+1. What is actually stored in PX4?
+2. What mission sequence is uploaded?
+3. What sequence does PX4 report?
+4. What does the backend think the current mission is?
+5. What does the frontend think it is?
+
+Make the states agree.
+
+========================================================
+12. MISSION START MUST NOT BE BLOCKED BY STALE TERMINAL STATE
+========================================================
+
+A new mission should be allowed when:
+
+current mission:
+COMPLETED / ABORTED / FAILED
+
+and the new mission has been newly generated and uploaded.
+
+The start endpoint must evaluate the CURRENT mission instance.
+
+It must NOT simply reject because:
+
+global mission_state == COMPLETED
+
+For example, this is wrong:
+
+if mission_state == "COMPLETED":
+    reject_start()
+
+because a newly uploaded mission can legitimately follow a completed mission.
+
+Correct logic:
+
+if current_mission.state in ACTIVE_STATES:
+    enforce active-mission conflict rules
+
+elif current_mission belongs to old mission:
+    allow creation of a new mission
+
+========================================================
+13. DEFINE EXPLICIT ACTIVE STATES
+========================================================
+
+Create clear categories.
+
+TERMINAL:
+
+COMPLETED
+ABORTED
+FAILED
+CANCELLED
+
+ACTIVE:
+
+STARTING
+EXECUTING
+RETURNING
+LANDING
+DEPLOYMENT_READY
+
+PRE-ACTIVE:
+
+DRAFT
+GENERATED
+UPLOADED
+
+The exact names may follow the current codebase, but the distinction must exist.
+
+Only ACTIVE missions should block starting another mission.
+
+========================================================
+14. DO NOT ALLOW TWO ACTIVE MISSIONS SIMULTANEOUSLY
+========================================================
+
+There must be exactly one active UAV mission at a time.
+
+If a mission is:
+
+EXECUTING
+
+and the operator tries to start another:
+
+REJECT with:
+
+"UAV already has an active mission."
+
+But once the current mission is:
+
+COMPLETED
+ABORTED
+FAILED
+CANCELLED
+
+a new mission can be created.
+
+Do not confuse:
+"there was a completed mission"
+
+with:
+"there is an active mission."
+
+========================================================
+15. RF SURVEY LIFECYCLE
+========================================================
+
+RF Survey should have its own explicit lifecycle.
+
+Example:
+
+IDLE
+↓
+MISSION_GENERATED
+↓
+MISSION_UPLOADED
+↓
+WAITING_TO_START
+↓
+STARTING
+↓
+TRANSIT_TO_SCAN_START
+↓
+SCANNING
+↓
+FINAL_WAYPOINT_REACHED
+↓
+RETURNING_TO_ORIGINAL_POSITION
+↓
+LANDING_AT_ORIGINAL_POSITION
+↓
+COMPLETED
+
+After COMPLETED:
+
+RF collector:
+COMPLETE
+
+Mission:
+COMPLETED
+
+The operator must be able to immediately create another RF survey.
+
+New survey:
+
+new survey ID
+new mission ID
+new collector session
+new sample buffer
+new survey-start point
+new return point
+
+Do NOT reuse the previous survey's collector session.
+
+========================================================
+16. RF SAMPLE COLLECTOR RESET
+========================================================
+
+Inspect rf_collector carefully.
+
+Determine:
+
+- when state becomes SCANNING;
+- when it becomes COMPLETE;
+- when it becomes ABORTED;
+- when the sample buffer is cleared;
+- when a new survey session is created.
+
+A new survey MUST NOT inherit:
+
+old:
+SCAN_STATE_COMPLETE
+
+or:
+
+old sample buffer.
+
+But historical survey data must remain preserved.
+
+Correct model:
+
+Historical Survey 001
+→ immutable
+
+Current Collector
+→ reset
+→ new Survey 002
+
+========================================================
+17. RF SURVEY COMPLETION EVENT
+========================================================
+
+Do not mark the survey complete merely because the backend sees a generic mission completion message.
+
+RF survey completion should require the actual RF survey's relevant terminal condition.
+
+For example:
+
+final survey waypoint reached
+AND
+survey sample collection completed
+
+Then:
+
+rf_survey_state = COMPLETE
+
+Return-to-home portion is separate from RF sampling.
+
+Sampling remains COMPLETE while the UAV returns and lands.
+
+The survey mission itself can finish after landing.
+
+Keep the two concepts separate:
+
+RF DATA COLLECTION COMPLETE
+
+vs
+
+UAV MISSION COMPLETE
+
+========================================================
+18. DEPLOYMENT MISSION LIFECYCLE
+========================================================
+
+Node deployment mission should be:
+
+GENERATED
+↓
+UPLOADED
+↓
+STARTING
+↓
+TAKEOFF
+↓
+FLYING_TO_DESTINATION
+↓
+DESTINATION_REACHED
+↓
+LANDING
+↓
+LANDED_ON_TARGET
+↓
+RELEASE_READY
+↓
+RELEASE
+↓
+RELEASE_SUCCESS
+↓
+MISSION_COMPLETE
+
+Do not make:
+
+MISSION_COMPLETE
+
+immediately imply:
+
+RELEASED
+
+They are separate.
+
+========================================================
+19. DESTINATION REACHED MUST BE LATCHED
+========================================================
+
+When the UAV first satisfies destination arrival conditions:
+
+destination_reached = true
+
+Keep this state.
+
+Do not clear it just because:
+- current waypoint changes;
+- mission state changes;
+- telemetry update arrives;
+- PX4 reports a different sequence.
+
+If the UAV then successfully lands within tolerance:
+
+landed_on_target = true
+release_ready = true
+
+========================================================
+20. RELEASE TARGET MUST BE STORED WITH MISSION
+========================================================
+
+The deployment mission must contain:
+
+mission.target_lat
+mission.target_lon
+
+not rely on:
+- current selected candidate UI;
+- current map marker;
+- latest candidate list.
+
+This prevents the target from changing underneath an active mission.
+
+When release is evaluated:
+
+use the target belonging to that mission ID.
+
+This is important if the operator selects another candidate later.
+
+========================================================
+21. RELEASE AFTER A LONG WAIT
+========================================================
+
+Explicitly test:
+
+UAV lands on target.
+
+release_ready = true.
+
+Wait:
+1 second.
+10 seconds.
+30 seconds.
+60 seconds.
+
+release_ready must remain TRUE.
+
+Then:
+
+POST /api/deployment/release
+
+must succeed.
+
+Only after successful release:
+
+release_state = RELEASED.
+
+========================================================
+22. RELEASE FAILURE MUST NOT DESTROY READY STATE UNLESS APPROPRIATE
+========================================================
+
+If RELEASE is attempted and the backend returns a transient failure:
+
+Do not automatically assume the mission is invalid.
+
+Keep enough state to allow another attempt where safe.
+
+For example:
+
+release_ready = true
+release_attempt = FAILED
+
+Then the UI can show:
+
+RELEASE FAILED
+Retry
+
+Only clear release_ready when the safety conditions are no longer satisfied or the mission is explicitly invalidated.
+
+Do not make one failed HTTP request permanently destroy the release opportunity.
+
+If a failure means the physical payload mechanism itself is permanently unavailable, distinguish that explicitly.
+
+========================================================
+23. ABORT SEMANTICS
+========================================================
+
+ABORT must be treated as a deliberate mission transition.
+
+For an active mission:
+
+EXECUTING
+→ ABORTING
+→ RETURNING/RTL
+→ LANDING
+→ ABORTED or COMPLETED_WITH_RTL
+
+Do not instantly label it COMPLETED.
+
+Determine what PX4 actually reports.
+
+Important:
+
+An aborted mission must NOT:
+- create a node;
+- become release-ready;
+- leave the old mission blocking all future missions.
+
+After the abort/return operation is safely terminal:
+
+a new mission may be generated.
+
+========================================================
+24. RTL SEMANTICS
+========================================================
+
+RTL means:
+
+Return to PX4's configured home.
+
+It is NOT equivalent to:
+- RF survey return point;
+- deployment target;
+- current map click;
+- previous mission destination.
+
+Track this distinctly:
+
+RETURN_HOME mode/action
+
+When RTL is requested:
+- cancel/terminate the current mission according to the existing safe PX4 behavior;
+- mark the previous mission as interrupted/aborted as appropriate;
+- do not claim mission success;
+- disable RELEASE;
+- do not create a node;
+- allow recovery after the vehicle reaches a terminal safe state.
+
+========================================================
+25. RETURN HOME SEMANTICS
+========================================================
+
+Keep:
+
+RETURN TO HOME
+
+as a separate operator action.
+
+It should not reuse RF survey's special "return to original pre-survey location" state.
+
+RF survey:
+
+original pre-survey position
+→ survey
+→ original pre-survey position
+→ land
+
+Generic Return Home:
+
+current mission interrupted
+→ PX4 HOME
+→ land / appropriate PX4 RTL behavior
+
+Deployment mission:
+
+candidate
+→ land at candidate
+→ RELEASE
+→ then operator may Return Home
+
+Do not merge these paths.
+
+========================================================
+26. COMMAND SERIALIZATION
+========================================================
+
+Inspect whether commands can race with each other.
+
+Examples:
+
+START + ABORT
+START + RETURN_HOME
+ABORT + RTL
+RELEASE + RETURN_HOME
+GENERATE + START
+UPLOAD + START
+
+Implement a command guard / mutex / state check.
+
+Only one mission-control command should be modifying the mission lifecycle at a time.
+
+Commands should return deterministic results.
+
+Example:
+
+START:
+ACCEPTED
+or
+REJECTED: mission not uploaded
+
+ABORT:
+ACCEPTED
+or
+REJECTED: no active mission
+
+RETURN HOME:
+ACCEPTED
+or
+REJECTED: UAV not connected
+
+RELEASE:
+ACCEPTED
+or
+REJECTED: release conditions not satisfied
+
+========================================================
+27. TELEMETRY RECONCILIATION
+========================================================
+
+This is critical.
+
+Telemetry is asynchronous.
+
+The following can arrive out of order:
+
+- mission state;
+- current waypoint;
+- GPS;
+- altitude;
+- landed state;
+- heartbeat.
+
+Do NOT let an old telemetry packet blindly overwrite a newer backend state.
+
+Create a reconciliation layer.
+
+For every telemetry update determine:
+
+- current physical state;
+- current PX4 mission sequence;
+- current position;
+- landed state;
+- altitude;
+- mode.
+
+Then reconcile them against:
+
+current mission ID
+current mission type
+current mission state.
+
+Do not infer everything from one field.
+
+========================================================
+28. FRONTEND MUST USE SERVER STATE
+========================================================
+
+The frontend must not maintain an independent mission truth.
+
+Do not let:
+
+app.js
+
+decide:
+
+"mission complete"
+
+unless it comes from backend state.
+
+Frontend should render:
+
+current mission
+physical UAV state
+release state
+command availability
+
+from backend/WebSocket state.
+
+This prevents UI/backend disagreement.
+
+========================================================
+29. UI STATE SHOULD BE EXPLICIT
+========================================================
+
+Show the operator:
+
+MISSION
+
+RF SURVEY
+SCANNING
+
+or:
+
+NODE DEPLOYMENT
+FLYING TO TARGET
+
+or:
+
+NODE DEPLOYMENT
+LANDED — RELEASE READY
+
+or:
+
+MISSION
+COMPLETED
+
+Also show:
+
+UAV
+ON GROUND
+
+or:
+
+UAV
+AIRBORNE
+
+Do not combine these into one ambiguous status.
+
+========================================================
+30. COMMAND AVAILABILITY MATRIX
+========================================================
+
+Build one centralized function that determines which actions are allowed.
+
+Example:
+
+-------------------------------------------------
+STATE                         START  ABORT  RTL  RELEASE
+-------------------------------------------------
+IDLE                          YES    NO     YES  NO
+RF SCANNING                   NO     YES    YES  NO
+RF RETURNING                  NO     YES    YES  NO
+RF COMPLETED                  YES    NO     YES  NO
+DEPLOYMENT FLYING             NO     YES    YES  NO
+DEPLOYMENT LANDED ON TARGET   NO     NO     YES  YES
+DEPLOYMENT OFF TARGET         NO     ...    YES  NO
+RELEASED                      YES    NO     YES  NO
+ABORTED                       YES    NO     YES  NO
+-------------------------------------------------
+
+This is an example only.
+
+Derive the exact allowed transitions from the actual implementation.
+
+Do not scatter button conditions across dozens of frontend functions.
+
+========================================================
+31. MISSION TRANSITION TABLE
+========================================================
+
+Create a formal transition table in the implementation.
+
+For example:
+
+IDLE
+→ GENERATED
+
+GENERATED
+→ UPLOADED
+→ CANCELLED
+
+UPLOADED
+→ STARTING
+→ CANCELLED
+
+STARTING
+→ EXECUTING
+→ FAILED
+→ ABORTING
+
+EXECUTING
+→ DESTINATION_REACHED
+→ COMPLETED
+→ ABORTING
+→ FAILED
+
+DESTINATION_REACHED
+→ LANDING
+→ ABORTING
+→ FAILED
+
+LANDING
+→ LANDED
+→ FAILED
+
+LANDED
+→ RELEASE_READY
+
+RELEASE_READY
+→ RELEASED
+→ ABORTED/CANCELLED if mission is invalidated
+
+RELEASED
+→ COMPLETED
+
+Completed/Aborted/Failed
+→ new mission instance
+
+Do not blindly use this exact table if PX4 behavior requires a different transition. Adapt it to the real code.
+
+The important requirement is that transitions are explicit and valid.
+
+========================================================
+32. NEVER USE "MISSION COMPLETE" AS A GLOBAL BLOCK
+========================================================
+
+This is a major requirement.
+
+BAD:
+
+if mission_state == "COMPLETED":
+    disable START permanently
+
+BAD:
+
+if mission_state == "COMPLETED":
+    disable RELEASE
+
+BAD:
+
+if mission_state == "COMPLETED":
+    block new RF survey
+
+Instead:
+
+inspect current mission instance
+and its type/state.
+
+A completed mission is history.
+
+A new mission is a new state machine instance.
+
+========================================================
+33. DEBUG LOGGING
+========================================================
+
+Add structured mission logs.
+
+For every mission event log:
+
+timestamp
+mission_id
+mission_type
+previous_state
+new_state
+PX4 mode
+PX4 mission sequence
+current waypoint
+physical flight state
+latitude
+longitude
+altitude
+
+Example:
+
+[19:20:10]
+Mission RF-SURVEY-001
+EXECUTING → COMPLETED
+PX4 seq=27
+physical_state=ON_GROUND
+
+Then:
+
+[19:20:12]
+New mission RF-SURVEY-002
+CREATED
+
+[19:20:15]
+RF-SURVEY-002
+CREATED → UPLOADED
+
+[19:20:20]
+RF-SURVEY-002
+UPLOADED → EXECUTING
+
+This will make mission bugs diagnosable instead of mysterious.
+
+========================================================
+34. RELEASE DEBUG LOGGING
+========================================================
+
+When checking RELEASE, log every condition independently:
+
+RELEASE CHECK
+
+mission_id:
+DEPLOY-002
+
+target:
+lat=...
+lon=...
+
+uav:
+lat=...
+lon=...
+
+distance:
+2.4m
+
+in_air:
+false
+
+landed_state:
+ON_GROUND
+
+altitude:
+0.02m
+
+destination_reached:
+true
+
+release_ready:
+true
+
+already_released:
+false
+
+rtl_active:
+false
+
+abort_active:
+false
+
+RESULT:
+READY
+
+If rejected:
+
+RESULT:
+REJECTED
+
+REASON:
+OFF_TARGET
+
+Do NOT produce misleading messages such as:
+
+"airborne"
+
+solely because:
+
+mission_state = EXECUTING.
+
+========================================================
+35. RETURN HOME DEBUGGING
+========================================================
+
+When Return Home is requested, log:
+
+current mission ID
+current mission type
+current mission state
+PX4 mode before
+requested action
+PX4 mode response
+result
+
+Then observe live telemetry until:
+
+RETURNING
+→ LANDED
+
+Do not mark it complete merely because the command was accepted.
+
+"COMMAND ACCEPTED"
+
+is not the same thing as:
+
+"UAV RETURNED HOME"
+
+========================================================
+36. ABORT DEBUGGING
+========================================================
+
+Same principle.
+
+Do not treat:
+
+POST /abort → HTTP 200
+
+as:
+
+mission successfully aborted
+
+That only means the command was accepted.
+
+Track:
+
+ABORT REQUESTED
+→ PX4 COMMAND ACCEPTED
+→ PX4 actually transitions
+→ UAV returns/lands
+→ mission terminal state
+
+========================================================
+37. RETRY / RECOVERY
+========================================================
+
+The GCS must recover gracefully from:
+
+- failed upload;
+- failed start;
+- failed abort;
+- failed RTL;
+- telemetry interruption;
+- mission timeout;
+- PX4 mode mismatch;
+- stale telemetry;
+- temporary MAVLink disconnect.
+
+Do not leave the application permanently stuck.
+
+For example:
+
+mission state:
+STARTING
+
+for too long
+
+→ timeout
+→ FAILED
+
+Then allow a new mission.
+
+Do not leave:
+
+STARTING
+
+forever.
+
+========================================================
+38. MISSION CLEANUP
+========================================================
+
+Do not destroy historical information when starting a new mission.
+
+Separate:
+
+current mission state
+
+from:
+
+mission history/log.
+
+A completed RF mission can remain in a lightweight history/log:
+
+RF-SURVEY-001
+COMPLETED
+
+while the current mission becomes:
+
+RF-SURVEY-002
+EXECUTING
+
+Only ONE is current.
+
+This will also make debugging easier.
+
+========================================================
+39. RF HISTORY VS MISSION HISTORY
+========================================================
+
+Do not mix:
+
+survey history
+
+with:
+
+mission history.
+
+RF survey history stores:
+
+- samples;
+- nodes;
+- classifications;
+- heatmap;
+- statistics;
+- candidate analysis.
+
+Mission history stores:
+
+- mission ID;
+- mission type;
+- timestamps;
+- terminal state;
+- destination;
+- events.
+
+They can reference each other using IDs but should not be the same state object.
+
+========================================================
+40. IMPORTANT AUTO DEPLOY REQUIREMENT
+========================================================
+
+AUTO DEPLOY remains completely independent.
+
+AUTO DEPLOY:
+
+select location
+→ create node immediately
+
+It should NOT:
+- create UAV mission;
+- change current UAV mission state;
+- require ARM;
+- require landing;
+- require RELEASE.
+
+Do not accidentally break this while refactoring mission coordination.
+
+========================================================
+41. IMPORTANT RELEASE REQUIREMENT
+========================================================
+
+Mission-based node deployment:
+
+generate mission
+→ upload
+→ start
+→ fly
+→ land on target
+→ RELEASE_READY
+→ operator can wait
+→ RELEASE
+→ backend release succeeds
+→ node created
+
+Node creation must happen ONLY after successful release.
+
+Mission completion must NOT create the node.
+
+Landing must NOT create the node.
+
+Destination reached must NOT create the node.
+
+========================================================
+42. TEST THE EXACT BUGS
+========================================================
+
+Add deterministic tests for:
+
+TEST 1 — Re-run RF survey
+
+RF-SURVEY-001
+→ COMPLETE
+
+Generate RF-SURVEY-002
+
+Expected:
+new mission ID
+state=GENERATED
+
+Upload
+
+Expected:
+state=UPLOADED
+
+Start
+
+Expected:
+state=EXECUTING
+
+Must NOT report:
+"previous mission completed"
+
+------------------------------------------------
+
+TEST 2 — New RF survey resets collector
+
+Survey 001:
+samples > 0
+state=COMPLETE
+
+Start Survey 002
+
+Expected:
+new collector session
+sample_count starts from 0 for Survey 002
+Survey 001 history remains unchanged
+
+------------------------------------------------
+
+TEST 3 — Release late
+
+Deployment mission reaches target.
+
+UAV lands.
+
+release_ready=true.
+
+Wait simulated time.
+
+Expected:
+release_ready remains true.
+
+Then RELEASE.
+
+Expected:
+success.
+
+------------------------------------------------
+
+TEST 4 — Release after mission becomes COMPLETE
+
+Simulate:
+
+mission_state=COMPLETED
+physical_state=ON_GROUND
+destination_reached=true
+on_target=true
+released=false
+
+Expected:
+
+release_ready=true
+
+------------------------------------------------
+
+TEST 5 — Airborne
+
+mission_state=EXECUTING
+in_air=true
+altitude=15
+
+Expected:
+
+release_ready=false
+
+------------------------------------------------
+
+TEST 6 — Off target
+
+mission_state=COMPLETED
+in_air=false
+altitude=0
+distance=25m
+
+Expected:
+
+release_ready=false
+
+------------------------------------------------
+
+TEST 7 — Duplicate release
+
+release once
+→ node created
+
+release again
+→ rejected
+→ node count unchanged
+
+------------------------------------------------
+
+TEST 8 — Abort
+
+mission executing
+→ abort
+
+Expected:
+mission eventually enters terminal aborted/interrupted state
+release=false
+no node created
+new mission can later be generated
+
+------------------------------------------------
+
+TEST 9 — RTL
+
+mission executing
+→ RTL
+
+Expected:
+current mission interrupted safely
+release=false
+UAV eventually returns
+new mission can later be generated
+
+------------------------------------------------
+
+TEST 10 — Return Home after completion
+
+mission complete
+→ Return Home
+
+Expected:
+UAV returns home
+does not alter completed mission history
+does not create a node
+release unaffected unless it is a valid deployment release state
+
+------------------------------------------------
+
+TEST 11 — Command race
+
+Start + Abort simultaneously.
+
+Expected:
+deterministic state transitions.
+No corrupt mission object.
+
+------------------------------------------------
+
+TEST 12 — Telemetry race
+
+Inject old telemetry after a new mission starts.
+
+Expected:
+old terminal event does not overwrite the new mission.
+
+========================================================
+43. ADD A STATE-MACHINE TEST SUITE
+========================================================
+
+Create a dedicated:
+
+test_mission_coordination.py
+
+Do not put all mission coordination tests inside an unrelated RF file.
+
+Cover:
+
+- mission creation;
+- mission IDs;
+- transitions;
+- terminal states;
+- reruns;
+- abort;
+- RTL;
+- return-home;
+- deployment release;
+- telemetry reconciliation;
+- stale event protection;
+- command serialization.
+
+========================================================
+44. LIVE SITL TEST MATRIX
+========================================================
+
+After unit/integration tests pass, perform actual PX4 + Gazebo tests.
+
+TEST A:
+RF survey #1
+→ complete
+→ land
+
+Then immediately:
+
+RF survey #2
+→ generate
+→ upload
+→ start
+
+Expected:
+second mission starts normally.
+
+TEST B:
+Deployment mission
+→ fly to target
+→ land
+→ wait 30–60 seconds
+→ RELEASE
+
+Expected:
+release still available.
+
+TEST C:
+Deployment mission
+→ reach target
+→ land
+→ RELEASE
+
+TEST D:
+Deployment mission
+→ abort during flight
+
+Expected:
+no release
+no node
+future mission works.
+
+TEST E:
+Deployment mission
+→ RTL
+
+Expected:
+safe return
+future mission works.
+
+TEST F:
+RF survey
+→ Return to original pre-survey position
+→ land
+
+Then:
+
+new RF survey
+→ works normally.
+
+TEST G:
+complete mission
+→ Return Home
+
+Then:
+new mission
+→ works.
+
+========================================================
+45. IMPORTANT — DO NOT CLAIM A FIX WITHOUT FINDING THE ROOT CAUSE
+========================================================
+
+For each currently reported problem, identify:
+
+Observed behavior
+→ root cause
+→ exact code path
+→ fix
+→ regression test
+→ live verification
+
+Do not write:
+
+"Fixed by resetting mission state"
+
+unless the exact stale state and its source have been identified.
+
+========================================================
+46. BACKWARD COMPATIBILITY
+========================================================
+
+Preserve existing API endpoints where possible.
+
+Do not break:
+- RF survey APIs;
+- mission APIs;
+- node APIs;
+- deployment APIs;
+- telemetry WebSockets.
+
+If response fields need additions, add fields rather than unnecessarily removing existing fields.
+
+========================================================
+47. FINAL REQUIRED STATE MODEL
+========================================================
+
+The implementation should conceptually become:
+
+                UAV PHYSICAL STATE
+                       │
+                       ▼
+                ON_GROUND / AIRBORNE
+                       │
+                       │
+                       ▼
+                MISSION COORDINATOR
+                       │
+            ┌──────────┼──────────┐
+            ▼          ▼          ▼
+        RF SURVEY   NODE DEPLOY  RETURN HOME
+            │          │
+            │          ▼
+            │      DESTINATION
+            │       REACHED
+            │          │
+            │          ▼
+            │      LANDED ON TARGET
+            │          │
+            │          ▼
+            │      RELEASE READY
+            │          │
+            │          ▼
+            │       RELEASE
+            │          │
+            │          ▼
+            │       NODE CREATED
+            │
+            ▼
+       RETURN TO ORIGINAL
+       PRE-SURVEY LOCATION
+            │
+            ▼
+          LAND
+
+Each mission has its own:
+
+mission_id
+mission_type
+state
+timestamps
+target
+mission items
+completion state
+
+The current mission is independent from previous completed missions.
+
+========================================================
+48. FINAL SUCCESS CRITERIA
+========================================================
+
+The implementation is considered successful only if ALL of these are true:
+
+1. A completed RF survey does not block a new RF survey.
+
+2. A new RF survey gets a new mission/session identity.
+
+3. Previous RF samples remain in history.
+
+4. RF collector resets correctly for the new survey.
+
+5. A deployment mission can reach and land at its destination.
+
+6. RELEASE becomes READY after valid landing.
+
+7. RELEASE stays READY even if the operator waits.
+
+8. Mission completion does NOT disable a valid release.
+
+9. RELEASE creates the node only after backend success.
+
+10. Duplicate RELEASE cannot create another node.
+
+11. ABORT does not accidentally create a node.
+
+12. RTL does not accidentally create a node.
+
+13. Return Home does not corrupt mission history.
+
+14. A new mission can be started after completed/aborted/failed missions.
+
+15. Two active missions cannot exist simultaneously.
+
+16. Stale telemetry from an old mission cannot overwrite a new mission.
+
+17. Frontend state and backend state remain synchronized.
+
+18. AUTO DEPLOY remains unchanged:
+    select location → node immediately created.
+
+19. RF survey return-to-original-position behavior remains unchanged.
+
+20. Historical RF survey data remains immutable.
+
+========================================================
+49. FINAL REPORT FORMAT
+========================================================
+
+After implementation, report:
+
+A. Every bug discovered.
+B. Root cause of each bug.
+C. Exact files/functions involved.
+D. New mission state machine.
+E. Physical UAV state model.
+F. Release state model.
+G. Mission ID mechanism.
+H. How old completed missions are separated from new missions.
+I. How stale telemetry is prevented from corrupting state.
+J. How RF collector reset works.
+K. How RELEASE remains available after a long wait.
+L. Abort behavior.
+M. RTL behavior.
+N. Return Home behavior.
+O. Command serialization.
+P. Recovery/timeout behavior.
+Q. Unit/integration test results.
+R. Full pytest count.
+S. Actual PX4/Gazebo runtime results.
+T. Any remaining issues.
+
+Do not simply report that tests pass.
+
+For each of the original observed bugs, show:
+
+BEFORE
+→ ROOT CAUSE
+→ FIX
+→ TEST
+→ RUNTIME RESULT.
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-09-29T20:47:14+05:30.
+
+The user's current state is as follows:
+Other open documents:
+- c:\Users\Ronie Samuel\Documents\Code\gcs\backend\mavlink_mission.py (LANGUAGE_PYTHON)
+- c:\Users\Ronie Samuel\Documents\Code\gcs\backend\tests\test_phase4_corrections.py (LANGUAGE_PYTHON)
+- c:\Users\Ronie Samuel\Documents\Code\gcs\backend\database.py (LANGUAGE_PYTHON)
+- c:\Users\Ronie Samuel\Documents\Code\gcs\emergency_simu\functions\SurveyDataLogger.m (LANGUAGE_MATLAB)
+- c:\Users\Ronie Samuel\Documents\Code\gcs\emergency_simu\functions\DroneSurvey.m (LANGUAGE_MATLAB)
+</ADDITIONAL_METADATA>
+<USER_SETTINGS_CHANGE>
+The user changed setting `Model Selection` from Gemini 3.8 Flash (High) to Gemini 3.1 Pro (Low). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.
+</USER_SETTINGS_CHANGE>
