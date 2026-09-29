@@ -2172,7 +2172,7 @@ def api_deployment_status():
         is_airborne = normalized_altitude > 1.0
 
     is_landed = (not is_airborne) and (normalized_altitude <= 1.0)
-    is_aborted = mission_state in ("ABORTED", "FAILED") or "RTL" in flight_mode
+    is_aborted = mission_state in ("ABORTED", "FAILED") or ("RTL" in flight_mode and mission_state != "COMPLETED")
 
     upload_st = mav_manager.get_mission_upload_state()
     total_items = upload_st.get("items", 0)
@@ -2307,7 +2307,7 @@ def api_deployment_release(payload: Optional[DeploymentReleaseRequest] = None):
         is_airborne = normalized_altitude > 1.0
 
     is_landed = (not is_airborne) and (normalized_altitude <= 1.0)
-    is_aborted = mission_state in ("ABORTED", "FAILED") or "RTL" in flight_mode
+    is_aborted = mission_state in ("ABORTED", "FAILED") or ("RTL" in flight_mode and mission_state != "COMPLETED")
 
     upload_st = mav_manager.get_mission_upload_state()
     total_items = upload_st.get("items", 0)

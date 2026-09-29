@@ -831,7 +831,8 @@ function startDrawing() {
 
   const drawBtn = document.getElementById("btn-draw");
   drawBtn.classList.add("active");
-  drawBtn.textContent = "Drawing… (click map)";
+  drawBtn.title = "Drawing... (click map)";
+  drawBtn.innerHTML = "🖊";
 
   document.getElementById("btn-clear").disabled = false;
   logEvent("Draw Affected Area started — click the map to place vertices.");
@@ -858,7 +859,8 @@ function finishArea() {
 
   const drawBtn = document.getElementById("btn-draw");
   drawBtn.classList.remove("active");
-  drawBtn.textContent = "Draw Affected Area";
+  drawBtn.title = "Draw Affected Area";
+  drawBtn.innerHTML = "🖊";
   drawBtn.disabled = true;
 
   document.getElementById("btn-finish").disabled = true;
@@ -890,7 +892,8 @@ function clearArea() {
   const drawBtn = document.getElementById("btn-draw");
   drawBtn.disabled = false;
   drawBtn.classList.remove("active");
-  drawBtn.textContent = "Draw Affected Area";
+  drawBtn.title = "Draw Affected Area";
+  drawBtn.innerHTML = "🖊";
 
   document.getElementById("btn-finish").disabled = true;
   document.getElementById("btn-clear").disabled = true;
@@ -3707,21 +3710,6 @@ boot();
     if (typeof map !== "undefined" && map) map.invalidateSize();
   });
 
-  // -------------------------------------------------------------------------
-  // Zoom In / Zoom Out map tools
-  // -------------------------------------------------------------------------
-  const zoomInBtn = document.getElementById("btn-map-zoom-in");
-  const zoomOutBtn = document.getElementById("btn-map-zoom-out");
-  if (zoomInBtn) {
-    zoomInBtn.addEventListener("click", () => {
-      if (typeof map !== "undefined" && map) map.zoomIn();
-    });
-  }
-  if (zoomOutBtn) {
-    zoomOutBtn.addEventListener("click", () => {
-      if (typeof map !== "undefined" && map) map.zoomOut();
-    });
-  }
 
   // -------------------------------------------------------------------------
   // Map layers popover & checkboxes
@@ -4269,9 +4257,41 @@ boot();
           } catch(e) { /* bounds not ready */ }
         }
 
-        m.invalidateSize();
       });
     });
+
+    // Make map rendering robust by calling invalidateSize and fitBounds after a short delay
+    setTimeout(() => {
+      requestAnimationFrame(() => {
+        if (window._histMapA) {
+          window._histMapA.invalidateSize(true);
+          try {
+            const containerA = document.getElementById('hist-map-container-0');
+            console.log("Historical comparison map A size:", containerA ? containerA.offsetWidth : 0, containerA ? containerA.offsetHeight : 0);
+            const layersA = [];
+            window._histMapA.eachLayer(l => { if(l instanceof L.CircleMarker) layersA.push(l); });
+            if (layersA.length > 0) {
+              const group = L.featureGroup(layersA);
+              window._histMapA.fitBounds(group.getBounds(), { padding: [10, 10] });
+            }
+          } catch(e) {}
+        }
+        
+        if (window._histMapB) {
+          window._histMapB.invalidateSize(true);
+          try {
+            const containerB = document.getElementById('hist-map-container-1');
+            console.log("Historical comparison map B size:", containerB ? containerB.offsetWidth : 0, containerB ? containerB.offsetHeight : 0);
+            const layersB = [];
+            window._histMapB.eachLayer(l => { if(l instanceof L.CircleMarker) layersB.push(l); });
+            if (layersB.length > 0) {
+              const group = L.featureGroup(layersB);
+              window._histMapB.fitBounds(group.getBounds(), { padding: [10, 10] });
+            }
+          } catch(e) {}
+        }
+      });
+    }, 150);
 
     syncRfLegend();
   };
