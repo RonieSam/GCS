@@ -15,7 +15,7 @@ numbers through the code, per the project spec.
 # transparently remaps coordinates between the GCS planning space and the
 # PX4/Gazebo geographic space.  Set to False for real-hardware deployments
 # where GCS and vehicle share the same WGS84 reference frame.
-SIMULATION_MODE = True
+SIMULATION_MODE = False
 
 # GCS map reference origin — the point on the GCS map that corresponds to the
 # PX4/Gazebo home position.  All user-selected targets are expressed as a
@@ -33,7 +33,7 @@ PX4_REFERENCE_LAT = 47.397742   # °N  (PX4 SITL default — overridden at runti
 PX4_REFERENCE_LON = 8.545594    # °E
 
 # --- MAVLink / SITL (used from Phase 6 onward) ---
-MAVLINK_CONNECTION = "udp:127.0.0.1:14550"
+MAVLINK_CONNECTION = "udpin:0.0.0.0:14550"  # Keep only if a local bridge forwards MAVLink here
 ARRIVAL_THRESHOLD_METERS = 5
 
 # How long to block waiting for the first HEARTBEAT before treating a
