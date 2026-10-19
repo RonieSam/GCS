@@ -21,7 +21,7 @@ from pymavlink import mavutil
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from mavlink_manager import MAVLinkManager
+from mavlink_manager import MAVLinkManager, _is_transient_receive_error
 from safety_manager import CONNECTED, DISCONNECTED
 
 
@@ -139,6 +139,44 @@ class TestSendCommand(unittest.TestCase):
             manager.connect()
             with self.assertRaises(ValueError):
                 manager.send_command("takeoff")
+
+
+class TestUdpReceiveErrorHandling(unittest.TestCase):
+    def test_windows_udp_connection_reset_is_treated_as_transient(self):
+        # Windows may report WSAECONNRESET (10054) for an ICMP response to a
+        # UDP datagram. It should not force the manager to recreate its socket.
+        exc = OSError(10054, "An existing connection was forcibly closed by the remote host")
+        self.assertTrue(_is_transient_receive_error(exc, "udpin:0.0.0.0:14550"))
+
+    def test_transient_udp_error_keeps_healthy_connection(self):
+        conn = FakeConn(heartbeat=FakeHeartbeat())
+        with patch("mavlink_manager.mavutil.mavlink_connection", return_value=conn):
+            manager = MAVLinkManager("udpin:0.0.0.0:14550", connect_timeout_s=0.2)
+            self.assertTrue(manager.connect())
+
+        conn.recv_match = Mock(side_effect=OSError(10054, "UDP ICMP reset"))
+        manager._drain_incoming()
+
+        self.assertIs(manager._conn, conn)
+        self.assertFalse(conn.closed)
+        self.assertTrue(manager.is_connected())
+        self.assertTrue(manager.get_vehicle_state()["connected"])
+        manager.disconnect()
+
+    def test_fatal_receive_error_closes_socket_and_clears_link_state(self):
+        conn = FakeConn(heartbeat=FakeHeartbeat())
+        with patch("mavlink_manager.mavutil.mavlink_connection", return_value=conn):
+            manager = MAVLinkManager("udpin:0.0.0.0:14550", connect_timeout_s=0.2)
+            self.assertTrue(manager.connect())
+
+        conn.recv_match = Mock(side_effect=OSError(10038, "Not a socket"))
+        manager._drain_incoming()
+
+        self.assertIsNone(manager._conn)
+        self.assertTrue(conn.closed)
+        self.assertEqual(manager.link_state, DISCONNECTED)
+        self.assertFalse(manager.get_vehicle_state()["connected"])
+
 
 
 class TestBackgroundLifecycle(unittest.TestCase):

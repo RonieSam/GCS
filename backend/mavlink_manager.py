@@ -5,7 +5,10 @@ Maintains the MAVLink connection, receives telemetry, and executes
 vehicle commands from the FastAPI backend.
 """
 
+import errno
+import logging
 import queue
+import socket
 import threading
 import time
 
@@ -19,6 +22,42 @@ import coordinate_mapper as _coord_mapper  # Phase 9A — simulation coordinate 
 
 
 _POLL_INTERVAL_S = 0.1
+logger = logging.getLogger(__name__)
+
+# Windows reports these Winsock codes for non-blocking UDP reads and for an
+# ICMP Port Unreachable response delivered to a UDP socket. Neither should,
+# by itself, be treated as proof that the MAVLink socket is dead. In
+# particular, WSAECONNRESET (10054) is common on Windows UDP input sockets.
+_TRANSIENT_UDP_WINERRORS = {10035, 10054, 10061}
+_TRANSIENT_UDP_ERRNOS = {
+    errno.EAGAIN,
+    errno.EWOULDBLOCK,
+    errno.EINTR,
+    errno.ECONNRESET,
+    errno.ECONNREFUSED,
+}
+
+
+def _is_transient_receive_error(exc, connection_string):
+    """Return True for receive errors that mean 'no datagram right now'.
+
+    pymavlink wraps a non-blocking UDP socket. Some Windows Winsock errors
+    surface as OSError instead of an empty receive; they must not force a full
+    reconnect every poll iteration. Other errors still trigger a logged, clean
+    reconnect.
+    """
+    if isinstance(exc, (BlockingIOError, InterruptedError, socket.timeout)):
+        return True
+
+    is_udp = connection_string.startswith(("udp:", "udpin:", "udpout:"))
+    if not is_udp or not isinstance(exc, OSError):
+        return False
+
+    return (
+        getattr(exc, "winerror", None) in _TRANSIENT_UDP_WINERRORS
+        or getattr(exc, "errno", None) in _TRANSIENT_UDP_WINERRORS
+        or getattr(exc, "errno", None) in _TRANSIENT_UDP_ERRNOS
+    )
 
 # Phase 9A — track whether we have already snapped the PX4 reference from a
 # HOME_POSITION message.  GLOBAL_POSITION_INT is used as an early fallback only
@@ -149,17 +188,38 @@ class MAVLinkManager:
         return self._conn is not None
 
     def disconnect(self):
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-
+        """Close the active transport and clear the public vehicle snapshot."""
+        conn = self._conn
         self._conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                logger.debug("Error while closing MAVLink transport", exc_info=True)
 
         with self._lock:
             self._safety.disconnect()
             self._state = mavlink_telemetry.new_vehicle_state()
+
+    def _drop_connection(self, reason):
+        """Retire a failed transport exactly once and allow the loop to retry.
+
+        Keep last-known telemetry for diagnostics/map context, but mark it as
+        disconnected so the UI cannot mistake it for live vehicle state.
+        """
+        conn = self._conn
+        self._conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                logger.debug("Error while closing failed MAVLink transport", exc_info=True)
+
+        with self._lock:
+            self._safety.disconnect()
+            self._state["connected"] = False
+
+        logger.warning("MAVLink link dropped: %s. Reconnecting in %.1f s.", reason, self._reconnect_interval_s)
 
     # ------------------------------------------------------------------
     # State
@@ -391,9 +451,7 @@ class MAVLinkManager:
 
             with self._lock:
                 self._safety.check_timeout()
-                self._state["connected"] = (
-                    self._safety.is_connected()
-                )
+                self._state["connected"] = self._safety.is_connected()
 
             self._stop_event.wait(_POLL_INTERVAL_S)
 
@@ -503,36 +561,55 @@ class MAVLinkManager:
     def _attempt_connect(self):
         with self._lock:
             self._safety.connecting()
+            self._state["connected"] = False
 
+        logger.info("Opening MAVLink connection %s", self.connection_string)
         try:
-            conn = mavutil.mavlink_connection(
-                self.connection_string
-            )
-
+            conn = mavutil.mavlink_connection(self.connection_string)
         except Exception:
+            logger.exception("Could not open MAVLink connection %s", self.connection_string)
             with self._lock:
                 self._safety.disconnect()
-
+                self._state["connected"] = False
             self._conn = None
             return
 
-        heartbeat = self._wait_heartbeat_interruptible(
-            conn,
-            self._connect_timeout_s,
-        )
-
-        if heartbeat is None:
+        try:
+            heartbeat = self._wait_heartbeat_interruptible(
+                conn,
+                self._connect_timeout_s,
+            )
+        except Exception:
+            logger.exception("Error while waiting for the initial MAVLink HEARTBEAT")
             try:
                 conn.close()
             except Exception:
-                pass
-
+                logger.debug("Error closing failed initial MAVLink connection", exc_info=True)
             with self._lock:
                 self._safety.disconnect()
-
+                self._state["connected"] = False
             self._conn = None
             return
 
+        if heartbeat is None:
+            logger.warning(
+                "No MAVLink HEARTBEAT received on %s within %.1f s",
+                self.connection_string,
+                self._connect_timeout_s,
+            )
+            try:
+                conn.close()
+            except Exception:
+                logger.debug("Error closing MAVLink connection without heartbeat", exc_info=True)
+
+            with self._lock:
+                self._safety.disconnect()
+                self._state["connected"] = False
+            self._conn = None
+            return
+
+        # Publish the connection only after a heartbeat proves a vehicle is
+        # present. This keeps commands from seeing a half-open connection.
         with self._lock:
             mavlink_telemetry.update_from_message(
                 self._state,
@@ -542,15 +619,21 @@ class MAVLinkManager:
             self._safety.heartbeat_received()
             self._state["connected"] = True
 
+        self._conn = conn
+        logger.info(
+            "MAVLink connected: sysid=%s compid=%s",
+            getattr(conn, "target_system", "?"),
+            getattr(conn, "target_component", "?"),
+        )
         try:
             mavlink_commands.request_data_streams(
                 conn,
                 self._stream_rate_hz,
             )
         except Exception:
-            pass
-
-        self._conn = conn
+            # A heartbeat is sufficient to establish the link; some PX4
+            # setups do not support REQUEST_DATA_STREAM in the same way.
+            logger.debug("MAVLink data-stream request was not accepted", exc_info=True)
 
     def _wait_heartbeat_interruptible(
         self,
@@ -558,18 +641,26 @@ class MAVLinkManager:
         timeout_s,
         step_s=1.0,
     ):
-        deadline = time.time() + timeout_s
+        deadline = time.monotonic() + timeout_s
 
-        while time.time() < deadline:
-
+        while time.monotonic() < deadline:
             if self._stop_event.is_set():
                 return None
 
-            msg = conn.recv_match(
-                type="HEARTBEAT",
-                blocking=True,
-                timeout=step_s,
-            )
+            try:
+                msg = conn.recv_match(
+                    type="HEARTBEAT",
+                    blocking=True,
+                    timeout=min(step_s, max(0.0, deadline - time.monotonic())),
+                )
+            except Exception as exc:
+                if _is_transient_receive_error(exc, self.connection_string):
+                    # Common with non-blocking UDP on Windows; keep waiting for
+                    # the first heartbeat instead of failing the connection.
+                    self._stop_event.wait(min(_POLL_INTERVAL_S, max(0.0, deadline - time.monotonic())))
+                    continue
+                logger.exception("MAVLink receive error during initial heartbeat wait")
+                raise
 
             if msg is not None:
                 return msg
@@ -591,12 +682,16 @@ class MAVLinkManager:
                     blocking=False
                 )
 
-            except Exception:
-                self._conn = None
+            except Exception as exc:
+                if _is_transient_receive_error(exc, self.connection_string):
+                    # No datagram available / a Windows UDP ICMP notification.
+                    # Keep the socket open. The heartbeat state machine remains
+                    # responsible for marking the link unhealthy if heartbeats stop.
+                    logger.debug("Transient MAVLink UDP receive condition: %r", exc)
+                    return
 
-                with self._lock:
-                    self._safety.disconnect()
-
+                logger.exception("MAVLink receive failed on %s", self.connection_string)
+                self._drop_connection(f"receive exception: {exc!r}")
                 return
 
             if msg is None:
