@@ -111,6 +111,26 @@ const state = {
   deploymentReleased: false,
   surveyHistory: [],
   rfHistoricalLayer: null,
+
+  // E-MESH Emergency Mesh & Live RF Survey Integration
+  emesh: {
+    connected: false,
+    audioEnabled: true,
+    nodes: [],
+    topology: { nodes: [], links: [] },
+    clients: [],
+    sos: [],
+    survey: { state: "IDLE", sample_count: 0, latest_readings: {}, elapsed_seconds: 0 },
+    activeFilter: "ACTIVE",
+    selectedSos: null,
+    ws: null,
+    reconnectTimer: null,
+    sosMarkers: new Map(),
+    clientMarkers: new Map(),
+  },
+  meshNodesLayer: null,
+  connectedClientsLayer: null,
+  sosAlertsLayer: null,
 };
 
 // A message every ~1/MAVLINK stream rate is expected; if nothing arrives
@@ -201,20 +221,32 @@ function initMap(centerLat, centerLon) {
 
   const osmLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     maxZoom: 19,
-    attribution: "&copy; OpenStreetMap contributors",
+    attribution: "&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors",
+    subdomains: ["a", "b", "c"],
   });
 
   let tileErrorCount = 0;
+  let successfulTileLoads = 0;
+
+  osmLayer.on("tileload", () => {
+    successfulTileLoads += 1;
+    if (tileErrorCount > 0) tileErrorCount = Math.max(0, tileErrorCount - 1);
+  });
+
   osmLayer.on("tileerror", () => {
     tileErrorCount += 1;
-    // A handful of missed tiles is normal at map edges; only fall back
-    // once it's clear tile imagery genuinely isn't reachable.
-    if (tileErrorCount > 6 && !usingFallbackTiles) {
+    // Only fall back to schematic offline grid if genuine network/provider outage occurs
+    if (tileErrorCount >= 25 && successfulTileLoads === 0 && !usingFallbackTiles) {
       enableFallbackBasemap();
     }
   });
 
   osmLayer.addTo(map);
+
+  // E-MESH layer groups
+  state.meshNodesLayer = L.layerGroup().addTo(map);
+  state.connectedClientsLayer = L.layerGroup().addTo(map);
+  state.sosAlertsLayer = L.layerGroup().addTo(map);
 
   map.on("click", onMapClick);
 
@@ -1371,6 +1403,9 @@ async function startMission() {
     if (rfStartBtn) rfStartBtn.disabled = true;
     document.getElementById("btn-abort-mission").disabled = false;
 
+    // Start E-MESH live RF survey collection
+    startEMeshSurvey();
+
   } catch (err) {
     document.getElementById("mission-hint").textContent = `Start error: ${err.message}`;
     logEvent(`Start Mission error: ${err.message}`);
@@ -1417,6 +1452,9 @@ async function abortMission() {
     // Abort succeeded (or there was no active mission — both cases leave btn disabled)
     state.missionExecuting = false;
     document.getElementById("stat-mission-state").textContent = "ABORTED";
+
+    // Stop E-MESH live survey collection
+    stopEMeshSurvey();
 
     // Update RF scan state if this was an RF scan abort
     if (state.rfScanState === "RUNNING" || state.rfScanState === "MISSION_UPLOADED" || state.rfScanState === "APPROACHING") {
@@ -3513,6 +3551,9 @@ async function resetSurveyData() {
     // Phase 5 Requirement 27: New survey invalidates old analysis
     resetRfAnalysisState("Survey data reset. Run a new scan to analyze.");
 
+    // Reset E-MESH live survey data
+    resetEMeshSurvey();
+
     logEvent("RF survey data reset to IDLE.");
   } catch (err) {
     logEvent(`RF survey reset failed: ${err.message}`);
@@ -3560,7 +3601,22 @@ function initControls() {
   const uploadRfBtn = document.getElementById("btn-upload-rf-scan");
   if (uploadRfBtn) uploadRfBtn.addEventListener("click", uploadRfScanMission);
   const startRfBtn = document.getElementById("btn-start-rf-scan");
-  if (startRfBtn) startRfBtn.addEventListener("click", startMission);
+  if (startRfBtn) {
+    startRfBtn.addEventListener("click", () => {
+      // If survey is currently scanning, click stops it
+      if (state.emesh.survey && state.emesh.survey.state === "SCANNING") {
+        stopEMeshSurvey();
+        return;
+      }
+      // If UAV mission uploaded and vehicle armed, command PX4 mission
+      if (state.missionUploaded && state.vehicle && state.vehicle.armed) {
+        startMission();
+      } else {
+        // Direct RF survey collection mode
+        startEMeshSurvey();
+      }
+    });
+  }
   // Phase 3 — RF Survey Live Data reset button
   const resetRfBtn = document.getElementById("btn-reset-rf-survey");
   if (resetRfBtn) resetRfBtn.addEventListener("click", resetSurveyData);
@@ -3585,6 +3641,1151 @@ function initControls() {
   initSurveyHistoryControls();
 }
 
+
+// ===========================================================================
+// E-MESH Emergency Mesh & Real-Time SOS / RF Survey Integration
+// ===========================================================================
+
+let _emeshAudioCtx = null;
+
+function playEmergencyChime() {
+  if (!state.emesh.audioEnabled) return;
+  try {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) return;
+    if (!_emeshAudioCtx) _emeshAudioCtx = new AudioContext();
+    if (_emeshAudioCtx.state === "suspended") {
+      _emeshAudioCtx.resume();
+    }
+    const now = _emeshAudioCtx.currentTime;
+    const osc = _emeshAudioCtx.createOscillator();
+    const gain = _emeshAudioCtx.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(880, now);
+    osc.frequency.setValueAtTime(660, now + 0.15);
+    gain.gain.setValueAtTime(0.3, now);
+    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.35);
+    osc.connect(gain);
+    gain.connect(_emeshAudioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.35);
+  } catch (err) {
+    console.debug("Audio chime skipped:", err);
+  }
+}
+
+function showSOSToast(sos) {
+  const container = document.getElementById("sos-toast-container");
+  if (!container) return;
+
+  const refId = sos.reference_code || ("SOS-" + String(sos.id).padStart(5, "0"));
+  const toast = document.createElement("div");
+  toast.className = "sos-toast";
+  toast.innerHTML = `
+    <span class="sos-toast-icon">🚨</span>
+    <div class="sos-toast-text">
+      EMERGENCY SOS RECEIVED: <span class="sos-toast-ref">${escapeHtml(refId)}</span>
+      <div style="font-size:11px; color:#ff8a80; margin-top:2px;">${escapeHtml(sos.message || sos.notes || "Emergency assistance requested")}</div>
+    </div>
+    <button class="sos-toast-btn">VIEW &amp; LOCATE</button>
+  `;
+
+  const btn = toast.querySelector(".sos-toast-btn");
+  btn.addEventListener("click", () => {
+    // Switch to Emergency Mesh -> SOS tab
+    const emeshTab = document.getElementById("tab-emesh");
+    if (emeshTab) emeshTab.click();
+    const sosSubtab = document.getElementById("subtab-emesh-sos");
+    if (sosSubtab) sosSubtab.click();
+    openSOSDetailDrawer(sos);
+    if (sos.latitude && sos.longitude && (sos.latitude !== 0 || sos.longitude !== 0)) {
+      if (typeof map !== "undefined" && map) {
+        map.setView([sos.latitude, sos.longitude], 17);
+      }
+    }
+    toast.remove();
+  });
+
+  container.appendChild(toast);
+  setTimeout(() => {
+    if (toast.parentNode) toast.remove();
+  }, 10000);
+}
+
+function escapeHtml(str) {
+  if (!str) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function formatEmeshTime(isoOrTs) {
+  if (!isoOrTs) return "--:--:--";
+  try {
+    const d = typeof isoOrTs === "number" ? new Date(isoOrTs * 1000) : new Date(isoOrTs);
+    if (isNaN(d.getTime())) return String(isoOrTs);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  } catch (_) {
+    return String(isoOrTs);
+  }
+}
+
+async function loadEMeshData() {
+  try {
+    const [stRes, nodesRes, clientsRes, sosRes, surveyRes, topoRes] = await Promise.allSettled([
+      apiGet("/api/emesh/status"),
+      apiGet("/api/emesh/nodes"),
+      apiGet("/api/emesh/clients"),
+      apiGet("/api/emesh/sos"),
+      apiGet("/api/emesh/survey/status"),
+      apiGet("/api/emesh/topology"),
+    ]);
+
+    if (stRes.status === "fulfilled" && stRes.value && !stRes.value.error) {
+      state.emesh.connected = Boolean(stRes.value.connected);
+      updateEMeshStatusPill(stRes.value);
+    }
+    if (nodesRes.status === "fulfilled" && Array.isArray(nodesRes.value)) {
+      state.emesh.nodes = nodesRes.value;
+      renderEMeshNodes();
+    }
+    if (clientsRes.status === "fulfilled" && Array.isArray(clientsRes.value)) {
+      state.emesh.clients = clientsRes.value;
+      renderEMeshClients();
+    }
+    if (sosRes.status === "fulfilled" && Array.isArray(sosRes.value)) {
+      state.emesh.sos = sosRes.value;
+      renderSOSQueue();
+    }
+    if (surveyRes.status === "fulfilled" && surveyRes.value && !surveyRes.value.error) {
+      state.emesh.survey = surveyRes.value;
+      renderEMeshSurveyUI();
+    }
+    if (topoRes.status === "fulfilled" && topoRes.value && !topoRes.value.error) {
+      state.emesh.topology = topoRes.value;
+      renderEMeshTopology();
+    }
+    renderEMeshOverview();
+  } catch (err) {
+    console.warn("Failed to load initial E-MESH data:", err);
+  }
+}
+
+function updateEMeshStatusPill(statusData) {
+  const pill = document.getElementById("status-emesh-pill");
+  const dot = document.getElementById("status-emesh-dot");
+  const label = document.getElementById("status-emesh-label");
+  const heroBadge = document.getElementById("emesh-hero-status-badge");
+
+  const connected = statusData && statusData.connected;
+  if (pill) {
+    if (connected) {
+      if (dot) {
+        dot.className = "status-dot";
+      }
+      if (label) label.textContent = "E-MESH: ONLINE";
+      if (heroBadge) {
+        heroBadge.className = "badge-status-conn";
+        heroBadge.textContent = "ONLINE";
+      }
+    } else {
+      if (dot) {
+        dot.className = "status-dot status-dot--danger";
+      }
+      const last = statusData && statusData.last_successful_iso ? formatEmeshTime(statusData.last_successful_iso) : "--";
+      if (label) label.textContent = `E-MESH: OFFLINE (${last})`;
+      if (heroBadge) {
+        heroBadge.className = "badge-status-conn offline";
+        heroBadge.textContent = "OFFLINE";
+      }
+    }
+  }
+}
+
+function connectEMeshWebSocket() {
+  if (state.emesh.ws) {
+    try { state.emesh.ws.close(); } catch (_) {}
+    state.emesh.ws = null;
+  }
+
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${proto}//${window.location.host}/ws/emesh`;
+
+  try {
+    const ws = new WebSocket(url);
+    state.emesh.ws = ws;
+
+    ws.onopen = () => {
+      state.emesh.connected = true;
+      updateEMeshStatusPill({ connected: true });
+      logEvent("Connected to E-MESH live telemetry stream.");
+      // Fresh backend snapshot after connect or reconnect ensures no missed events
+      loadEMeshData();
+    };
+
+    ws.onclose = () => {
+      state.emesh.connected = false;
+      updateEMeshStatusPill({ connected: false });
+      if (!state.emesh.reconnectTimer) {
+        state.emesh.reconnectTimer = setTimeout(() => {
+          state.emesh.reconnectTimer = null;
+          connectEMeshWebSocket();
+        }, 5000);
+      }
+    };
+
+    ws.onerror = () => {
+      state.emesh.connected = false;
+      updateEMeshStatusPill({ connected: false });
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        handleEMeshWSEvent(payload);
+      } catch (err) {
+        console.warn("E-MESH WS parse error:", err);
+      }
+    };
+  } catch (e) {
+    console.warn("Could not initiate E-MESH WS:", e);
+  }
+}
+
+function handleEMeshWSEvent(payload) {
+  const ev = payload.event;
+  const data = payload.data;
+
+  if (ev === "emesh_init") {
+    if (data.status) {
+      state.emesh.connected = Boolean(data.status.connected);
+      updateEMeshStatusPill(data.status);
+    }
+    if (Array.isArray(data.nodes)) {
+      state.emesh.nodes = data.nodes;
+      renderEMeshNodes();
+    }
+    if (Array.isArray(data.clients)) {
+      state.emesh.clients = data.clients;
+      renderEMeshClients();
+    }
+    if (Array.isArray(data.sos)) {
+      state.emesh.sos = data.sos;
+      renderSOSQueue();
+    }
+    if (data.survey) {
+      state.emesh.survey = data.survey;
+      renderEMeshSurveyUI();
+    }
+    if (data.topology) {
+      state.emesh.topology = data.topology;
+      renderEMeshTopology();
+    }
+    renderEMeshOverview();
+    return;
+  }
+
+  if (ev === "sos.created") {
+    const sid = data.id || data.sos_id;
+    const exists = state.emesh.sos.some((s) => String(s.id) === String(sid) || String(s.sos_id) === String(sid));
+    if (!exists) {
+      state.emesh.sos.unshift(data);
+    }
+    playEmergencyChime();
+    showSOSToast(data);
+    renderSOSQueue();
+    renderEMeshOverview();
+    logEvent(`EMERGENCY SOS: ${data.reference_code || data.sos_id || ("SOS-" + sid)} received.`);
+    return;
+  }
+
+  if (ev === "sos.updated" || ev === "incident.updated") {
+    const sid = data.id || data.sos_id;
+    const idx = state.emesh.sos.findIndex((s) => String(s.id) === String(sid) || String(s.sos_id) === String(sid));
+    if (idx >= 0) {
+      state.emesh.sos[idx] = { ...state.emesh.sos[idx], ...data };
+    } else if (sid) {
+      state.emesh.sos.unshift(data);
+    }
+    renderSOSQueue();
+    renderEMeshOverview();
+    if (state.emesh.selectedSos && (String(state.emesh.selectedSos.id) === String(sid) || String(state.emesh.selectedSos.sos_id) === String(sid))) {
+      openSOSDetailDrawer(state.emesh.sos[idx >= 0 ? idx : 0]);
+    }
+    return;
+  }
+
+  if (ev === "user.location_updated") {
+    const cid = data.client_id || data.user_id;
+    if (cid) {
+      const idx = state.emesh.clients.findIndex((c) => (c.client_id || c.user_id) === cid);
+      if (idx >= 0) {
+        state.emesh.clients[idx] = { ...state.emesh.clients[idx], ...data };
+      } else {
+        state.emesh.clients.unshift(data);
+      }
+      renderEMeshClients();
+      renderEMeshOverview();
+    }
+    return;
+  }
+
+  if (ev === "node.updated" || ev === "node.online") {
+    const nid = data.node_id || data.id;
+    if (nid) {
+      const idx = state.emesh.nodes.findIndex((n) => (n.node_id || n.id) === nid);
+      if (idx >= 0) {
+        state.emesh.nodes[idx] = { ...state.emesh.nodes[idx], ...data };
+      } else {
+        state.emesh.nodes.push(data);
+      }
+      renderEMeshNodes();
+      renderEMeshOverview();
+    }
+    return;
+  }
+
+  if (ev === "survey.reading") {
+    if (state.emesh.survey) {
+      if (!state.emesh.survey.latest_readings) state.emesh.survey.latest_readings = {};
+      const key = data.reading_key || data.node_id;
+      state.emesh.survey.latest_readings[key] = data;
+      state.emesh.survey.sample_count = (state.emesh.survey.sample_count || 0) + 1;
+      renderEMeshSurveyUI();
+    }
+    return;
+  }
+
+  if (ev === "survey.state_changed") {
+    state.emesh.survey = { ...state.emesh.survey, ...data };
+    renderEMeshSurveyUI();
+    renderEMeshOverview();
+    return;
+  }
+}
+
+function renderEMeshOverview() {
+  const activeCount = state.emesh.sos.filter((s) => String(s.status).toUpperCase() === "ACTIVE").length;
+  const totalCount = state.emesh.sos.length;
+  const nodeCount = state.emesh.nodes.length;
+  const clientCount = state.emesh.clients.length;
+
+  const actEl = document.getElementById("stat-emesh-active-sos");
+  if (actEl) actEl.textContent = activeCount;
+
+  const totEl = document.getElementById("stat-emesh-total-sos");
+  if (totEl) totEl.textContent = totalCount;
+
+  const nodeEl = document.getElementById("stat-emesh-nodes");
+  if (nodeEl) nodeEl.textContent = nodeCount;
+
+  const clientEl = document.getElementById("stat-emesh-clients");
+  if (clientEl) clientEl.textContent = clientCount;
+
+  const sStateEl = document.getElementById("stat-emesh-survey-state");
+  if (sStateEl) sStateEl.textContent = state.emesh.survey && state.emesh.survey.state ? state.emesh.survey.state : "IDLE";
+
+  const lastSeenEl = document.getElementById("stat-emesh-last-seen");
+  if (lastSeenEl) lastSeenEl.textContent = formatEmeshTime(Date.now());
+
+  // Badges
+  const tabBadge = document.getElementById("badge-tab-sos-count");
+  if (tabBadge) {
+    if (activeCount > 0) {
+      tabBadge.textContent = activeCount;
+      tabBadge.classList.remove("hidden");
+    } else {
+      tabBadge.classList.add("hidden");
+    }
+  }
+
+  const subtabBadge = document.getElementById("badge-subtab-sos");
+  if (subtabBadge) {
+    if (activeCount > 0) {
+      subtabBadge.textContent = activeCount;
+      subtabBadge.classList.remove("hidden");
+    } else {
+      subtabBadge.classList.add("hidden");
+    }
+  }
+}
+
+function renderEMeshNodes() {
+  const listEl = document.getElementById("emesh-nodes-list");
+  if (!listEl) return;
+
+  if (!state.emesh.nodes || state.emesh.nodes.length === 0) {
+    listEl.innerHTML = '<p class="cs-hint">No nodes currently detected on mesh.</p>';
+    renderMeshNodeMarkers();
+    return;
+  }
+
+  let html = "";
+  for (const n of state.emesh.nodes) {
+    const id = n.node_id || n.id;
+    const name = n.display_name || id;
+    const status = (n.status || "UNKNOWN").toUpperCase();
+    const battery = n.battery_percent != null ? Math.round(n.battery_percent) + "%" : "N/A";
+    const rssi = n.rssi_dbm != null ? Math.round(n.rssi_dbm) + " dBm" : "N/A";
+    const hops = n.hop_count != null ? n.hop_count : "--";
+    const lat = n.gps_lat != null ? n.gps_lat : n.latitude;
+    const lon = n.gps_lon != null ? n.gps_lon : n.longitude;
+    const coordsStr = (lat != null && lon != null && (lat !== 0 || lon !== 0))
+      ? `${Number(lat).toFixed(5)}, ${Number(lon).toFixed(5)}`
+      : "No GPS fix";
+
+    html += `
+      <div class="emesh-node-card">
+        <div class="card-header-row">
+          <span class="card-title text-cyan">${escapeHtml(name)}</span>
+          <span class="badge-status-conn ${status === 'ONLINE' ? '' : 'offline'}">${escapeHtml(status)}</span>
+        </div>
+        <div class="card-meta-grid">
+          <div><span class="muted">BATTERY:</span> ${escapeHtml(battery)}</div>
+          <div><span class="muted">RSSI:</span> ${escapeHtml(rssi)}</div>
+          <div><span class="muted">HOPS:</span> ${escapeHtml(hops)}</div>
+          <div><span class="muted">GPS:</span> ${escapeHtml(coordsStr)}</div>
+        </div>
+      </div>
+    `;
+  }
+  listEl.innerHTML = html;
+  renderMeshNodeMarkers();
+}
+
+function renderMeshNodeMarkers() {
+  if (!state.meshNodesLayer) return;
+  state.meshNodesLayer.clearLayers();
+
+  for (const n of state.emesh.nodes) {
+    const lat = n.gps_lat != null ? n.gps_lat : n.latitude;
+    const lon = n.gps_lon != null ? n.gps_lon : n.longitude;
+    if (lat != null && lon != null && (lat !== 0 || lon !== 0)) {
+      const marker = L.marker([lat, lon], {
+        icon: L.divIcon({
+          className: "custom-node-icon",
+          html: `<div class="leaflet-marker-mesh-node">⬡</div>`,
+          iconSize: [24, 24],
+          iconAnchor: [12, 12],
+        }),
+      });
+      const id = n.display_name || n.node_id || n.id;
+      const rssi = n.rssi_dbm != null ? `${n.rssi_dbm} dBm` : "N/A";
+      marker.bindPopup(`<b>Mesh Node: ${escapeHtml(id)}</b><br>Status: ${n.status || "ONLINE"}<br>RSSI: ${rssi}<br>Battery: ${n.battery_percent != null ? n.battery_percent + "%" : "N/A"}`);
+      state.meshNodesLayer.addLayer(marker);
+    }
+  }
+}
+
+function renderEMeshClients() {
+  const listEl = document.getElementById("emesh-clients-list");
+  if (!listEl) return;
+
+  const clients = state.emesh.clients || [];
+  let gpsCount = 0;
+
+  if (clients.length === 0) {
+    listEl.innerHTML = '<p class="cs-hint">No citizen devices active in the last 60 minutes.</p>';
+    const badge = document.getElementById("badge-client-gps-count");
+    if (badge) badge.textContent = "0 GPS Fix";
+    renderClientMarkers();
+    return;
+  }
+
+  let html = "";
+  for (const c of clients) {
+    const id = c.client_id || c.user_id || "Anonymous Client";
+    const lat = c.latitude;
+    const lon = c.longitude;
+    const hasGps = (lat != null && lon != null && (lat !== 0 || lon !== 0));
+    if (hasGps) gpsCount++;
+
+    const locStr = hasGps
+      ? `${Number(lat).toFixed(5)}, ${Number(lon).toFixed(5)} (±${c.accuracy ? Math.round(c.accuracy) + "m" : "N/A"})`
+      : "No coordinates (Wi-Fi connected only)";
+    const seenStr = formatEmeshTime(c.last_seen || c.timestamp);
+
+    html += `
+      <div class="emesh-client-card">
+        <div class="card-header-row">
+          <span class="card-title text-purple">📱 ${escapeHtml(id)}</span>
+          <span class="badge-status-conn">${c.is_online !== false ? "CONNECTED" : "OFFLINE"}</span>
+        </div>
+        <div class="card-meta-grid">
+          <div style="grid-column: span 2"><span class="muted">LOCATION:</span> ${escapeHtml(locStr)}</div>
+          <div><span class="muted">LAST SEEN:</span> ${escapeHtml(seenStr)}</div>
+          <div><span class="muted">STATUS:</span> ${hasGps ? '<span class="text-green">GPS Fix</span>' : '<span class="muted">No GPS</span>'}</div>
+        </div>
+      </div>
+    `;
+  }
+  listEl.innerHTML = html;
+
+  const badge = document.getElementById("badge-client-gps-count");
+  if (badge) badge.textContent = `${gpsCount} GPS Fix`;
+
+  renderClientMarkers();
+}
+
+function isValidLatLng(lat, lon) {
+  if (lat == null || lon == null) return false;
+  const nLat = Number(lat);
+  const nLon = Number(lon);
+  if (isNaN(nLat) || isNaN(nLon)) return false;
+  if (nLat === 0 && nLon === 0) return false;
+  if (nLat < -90 || nLat > 90) return false;
+  if (nLon < -180 || nLon > 180) return false;
+  return true;
+}
+
+function renderClientMarkers() {
+  if (!state.connectedClientsLayer) return;
+  if (!state.emesh.clientMarkers) state.emesh.clientMarkers = new Map();
+
+  const clients = state.emesh.clients || [];
+  const activeClientKeys = new Set();
+
+  for (const c of clients) {
+    const lat = parseFloat(c.latitude);
+    const lon = parseFloat(c.longitude);
+    const cid = String(c.client_id || c.user_id || "");
+    if (!cid) continue;
+
+    if (!isValidLatLng(lat, lon)) {
+      // No GPS fix — do NOT display marker on map (per Problem 3 & 5 requirements)
+      continue;
+    }
+
+    activeClientKeys.add(cid);
+    const accuracy = c.accuracy != null && !isNaN(parseFloat(c.accuracy)) ? parseFloat(c.accuracy) : null;
+    const popupContent = `<b>Citizen Device: ${escapeHtml(cid)}</b><br>Coords: ${lat.toFixed(6)}, ${lon.toFixed(6)}<br>Accuracy: ±${accuracy ? Math.round(accuracy) + "m" : "N/A"}<br>Last Seen: ${formatEmeshTime(c.last_seen || c.timestamp)}`;
+
+    if (state.emesh.clientMarkers.has(cid)) {
+      const entry = state.emesh.clientMarkers.get(cid);
+      entry.marker.setLatLng([lat, lon]);
+      entry.marker.setPopupContent(popupContent);
+      if (accuracy && accuracy > 0) {
+        if (entry.circle) {
+          entry.circle.setLatLng([lat, lon]);
+          entry.circle.setRadius(accuracy);
+        } else {
+          entry.circle = L.circle([lat, lon], {
+            radius: accuracy,
+            color: "#9C27B0",
+            weight: 1,
+            fillColor: "#9C27B0",
+            fillOpacity: 0.12,
+          }).addTo(state.connectedClientsLayer);
+        }
+      } else if (entry.circle) {
+        state.connectedClientsLayer.removeLayer(entry.circle);
+        entry.circle = null;
+      }
+    } else {
+      const marker = L.marker([lat, lon], {
+        icon: L.divIcon({
+          className: "custom-client-marker",
+          html: '<div class="leaflet-marker-client">👤</div>',
+          iconSize: [22, 22],
+          iconAnchor: [11, 11],
+        }),
+      });
+      marker.bindPopup(popupContent);
+
+      let circle = null;
+      if (accuracy && accuracy > 0) {
+        circle = L.circle([lat, lon], {
+          radius: accuracy,
+          color: "#9C27B0",
+          weight: 1,
+          fillColor: "#9C27B0",
+          fillOpacity: 0.12,
+        }).addTo(state.connectedClientsLayer);
+      }
+
+      state.connectedClientsLayer.addLayer(marker);
+      state.emesh.clientMarkers.set(cid, { marker, circle });
+    }
+  }
+
+  // Remove markers for clients that disconnected or lost GPS
+  for (const [cid, entry] of state.emesh.clientMarkers.entries()) {
+    if (!activeClientKeys.has(cid)) {
+      if (entry.marker) state.connectedClientsLayer.removeLayer(entry.marker);
+      if (entry.circle) state.connectedClientsLayer.removeLayer(entry.circle);
+      state.emesh.clientMarkers.delete(cid);
+    }
+  }
+}
+
+function renderSOSQueue() {
+  const queueEl = document.getElementById("emesh-sos-queue");
+  if (!queueEl) return;
+
+  const filter = state.emesh.activeFilter || "ACTIVE";
+  let items = state.emesh.sos || [];
+  if (filter === "ACTIVE") {
+    items = items.filter((s) => String(s.status || "").toUpperCase() === "ACTIVE");
+  } else if (filter === "ACKNOWLEDGED") {
+    items = items.filter((s) => String(s.status || "").toUpperCase() === "ACKNOWLEDGED");
+  } else if (filter === "RESOLVED") {
+    items = items.filter((s) => String(s.status || "").toUpperCase() === "RESOLVED");
+  }
+
+  if (items.length === 0) {
+    queueEl.innerHTML = `<p class="cs-hint">No ${filter === "ALL" ? "" : filter} SOS alerts in queue.</p>`;
+    renderSOSMarkers();
+    return;
+  }
+
+  let html = "";
+  for (const s of items) {
+    const ref = s.reference_code || s.sos_id || ("SOS-" + String(s.id).slice(0, 8));
+    const status = String(s.status || "ACTIVE").toUpperCase();
+    const isAct = status === "ACTIVE";
+    const isAck = status === "ACKNOWLEDGED";
+
+    const tagClass = isAct ? "tag-active" : (isAck ? "tag-ack" : "tag-res");
+    const cardClass = isAct ? "sos-card--active" : (isAck ? "sos-card--acknowledged" : "sos-card--resolved");
+
+    const lat = s.latitude;
+    const lon = s.longitude;
+    const hasGps = isValidLatLng(lat, lon);
+    const coordsStr = hasGps
+      ? `${Number(lat).toFixed(5)}, ${Number(lon).toFixed(5)}${s.accuracy ? ' (±' + Math.round(s.accuracy) + 'm)' : ''}`
+      : "Location unavailable";
+
+    html += `
+      <div class="sos-card ${cardClass}" data-sos-id="${escapeHtml(String(s.id))}">
+        <div class="sos-card-header">
+          <span class="sos-card-ref">${escapeHtml(ref)}</span>
+          <span class="sos-status-tag ${tagClass}">${escapeHtml(status)}</span>
+        </div>
+        <div class="sos-card-detail">
+          ${escapeHtml(s.message || s.notes || "Emergency assistance requested")}
+        </div>
+        <div class="sos-card-footer">
+          <span>👥 ${s.people_affected || s.people_count || 1} Person(s) &nbsp;|&nbsp; 📍 ${coordsStr}</span>
+          <span>${formatEmeshTime(s.received_time || s.created_at)}</span>
+        </div>
+      </div>
+    `;
+  }
+  queueEl.innerHTML = html;
+
+  queueEl.querySelectorAll(".sos-card").forEach((card) => {
+    card.addEventListener("click", () => {
+      const sid = card.getAttribute("data-sos-id");
+      const sos = (state.emesh.sos || []).find((s) => String(s.id) === String(sid) || String(s.sos_id) === String(sid));
+      if (sos) openSOSDetailDrawer(sos);
+    });
+  });
+
+  renderSOSMarkers();
+}
+
+function renderSOSMarkers() {
+  if (!state.sosAlertsLayer) return;
+  if (!state.emesh.sosMarkers) state.emesh.sosMarkers = new Map();
+
+  // Active alerts strictly
+  const activeAlerts = (state.emesh.sos || []).filter(
+    (s) => String(s.status || "").toUpperCase() === "ACTIVE"
+  );
+
+  const activeKeys = new Set();
+
+  for (const s of activeAlerts) {
+    const key = String(s.id || s.sos_id);
+    const lat = parseFloat(s.latitude);
+    const lon = parseFloat(s.longitude);
+
+    // If coordinates are invalid or missing, do NOT display a marker
+    if (!isValidLatLng(lat, lon)) {
+      continue;
+    }
+
+    activeKeys.add(key);
+    const ref = s.reference_code || s.sos_id || ("SOS-" + String(s.id).slice(0, 8));
+    const accuracy = s.accuracy != null && !isNaN(parseFloat(s.accuracy)) ? parseFloat(s.accuracy) : null;
+    const msg = s.message || s.notes || "Emergency assistance requested";
+
+    const popupContent = `
+      <div class="sos-popup" style="font-family:var(--font-sans); color:#fff; min-width:180px;">
+        <div style="font-weight:700; color:#FF3B30; font-size:13px; margin-bottom:4px;">🚨 ${escapeHtml(ref)}</div>
+        <div style="font-size:11px; margin-bottom:2px;"><span style="color:#8E8E93;">STATUS:</span> <b style="color:#FF3B30;">ACTIVE</b></div>
+        <div style="font-size:11px; margin-bottom:2px;"><span style="color:#8E8E93;">COORDS:</span> ${lat.toFixed(6)}, ${lon.toFixed(6)}</div>
+        ${accuracy && accuracy > 0 ? `<div style="font-size:11px; margin-bottom:2px;"><span style="color:#8E8E93;">ACCURACY:</span> ±${Math.round(accuracy)}m</div>` : ""}
+        <div style="font-size:11px; margin-top:4px; margin-bottom:8px; color:#ddd;">${escapeHtml(msg)}</div>
+        <div style="display:flex; gap:6px;">
+          <button class="btn btn-xs btn-primary" onclick="window.gcsAcknowledgeSOS('${escapeHtml(String(s.id))}')">Acknowledge</button>
+          <button class="btn btn-xs btn-outline" onclick="window.gcsOpenSOSDrawer('${escapeHtml(String(s.id))}')">Details</button>
+        </div>
+      </div>
+    `;
+
+    if (state.emesh.sosMarkers.has(key)) {
+      // Update existing marker in-place
+      const entry = state.emesh.sosMarkers.get(key);
+      entry.marker.setLatLng([lat, lon]);
+      entry.marker.setPopupContent(popupContent);
+      entry.marker.setTooltipContent(`<b>${escapeHtml(ref)}</b> [ACTIVE]<br>📍 ${lat.toFixed(5)}, ${lon.toFixed(5)}${accuracy ? ' (±' + Math.round(accuracy) + 'm)' : ''}`);
+
+      if (accuracy && accuracy > 0) {
+        if (entry.circle) {
+          entry.circle.setLatLng([lat, lon]);
+          entry.circle.setRadius(accuracy);
+        } else {
+          entry.circle = L.circle([lat, lon], {
+            radius: accuracy,
+            color: "#FF3B30",
+            weight: 1,
+            fillColor: "#FF3B30",
+            fillOpacity: 0.15,
+          }).addTo(state.sosAlertsLayer);
+        }
+      } else if (entry.circle) {
+        state.sosAlertsLayer.removeLayer(entry.circle);
+        entry.circle = null;
+      }
+    } else {
+      // Create new marker
+      const marker = L.marker([lat, lon], {
+        icon: L.divIcon({
+          className: "custom-sos-marker",
+          html: '<div class="leaflet-marker-sos-pulse">!</div>',
+          iconSize: [28, 28],
+          iconAnchor: [14, 14],
+        }),
+      });
+
+      marker.bindTooltip(
+        `<b>${escapeHtml(ref)}</b> [ACTIVE]<br>📍 ${lat.toFixed(5)}, ${lon.toFixed(5)}${accuracy ? ' (±' + Math.round(accuracy) + 'm)' : ''}`,
+        { direction: "top" }
+      );
+      marker.bindPopup(popupContent);
+      marker.on("click", () => openSOSDetailDrawer(s));
+
+      let circle = null;
+      if (accuracy && accuracy > 0) {
+        circle = L.circle([lat, lon], {
+          radius: accuracy,
+          color: "#FF3B30",
+          weight: 1,
+          fillColor: "#FF3B30",
+          fillOpacity: 0.15,
+        }).addTo(state.sosAlertsLayer);
+      }
+
+      state.sosAlertsLayer.addLayer(marker);
+      state.emesh.sosMarkers.set(key, { marker, circle });
+    }
+  }
+
+  // Remove markers for alerts that are no longer active or no longer have valid coordinates
+  for (const [key, entry] of state.emesh.sosMarkers.entries()) {
+    if (!activeKeys.has(key)) {
+      if (entry.marker) state.sosAlertsLayer.removeLayer(entry.marker);
+      if (entry.circle) state.sosAlertsLayer.removeLayer(entry.circle);
+      state.emesh.sosMarkers.delete(key);
+    }
+  }
+}
+
+window.gcsAcknowledgeSOS = function(sosId) {
+  updateSOSStatus(sosId, "ACKNOWLEDGED");
+};
+
+window.gcsOpenSOSDrawer = function(sosId) {
+  const s = (state.emesh.sos || []).find((item) => String(item.id) === String(sosId) || String(item.sos_id) === String(sosId));
+  if (s) openSOSDetailDrawer(s);
+};
+
+function openSOSDetailDrawer(sos) {
+  state.emesh.selectedSos = sos;
+  const drawer = document.getElementById("sos-detail-drawer");
+  if (!drawer) return;
+
+  const ref = sos.reference_code || sos.sos_id || ("SOS-" + String(sos.id).slice(0, 8));
+  const status = String(sos.status || "ACTIVE").toUpperCase();
+
+  const refEl = document.getElementById("sos-drawer-ref-id");
+  if (refEl) refEl.textContent = ref;
+
+  const stBadge = document.getElementById("sos-drawer-status-badge");
+  if (stBadge) {
+    stBadge.textContent = status;
+    stBadge.className = "sos-alert-badge " + (status === "ACTIVE" ? "" : (status === "ACKNOWLEDGED" ? "tag-ack" : "tag-res"));
+  }
+
+  const timeEl = document.getElementById("sos-drawer-time");
+  if (timeEl) timeEl.textContent = formatEmeshTime(sos.received_time || sos.created_at);
+
+  const peopleEl = document.getElementById("sos-drawer-people");
+  if (peopleEl) peopleEl.textContent = sos.people_affected != null ? sos.people_affected : (sos.people_count != null ? sos.people_count : "1");
+
+  const lat = sos.latitude;
+  const lon = sos.longitude;
+  const hasGps = isValidLatLng(lat, lon);
+
+  const coordsEl = document.getElementById("sos-drawer-coords");
+  if (coordsEl) coordsEl.textContent = hasGps ? `${Number(lat).toFixed(6)}, ${Number(lon).toFixed(6)}` : "Location unavailable";
+
+  const accEl = document.getElementById("sos-drawer-accuracy");
+  if (accEl) accEl.textContent = (hasGps && sos.accuracy) ? `±${Math.round(sos.accuracy)} m` : "Unavailable";
+
+  const clientEl = document.getElementById("sos-drawer-client");
+  if (clientEl) clientEl.textContent = sos.client_id || sos.user_id || "Anonymous";
+
+  const msgEl = document.getElementById("sos-drawer-message");
+  if (msgEl) msgEl.textContent = sos.message || sos.notes || "Emergency assistance requested. No extra details provided.";
+
+  const ackBtn = document.getElementById("btn-sos-acknowledge");
+  if (ackBtn) {
+    ackBtn.disabled = status !== "ACTIVE";
+  }
+  const resBtn = document.getElementById("btn-sos-resolve");
+  if (resBtn) {
+    resBtn.disabled = (status === "RESOLVED" || status === "CANCELLED");
+  }
+  const dismissBtn = document.getElementById("btn-sos-dismiss");
+  if (dismissBtn) {
+    dismissBtn.disabled = (status === "RESOLVED" || status === "CANCELLED");
+  }
+
+  drawer.classList.remove("hidden");
+}
+
+function renderEMeshTopology() {
+  const container = document.getElementById("emesh-topology-container");
+  if (!container) return;
+
+  const topo = state.emesh.topology || {};
+  const links = topo.links || [];
+
+  if (links.length === 0) {
+    container.innerHTML = '<p class="cs-hint">No direct peer links reported by nodes yet.</p>';
+    return;
+  }
+
+  let html = "";
+  for (const l of links) {
+    const from = l.from_node_id || l.from_node || "?";
+    const to = l.to_node_id || l.to_node || "?";
+    const rssi = l.rssi_dbm != null ? Math.round(l.rssi_dbm) + " dBm" : "N/A";
+    const lq = l.link_quality_pct != null ? Math.round(l.link_quality_pct) + "%" : "--";
+
+    html += `
+      <div class="topo-link-item">
+        <span class="topo-link-nodes">${escapeHtml(from)} ➔ ${escapeHtml(to)}</span>
+        <span class="topo-link-rssi">${escapeHtml(rssi)} (${escapeHtml(lq)})</span>
+      </div>
+    `;
+  }
+  container.innerHTML = html;
+}
+
+function renderEMeshSurveyUI() {
+  const survey = state.emesh.survey || {};
+  const isScanning = survey.state === "SCANNING";
+
+  const stEl = document.getElementById("stat-emesh-survey-stat");
+  if (stEl) {
+    stEl.textContent = survey.state || "IDLE";
+    stEl.className = "kv-val font-data " + (isScanning ? "text-green" : "");
+  }
+
+  const sCountEl = document.getElementById("stat-emesh-survey-samples");
+  if (sCountEl) sCountEl.textContent = survey.sample_count || 0;
+
+  const elTimeEl = document.getElementById("stat-emesh-survey-elapsed");
+  if (elTimeEl) elTimeEl.textContent = (survey.elapsed_seconds || 0).toFixed(1) + "s";
+
+  const nodeCountEl = document.getElementById("stat-emesh-survey-nodes");
+  const readings = survey.latest_readings || {};
+  if (nodeCountEl) nodeCountEl.textContent = Object.keys(readings).length;
+
+  const startBtn = document.getElementById("btn-emesh-survey-start");
+  if (startBtn) startBtn.disabled = isScanning;
+
+  const stopBtn = document.getElementById("btn-emesh-survey-stop");
+  if (stopBtn) stopBtn.disabled = !isScanning;
+
+  // Update button label on btn-start-rf-scan
+  const mainStartRfBtn = document.getElementById("btn-start-rf-scan");
+  if (mainStartRfBtn) {
+    if (isScanning) {
+      mainStartRfBtn.textContent = "⏹ STOP RF SURVEY";
+      mainStartRfBtn.classList.remove("btn-primary");
+      mainStartRfBtn.classList.add("btn-danger");
+    } else {
+      mainStartRfBtn.textContent = "▶ START RF SURVEY";
+      mainStartRfBtn.classList.remove("btn-danger");
+      mainStartRfBtn.classList.add("btn-primary");
+    }
+  }
+
+  const tableEl = document.getElementById("emesh-rssi-table");
+  if (tableEl) {
+    const keys = Object.keys(readings);
+    if (keys.length === 0) {
+      tableEl.innerHTML = `<p class="cs-hint">${isScanning ? "Waiting for incoming mesh node RSSI samples…" : "No RSSI readings collected yet. Click Start RF Survey to begin streaming real measurements."}</p>`;
+    } else {
+      let html = "";
+      for (const k of keys) {
+        const r = readings[k];
+        const val = r.rssi_dbm;
+        let badgeClass = "rssi-mod";
+        if (val > -60) badgeClass = "rssi-good";
+        else if (val <= -85) badgeClass = "rssi-gap";
+        else if (val <= -75) badgeClass = "rssi-weak";
+
+        const isStale = Boolean(r.is_stale);
+        const freshnessHtml = isStale
+          ? '<span class="freshness-indicator stale" title="Stale reading (>30s old)"></span>'
+          : '<span class="freshness-indicator fresh" title="Fresh reading (<30s old)"></span>';
+
+        html += `
+          <div class="emesh-rssi-row">
+            <div>
+              ${freshnessHtml}
+              <span class="rssi-node-name">${escapeHtml(r.node_id)}</span>
+              ${r.parent_id ? `<span class="muted">➔ ${escapeHtml(r.parent_id)}</span>` : ""}
+            </div>
+            <div>
+              <span class="rssi-value-chip ${badgeClass}">${Number(val).toFixed(1)} dBm</span>
+            </div>
+          </div>
+        `;
+      }
+      tableEl.innerHTML = html;
+    }
+  }
+
+  const rfTable = document.getElementById("rf-rssi-table");
+  const rfContainer = document.getElementById("rf-rssi-table-container");
+  if (rfTable && isScanning) {
+    if (rfContainer) rfContainer.classList.remove("hidden");
+    const keys = Object.keys(readings);
+    if (keys.length > 0) {
+      let html = "";
+      for (const k of keys) {
+        const r = readings[k];
+        html += `<div style="display:flex; justify-content:space-between; padding:3px 0; font-family:var(--font-data); font-size:11px;">
+          <span>${escapeHtml(r.node_id)}</span>
+          <span style="font-weight:700; color:var(--amber);">${Number(r.rssi_dbm).toFixed(1)} dBm</span>
+        </div>`;
+      }
+      rfTable.innerHTML = html;
+    }
+  }
+}
+
+async function startEMeshSurvey() {
+  const startBtn = document.getElementById("btn-emesh-survey-start");
+  if (startBtn) startBtn.disabled = true;
+
+  try {
+    const res = await apiPost("/api/emesh/survey/start", {});
+    state.emesh.survey = res.body;
+    renderEMeshSurveyUI();
+    logEvent("E-MESH RF Survey collection started.");
+  } catch (err) {
+    logEvent(`E-MESH Survey start failed: ${err.message}`);
+  } finally {
+    if (startBtn) startBtn.disabled = state.emesh.survey.state === "SCANNING";
+  }
+}
+
+async function stopEMeshSurvey() {
+  const stopBtn = document.getElementById("btn-emesh-survey-stop");
+  if (stopBtn) stopBtn.disabled = true;
+
+  try {
+    const res = await apiPost("/api/emesh/survey/stop", {});
+    state.emesh.survey = res.body;
+    renderEMeshSurveyUI();
+    logEvent(`E-MESH RF Survey stopped (${state.emesh.survey.sample_count || 0} samples collected).`);
+  } catch (err) {
+    logEvent(`E-MESH Survey stop failed: ${err.message}`);
+  } finally {
+    if (stopBtn) stopBtn.disabled = state.emesh.survey.state !== "SCANNING";
+  }
+}
+
+async function resetEMeshSurvey() {
+  try {
+    const res = await apiPost("/api/emesh/survey/reset", {});
+    state.emesh.survey = res.body;
+    renderEMeshSurveyUI();
+    logEvent("E-MESH RF Survey data reset.");
+  } catch (err) {
+    logEvent(`E-MESH Survey reset failed: ${err.message}`);
+  }
+}
+
+async function updateSOSStatus(sosId, newStatus) {
+  try {
+    const res = await fetch(`/api/emesh/sos/${encodeURIComponent(sosId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: newStatus }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      const ref = updated.reference_code || updated.sos_id || ("SOS-" + sosId);
+      logEvent(`SOS ${ref} updated to ${newStatus}.`);
+      const sid = String(sosId);
+      const idx = (state.emesh.sos || []).findIndex((s) => String(s.id) === sid || String(s.sos_id) === sid);
+      if (idx >= 0) {
+        state.emesh.sos[idx] = { ...state.emesh.sos[idx], ...updated };
+      }
+      renderSOSQueue();
+      renderEMeshOverview();
+      const updatedItem = idx >= 0 ? state.emesh.sos[idx] : updated;
+      openSOSDetailDrawer(updatedItem);
+    } else {
+      const err = await res.text();
+      logEvent(`Failed to update SOS: ${err}`);
+      showSOSErrorToast(`Failed to update SOS: HTTP ${res.status}`);
+    }
+  } catch (err) {
+    logEvent(`Error updating SOS: ${err.message}`);
+    showSOSErrorToast(`Network error updating SOS: ${err.message}`);
+  }
+}
+
+function showSOSErrorToast(msg) {
+  const container = document.getElementById("sos-toast-container");
+  if (!container) return;
+  const toast = document.createElement("div");
+  toast.className = "sos-toast sos-toast--error";
+  toast.style.borderColor = "#FF3B30";
+  toast.style.background = "rgba(40, 10, 10, 0.95)";
+  toast.innerHTML = `<span style="color:#FF3B30; font-weight:700;">⚠️ ${escapeHtml(msg)}</span>`;
+  container.appendChild(toast);
+  setTimeout(() => {
+    if (toast.parentNode) toast.remove();
+  }, 6000);
+}
+
+function initEMeshIntegration() {
+  const subtabs = document.querySelectorAll(".emesh-subtab");
+  const subviews = document.querySelectorAll(".emesh-subview");
+  subtabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      subtabs.forEach((t) => t.classList.remove("active"));
+      subviews.forEach((v) => v.classList.add("hidden"));
+      tab.classList.add("active");
+      const targetId = tab.getAttribute("data-target");
+      const targetView = document.getElementById(targetId);
+      if (targetView) targetView.classList.remove("hidden");
+    });
+  });
+
+  const filterChips = document.querySelectorAll(".filter-chip");
+  filterChips.forEach((chip) => {
+    chip.addEventListener("click", () => {
+      filterChips.forEach((c) => c.classList.remove("active"));
+      chip.classList.add("active");
+      state.emesh.activeFilter = chip.getAttribute("data-filter");
+      renderSOSQueue();
+    });
+  });
+
+  const audioBtn = document.getElementById("btn-toggle-audio");
+  if (audioBtn) {
+    audioBtn.addEventListener("click", () => {
+      state.emesh.audioEnabled = !state.emesh.audioEnabled;
+      if (state.emesh.audioEnabled) {
+        audioBtn.classList.remove("muted");
+        audioBtn.textContent = "🔊 ALERTS";
+        playEmergencyChime();
+      } else {
+        audioBtn.classList.add("muted");
+        audioBtn.textContent = "🔇 MUTED";
+      }
+    });
+  }
+
+  const closeDrawerBtn = document.getElementById("btn-close-sos-drawer");
+  if (closeDrawerBtn) {
+    closeDrawerBtn.addEventListener("click", () => {
+      const drawer = document.getElementById("sos-detail-drawer");
+      if (drawer) drawer.classList.add("hidden");
+    });
+  }
+
+  const locateBtn = document.getElementById("btn-sos-locate");
+  if (locateBtn) {
+    locateBtn.addEventListener("click", () => {
+      if (state.emesh.selectedSos) {
+        const lat = parseFloat(state.emesh.selectedSos.latitude);
+        const lon = parseFloat(state.emesh.selectedSos.longitude);
+        if (!isValidLatLng(lat, lon)) {
+          logEvent("Cannot locate SOS on map: Location unavailable (no GPS fix reported).");
+          alert("Location unavailable: This SOS report has no GPS fix reported by the device.");
+          return;
+        }
+        if (typeof map !== "undefined" && map) {
+          map.setView([lat, lon], 18);
+          const key = String(state.emesh.selectedSos.id || state.emesh.selectedSos.sos_id);
+          const entry = state.emesh.sosMarkers && state.emesh.sosMarkers.get(key);
+          if (entry && entry.marker) {
+            entry.marker.openPopup();
+          }
+          const ref = state.emesh.selectedSos.reference_code || state.emesh.selectedSos.sos_id || state.emesh.selectedSos.id;
+          logEvent(`Centered map on SOS ${ref} (${lat.toFixed(6)}, ${lon.toFixed(6)})`);
+        }
+      }
+    });
+  }
+
+  const ackBtn = document.getElementById("btn-sos-acknowledge");
+  if (ackBtn) {
+    ackBtn.addEventListener("click", () => {
+      if (state.emesh.selectedSos) {
+        updateSOSStatus(state.emesh.selectedSos.id, "ACKNOWLEDGED");
+      }
+    });
+  }
+
+  const resBtn = document.getElementById("btn-sos-resolve");
+  if (resBtn) {
+    resBtn.addEventListener("click", () => {
+      if (state.emesh.selectedSos) {
+        updateSOSStatus(state.emesh.selectedSos.id, "RESOLVED");
+      }
+    });
+  }
+
+  const dismissBtn = document.getElementById("btn-sos-dismiss");
+  if (dismissBtn) {
+    dismissBtn.addEventListener("click", () => {
+      if (state.emesh.selectedSos) {
+        updateSOSStatus(state.emesh.selectedSos.id, "DISMISSED");
+      }
+    });
+  }
+
+  const surveyStartBtn = document.getElementById("btn-emesh-survey-start");
+  if (surveyStartBtn) surveyStartBtn.addEventListener("click", startEMeshSurvey);
+
+  const surveyStopBtn = document.getElementById("btn-emesh-survey-stop");
+  if (surveyStopBtn) surveyStopBtn.addEventListener("click", stopEMeshSurvey);
+
+  const surveyResetBtn = document.getElementById("btn-emesh-survey-reset");
+  if (surveyResetBtn) surveyResetBtn.addEventListener("click", resetEMeshSurvey);
+
+  const refreshBtn = document.getElementById("btn-refresh-emesh");
+  if (refreshBtn) refreshBtn.addEventListener("click", loadEMeshData);
+
+  connectEMeshWebSocket();
+  loadEMeshData();
+}
 
 // ---------------------------------------------------------------------------
 // Boot
@@ -3668,6 +4869,9 @@ async function boot() {
   _updateGamepadStat();
   _updateOverrideStat();
 
+  // Initialize E-MESH Emergency Mesh & SOS Integration
+  initEMeshIntegration();
+
   logEvent("GCS initialized — Phase 6 ready.");
 }
 
@@ -3748,6 +4952,9 @@ boot();
   bindLayerCheckbox("chk-layer-rfscan", () => state.rfScanLayer);
   bindLayerCheckbox("chk-layer-rfheatmap", () => state.rfHeatmapLayer);
   bindLayerCheckbox("chk-layer-candidates", () => state.rfCandidateLayer || state.candidateLayer);
+  bindLayerCheckbox("chk-layer-mesh-nodes", () => state.meshNodesLayer);
+  bindLayerCheckbox("chk-layer-clients", () => state.connectedClientsLayer);
+  bindLayerCheckbox("chk-layer-sos", () => state.sosAlertsLayer);
 
   // -------------------------------------------------------------------------
   // Log drawer toggle & Clear

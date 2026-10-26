@@ -1,0 +1,19 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "mesh_layer.c"
+        "peripheral_gps.c"
+        "peripheral_ui.c"
+        "peripheral_sensors.c"
+        "comms.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        nvs_flash
+        esp_wifi
+        esp_netif
+        esp_event
+        esp_http_client
+        driver
+        esp_timer
+)

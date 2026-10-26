@@ -23,6 +23,7 @@ import coordinate_mapper  # Phase 9A — simulation coordinate transformation
 import survey_planner    # Phase 2 — RF scan survey path planner
 from rf_collector import get_rf_collector, SCAN_STATE_ABORTED  # Phase 3 — RF Survey collector
 import rf_survey_analyzer  # Phase 5 — RF-data-driven candidate generation
+from emesh_service import get_emesh_service  # E-MESH Emergency Mesh & RF Survey Integration
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -175,12 +176,21 @@ async def on_startup():
     # mav_manager's own background thread, so a slow/stalled WebSocket
     # client can never block MAVLink message processing.
     await telemetry_broadcaster.start()
+    # Initialize E-MESH background polling and WebSocket listener
+    try:
+        get_emesh_service()
+    except Exception as e:
+        logger.warning(f"Could not initialize EMeshService on startup: {e}")
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
     await telemetry_broadcaster.stop()
     mav_manager.stop_background()
+    try:
+        get_emesh_service().stop()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1287,6 +1297,10 @@ def api_mission_start():
             rf_collector.start_scan()
             session_state["rf_scan_state"] = "RUNNING"
             logger.info(f"RF Scan mission started — collector state: {rf_collector.state}.")
+            try:
+                get_emesh_service().start_rf_survey()
+            except Exception as em_err:
+                logger.warning(f"Could not start E-MESH RF survey on mission start: {em_err}")
 
         return MissionStartResponse(success=True, mode="MISSION")
 
@@ -1338,6 +1352,10 @@ def api_mission_abort():
         rf_collector.abort_scan(reason="User abort via /api/mission/abort")
         session_state["rf_scan_state"] = "ABORTED"
         logger.info("RF scan ABORTED — sample collection stopped immediately.")
+        try:
+            get_emesh_service().stop_rf_survey()
+        except Exception:
+            pass
 
     try:
         mav_manager.send_command("set_mode", mode="RTL")
@@ -1500,6 +1518,10 @@ def api_rf_survey_reset():
     """
     rf_collector = get_rf_collector()
     rf_collector.reset()
+    try:
+        get_emesh_service().reset_rf_survey()
+    except Exception:
+        pass
     active_nodes = list_nodes()
     rf_collector.update_deployed_nodes(active_nodes)
     session_state["rf_scan_state"] = "IDLE"
@@ -2536,6 +2558,227 @@ async def ws_telemetry(websocket: WebSocket):
 
 
 # ---------------------------------------------------------------------------
+# ESP32 Firmware & Citizen Proxy — forward all /api/v1/* to E-MESH backend
+# ---------------------------------------------------------------------------
+# The ESP32 firmware is compiled with SERVER_IP="192.168.137.1" (hotspot
+# gateway) and SERVER_PORT=8000 (this GCS). Since we cannot modify firmware,
+# we transparently proxy all /api/v1/* traffic (node heartbeats, SOS alerts,
+# citizen locations) to the E-MESH backend running on port 8001.
+
+from fastapi import Request, Response
+from fastapi.responses import JSONResponse
+import httpx as _httpx
+
+@app.api_route("/api/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+async def proxy_emesh_api(request: Request, path: str):
+    """
+    Transparently forward all /api/v1/* traffic (hardware nodes, SOS, client updates)
+    from port 8000 to the E-MESH backend on port 8001.
+    """
+    target = f"{config.EMESH_SERVER_URL}/api/v1/{path}"
+    query = request.url.query
+    if query:
+        target = f"{target}?{query}"
+    body = await request.body()
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.request(
+                method=request.method,
+                url=target,
+                content=body if body else None,
+                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+            )
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                media_type=resp.headers.get("content-type", "application/json"),
+            )
+    except Exception as e:
+        logger.warning(f"E-MESH proxy failed for {request.method} /api/v1/{path}: {e}")
+        return JSONResponse(
+            status_code=502,
+            content={"error": f"E-MESH backend unreachable on {config.EMESH_SERVER_URL}", "detail": str(e)},
+        )
+
+
+
+# ---------------------------------------------------------------------------
+# E-MESH Emergency Mesh & Live RF Survey Integration
+# ---------------------------------------------------------------------------
+
+class EMeshSOSUpdate(BaseModel):
+    status: Optional[str] = None
+    notes: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+
+@app.get("/api/emesh/status")
+def api_emesh_status():
+    """Return live status of E-MESH server connectivity, nodes, clients, SOS, and RF survey."""
+    svc = get_emesh_service()
+    return svc.get_status()
+
+
+@app.get("/api/emesh/nodes")
+def api_emesh_nodes():
+    """Return mesh nodes reported by E-MESH server."""
+    svc = get_emesh_service()
+    return svc.fetch_nodes()
+
+
+@app.get("/api/emesh/topology")
+def api_emesh_topology():
+    """Return full mesh topology (nodes and links) from E-MESH server."""
+    svc = get_emesh_service()
+    return svc.fetch_topology()
+
+
+@app.get("/api/emesh/clients")
+def api_emesh_clients():
+    """Return connected citizen devices / browser sessions from E-MESH."""
+    svc = get_emesh_service()
+    return svc.fetch_clients()
+
+
+@app.get("/api/emesh/sos")
+def api_emesh_sos(status: Optional[str] = None):
+    """Return SOS alerts queue from E-MESH."""
+    svc = get_emesh_service()
+    return svc.fetch_sos(status=status)
+
+
+@app.patch("/api/emesh/sos/{sos_id}")
+def api_emesh_update_sos(sos_id: str, body: EMeshSOSUpdate):
+    """Update SOS status or coordinates on E-MESH server (e.g. ACKNOWLEDGED, RESOLVED)."""
+    svc = get_emesh_service()
+    try:
+        return svc.update_sos_status(
+            sos_id,
+            new_status=body.status,
+            notes=body.notes,
+            latitude=body.latitude,
+            longitude=body.longitude,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"E-MESH update failed: {e}")
+
+
+
+@app.post("/api/emesh/survey/start")
+def api_emesh_survey_start():
+    """Start real-time E-MESH RSSI collection session."""
+    svc = get_emesh_service()
+    return svc.start_rf_survey()
+
+
+@app.post("/api/emesh/survey/stop")
+def api_emesh_survey_stop():
+    """Stop real-time E-MESH RSSI collection session."""
+    svc = get_emesh_service()
+    return svc.stop_rf_survey()
+
+
+@app.post("/api/emesh/survey/reset")
+def api_emesh_survey_reset():
+    """Reset E-MESH survey samples and state."""
+    svc = get_emesh_service()
+    return svc.reset_rf_survey()
+
+
+@app.get("/api/emesh/survey/status")
+def api_emesh_survey_status():
+    """Return current survey status, elapsed time, and latest per-node/link RSSI."""
+    svc = get_emesh_service()
+    return svc.get_survey_status()
+
+
+@app.get("/api/emesh/survey/samples")
+def api_emesh_survey_samples():
+    """Return all recorded RSSI samples for the current/last survey session."""
+    svc = get_emesh_service()
+    return svc.get_survey_samples()
+
+
+@app.websocket("/ws/emesh")
+async def ws_emesh(websocket: WebSocket):
+    """WebSocket endpoint streaming live E-MESH events and survey RSSI telemetry to GCS frontend."""
+    import asyncio
+    await websocket.accept()
+    svc = get_emesh_service()
+    client_q = asyncio.Queue()
+    svc.register_subscriber(client_q)
+
+    try:
+        # Push immediate snapshot on connect
+        await websocket.send_json({
+            "event": "emesh_init",
+            "data": {
+                "status": svc.get_status(),
+                "nodes": svc.fetch_nodes(),
+                "topology": svc.fetch_topology(),
+                "clients": svc.fetch_clients(),
+                "sos": svc.fetch_sos(),
+                "survey": svc.get_survey_status(),
+            }
+        })
+
+        while True:
+            # Drain queue and send
+            event = await client_q.get()
+            await websocket.send_json(event)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.warning(f"GCS EMesh WS error: {e}")
+    finally:
+        svc.unregister_subscriber(client_q)
+
+
+@app.websocket("/api/v1/ws")
+@app.websocket("/ws")
+async def ws_emesh_client_proxy(websocket: WebSocket):
+    """Proxy citizen client WebSockets on port 8000 to the E-MESH backend on port 8001."""
+    import asyncio
+    import websockets
+    await websocket.accept()
+
+    query_str = websocket.scope.get("query_string", b"").decode("utf-8")
+    target = config.EMESH_WS_URL
+    if query_str:
+        sep = "&" if "?" in target else "?"
+        target = f"{target}{sep}{query_str}"
+
+    try:
+        async with websockets.connect(target) as backend_ws:
+            async def client_to_backend():
+                try:
+                    while True:
+                        msg = await websocket.receive_text()
+                        await backend_ws.send(msg)
+                except Exception:
+                    pass
+
+            async def backend_to_client():
+                try:
+                    async for msg in backend_ws:
+                        await websocket.send_text(msg)
+                except Exception:
+                    pass
+
+            await asyncio.gather(client_to_backend(), backend_to_client())
+    except Exception as e:
+        logger.debug(f"Client WS proxy to E-MESH closed: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+
+# ---------------------------------------------------------------------------
 # Static frontend + data serving (so the whole app runs from one origin)
 # ---------------------------------------------------------------------------
 
@@ -2547,3 +2790,8 @@ def root():
 
 app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")
 app.mount("/frontend", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+
+EMESH_CLIENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "E-MESH-main", "client"))
+if os.path.exists(EMESH_CLIENT_DIR):
+    app.mount("/client", StaticFiles(directory=EMESH_CLIENT_DIR, html=True), name="client")
+

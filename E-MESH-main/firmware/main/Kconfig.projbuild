@@ -1,0 +1,85 @@
+menu "E-MESH Firmware Configuration"
+
+    config EMESH_ROUTER_SSID
+        string "Radxa Hotspot SSID"
+        default "E-MESH-SERVER"
+        help
+            The Wi-Fi SSID of the Radxa SBC hotspot that the root node will connect to.
+
+    config EMESH_ROUTER_PASSWORD
+        string "Radxa Hotspot Password"
+        default "emesh2025"
+        help
+            The Wi-Fi password for the Radxa SBC hotspot.
+
+    config EMESH_SOFTAP_SSID
+        string "Node SoftAP SSID (broadcast to clients)"
+        default "E-MESH-PUBLIC"
+        help
+            The SSID that each mesh node broadcasts for end-user devices to connect to.
+
+    config EMESH_SOFTAP_PASSWORD
+        string "Node SoftAP Password"
+        default "meshpublic"
+        help
+            Password for the public SoftAP network. Min 8 chars or empty for open.
+
+    config EMESH_SOFTAP_MAX_CONNECTIONS
+        int "Max SoftAP client connections per node"
+        default 4
+        range 1 10
+        help
+            Maximum number of devices that can connect to a single node's AP.
+
+    config EMESH_SERVER_IP
+        string "Backend Server IP Address"
+        default "192.168.4.1"
+        help
+            The static IP address of the Radxa SBC running the FastAPI backend.
+
+    config EMESH_SERVER_PORT
+        int "Backend Server Port"
+        default 8000
+        range 1 65535
+        help
+            The port on which the FastAPI backend is listening.
+
+    config EMESH_HEARTBEAT_INTERVAL_SEC
+        int "Heartbeat interval (seconds)"
+        default 3
+        range 3 300
+        help
+            How often each node sends a heartbeat/telemetry update to the server.
+            3 seconds is recommended for real-time sensor monitoring with <10 nodes.
+
+    config EMESH_GPS_ENABLED
+        bool "Enable GPS peripheral support"
+        default y
+        help
+            Enable NEO-6M GPS module support. If enabled, the firmware will
+            attempt to detect the GPS on boot. If no GPS is found, it will
+            gracefully degrade to router-only mode.
+
+    config EMESH_SOS_ENABLED
+        bool "Enable SOS button support"
+        default y
+        help
+            Enable the physical SOS button with hardware interrupt.
+
+    config EMESH_SENSORS_ENABLED
+        bool "Enable I2C sensor support (BMP280 + MPU6050)"
+        default y
+        help
+            Enable auto-detection of BMP280 (temperature/pressure) and
+            MPU6050 (6-axis IMU) over I2C. If sensors are not physically
+            connected, the firmware gracefully skips them and continues
+            normal mesh operation. Sensor data is included in heartbeats.
+
+    config EMESH_MESH_MAX_LEVEL
+        int "Maximum mesh tree depth"
+        default 6
+        range 2 10
+        help
+            Maximum number of levels (hops) in the mesh tree topology.
+
+endmenu

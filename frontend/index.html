@@ -35,9 +35,14 @@
       <span class="status-label muted">MISSION:</span>
       <span class="status-label" id="status-mission-label">IDLE</span>
     </div>
+    <div class="status-pill" id="status-emesh-pill" title="E-MESH Emergency Mesh Network Status">
+      <span class="status-dot status-dot--warn" id="status-emesh-dot"></span>
+      <span class="status-label" id="status-emesh-label">E-MESH: CONNECTING</span>
+    </div>
   </div>
 
   <div class="topbar-meta">
+    <button class="topbar-audio-btn" id="btn-toggle-audio" title="Toggle Emergency Audio Alert Chime" aria-label="Toggle Alert Audio">🔊 ALERTS</button>
     <span class="meta-time" id="topbar-clock">--:--:--</span>
     <div class="telemetry-strip">
       <div class="tel-chip"><span class="tel-chip-label">ALT</span><span class="tel-chip-val" id="hdr-alt">--</span></div>
@@ -86,6 +91,10 @@
       <label class="layer-chk"><input type="checkbox" id="chk-layer-rfscan" checked><span>RF Survey Path</span></label>
       <label class="layer-chk"><input type="checkbox" id="chk-layer-rfheatmap" checked><span>RF Coverage</span></label>
       <label class="layer-chk"><input type="checkbox" id="chk-layer-candidates" checked><span>Candidates</span></label>
+      <div style="border-top:1px solid var(--border-dim); margin:4px 0;"></div>
+      <label class="layer-chk"><input type="checkbox" id="chk-layer-mesh-nodes" checked><span class="layer-dot dot-cyan"></span><span>Mesh Nodes</span></label>
+      <label class="layer-chk"><input type="checkbox" id="chk-layer-clients" checked><span class="layer-dot dot-purple"></span><span>Connected Clients</span></label>
+      <label class="layer-chk"><input type="checkbox" id="chk-layer-sos" checked><span class="layer-dot dot-red"></span><span>SOS Alerts</span></label>
     </div>
 
     <!-- RF legend — shown when heatmap active -->
@@ -119,6 +128,9 @@
       <button class="cmd-tab"        id="tab-rf"      role="tab" aria-selected="false" aria-controls="pane-rf">RF</button>
       <button class="cmd-tab"        id="tab-deploy"  role="tab" aria-selected="false" aria-controls="pane-deploy">DEPLOY</button>
       <button class="cmd-tab"        id="tab-history" role="tab" aria-selected="false" aria-controls="pane-history">HISTORY</button>
+      <button class="cmd-tab"        id="tab-emesh"   role="tab" aria-selected="false" aria-controls="pane-emesh">
+        EMERGENCY MESH <span class="badge-sos-count hidden" id="badge-tab-sos-count">0</span>
+      </button>
     </nav>
 
     <!-- ============================================================
@@ -297,7 +309,7 @@
         <!-- Step 3: EXECUTE -->
         <section class="cs" aria-label="RF survey: execute">
           <h3 class="cs-title"><span class="step-badge">03</span> EXECUTE</h3>
-          <button id="btn-start-rf-scan" class="btn btn-primary btn-block" disabled>▶ START RF SCAN</button>
+          <button id="btn-start-rf-scan" class="btn btn-primary btn-block">▶ START RF SURVEY</button>
 
           <!-- Live scan progress -->
           <div id="rf-scan-live" class="rf-scan-live hidden">
@@ -623,6 +635,123 @@
       </div>
     </div>
 
+    <!-- ============================================================
+         TAB: EMERGENCY MESH
+         ============================================================ -->
+    <div class="cmd-pane" id="pane-emesh" role="tabpanel" aria-labelledby="tab-emesh">
+      <div class="cmd-scroll">
+
+        <!-- E-MESH Sub Navigation -->
+        <div class="emesh-subnav" role="tablist">
+          <button class="emesh-subtab active" id="subtab-emesh-overview" data-target="emesh-view-overview">OVERVIEW</button>
+          <button class="emesh-subtab" id="subtab-emesh-sos" data-target="emesh-view-sos">
+            SOS QUEUE <span class="badge-subtab-sos hidden" id="badge-subtab-sos">0</span>
+          </button>
+          <button class="emesh-subtab" id="subtab-emesh-topology" data-target="emesh-view-topology">TOPOLOGY</button>
+          <button class="emesh-subtab" id="subtab-emesh-rssi" data-target="emesh-view-rssi">RSSI / QUALITY</button>
+        </div>
+
+        <!-- VIEW 1: OVERVIEW -->
+        <div class="emesh-subview" id="emesh-view-overview">
+          <section class="cs emesh-hero">
+            <div class="emesh-hero-header">
+              <span class="cs-title">MESH NETWORK STATUS</span>
+              <span class="badge-status-conn" id="emesh-hero-status-badge">ONLINE</span>
+            </div>
+            <div class="kv-grid kv-grid--2" style="margin-top:10px">
+              <div class="kv"><span class="kv-label">ACTIVE SOS</span><span class="kv-val text-red font-data" id="stat-emesh-active-sos">0</span></div>
+              <div class="kv"><span class="kv-label">TOTAL ALERTS</span><span class="kv-val font-data" id="stat-emesh-total-sos">0</span></div>
+              <div class="kv"><span class="kv-label">MESH NODES</span><span class="kv-val font-data" id="stat-emesh-nodes">0</span></div>
+              <div class="kv"><span class="kv-label">CONNECTED CLIENTS</span><span class="kv-val text-purple font-data" id="stat-emesh-clients">0</span></div>
+              <div class="kv kv--wide"><span class="kv-label">SURVEY COLLECTOR</span><span class="kv-val font-data" id="stat-emesh-survey-state">IDLE</span></div>
+              <div class="kv kv--wide"><span class="kv-label">LAST UPDATE</span><span class="kv-val font-data" id="stat-emesh-last-seen">--:--:--</span></div>
+            </div>
+          </section>
+
+          <!-- Mesh Nodes Quick Table -->
+          <section class="cs" style="margin-top:12px">
+            <div class="section-header-flex">
+              <h4 class="cs-subtitle">DEPLOYED MESH NODES</h4>
+              <button class="btn btn-xs btn-outline" id="btn-refresh-emesh">⟳ REFRESH</button>
+            </div>
+            <div id="emesh-nodes-list" class="emesh-nodes-list">
+              <p class="cs-hint">No nodes currently detected on mesh.</p>
+            </div>
+          </section>
+
+          <!-- Connected Citizen Clients List -->
+          <section class="cs" style="margin-top:12px">
+            <div class="section-header-flex">
+              <h4 class="cs-subtitle">CONNECTED CITIZEN CLIENTS</h4>
+              <span class="badge-pill-subtle" id="badge-client-gps-count">0 GPS Fix</span>
+            </div>
+            <p class="cs-hint" style="margin-bottom:8px">Citizen devices connected to mesh hotspot. Precise map markers are only placed for clients with confirmed GPS permission.</p>
+            <div id="emesh-clients-list" class="emesh-clients-list">
+              <p class="cs-hint">No citizen devices active in the last 60 minutes.</p>
+            </div>
+          </section>
+        </div>
+
+        <!-- VIEW 2: SOS MAP & QUEUE -->
+        <div class="emesh-subview hidden" id="emesh-view-sos">
+          <section class="cs">
+            <div class="sos-filter-bar">
+              <button class="filter-chip active" data-filter="ACTIVE">ACTIVE</button>
+              <button class="filter-chip" data-filter="ALL">ALL (HISTORY)</button>
+              <button class="filter-chip" data-filter="ACKNOWLEDGED">ACKNOWLEDGED</button>
+              <button class="filter-chip" data-filter="RESOLVED">RESOLVED</button>
+            </div>
+            <div id="emesh-sos-queue" class="emesh-sos-queue" style="margin-top:10px">
+              <p class="cs-hint">No emergency SOS alerts in queue.</p>
+            </div>
+          </section>
+        </div>
+
+        <!-- VIEW 3: MESH TOPOLOGY -->
+        <div class="emesh-subview hidden" id="emesh-view-topology">
+          <section class="cs">
+            <h4 class="cs-subtitle">MESH TOPOLOGY &amp; LINK HEALTH</h4>
+            <p class="cs-hint" style="margin-bottom:8px">Direct neighbor and upstream parent telemetry reported by ESP32 nodes.</p>
+            <div id="emesh-topology-container" class="emesh-topology-container">
+              <p class="cs-hint">Gathering topology information…</p>
+            </div>
+          </section>
+        </div>
+
+        <!-- VIEW 4: RSSI / LINK QUALITY (SURVEY INTEGRATION) -->
+        <div class="emesh-subview hidden" id="emesh-view-rssi">
+          <section class="cs">
+            <h4 class="cs-subtitle">RF SURVEY RSSI TELEMETRY</h4>
+            <p class="cs-hint" style="margin-bottom:10px">Collect and inspect real-time RSSI signal strengths from mesh hardware nodes and links.</p>
+
+            <div class="survey-controls-bar">
+              <button id="btn-emesh-survey-start" class="btn btn-primary btn-sm">▶ START RF SURVEY</button>
+              <button id="btn-emesh-survey-stop" class="btn btn-secondary btn-sm" disabled>⏹ STOP SURVEY</button>
+              <button id="btn-emesh-survey-reset" class="btn btn-outline btn-sm">⟲ RESET</button>
+            </div>
+
+            <div class="kv-grid kv-grid--2" style="margin-top:10px">
+              <div class="kv"><span class="kv-label">SURVEY STATUS</span><span class="kv-val font-data" id="stat-emesh-survey-stat">IDLE</span></div>
+              <div class="kv"><span class="kv-label">SAMPLES RECORDED</span><span class="kv-val font-data" id="stat-emesh-survey-samples">0</span></div>
+              <div class="kv"><span class="kv-label">ELAPSED TIME</span><span class="kv-val font-data" id="stat-emesh-survey-elapsed">0.0s</span></div>
+              <div class="kv"><span class="kv-label">ACTIVE LINKS/NODES</span><span class="kv-val font-data" id="stat-emesh-survey-nodes">0</span></div>
+            </div>
+
+            <div class="rssi-table-wrap" style="margin-top:14px">
+              <div class="section-header-flex">
+                <span class="kv-label">LIVE MEASURED RSSI (dBm)</span>
+                <span class="freshness-legend"><span class="freshness-indicator fresh"></span>Fresh (&lt;30s) &nbsp; <span class="freshness-indicator stale"></span>Stale</span>
+              </div>
+              <div id="emesh-rssi-table" class="emesh-rssi-table">
+                <p class="cs-hint">No RSSI readings collected yet. Click Start RF Survey to begin streaming real measurements.</p>
+              </div>
+            </div>
+          </section>
+        </div>
+
+      </div>
+    </div>
+
   </aside>
 
 </main>
@@ -661,8 +790,43 @@
   <span id="stat-state">IDLE</span>
 </div>
 
+<!-- ===================================================================
+     EMERGENCY SOS DETAIL DRAWER
+     =================================================================== -->
+<div id="sos-detail-drawer" class="sos-drawer hidden" role="dialog" aria-modal="true" aria-label="SOS Alert Details">
+  <div class="sos-drawer-header">
+    <div class="sos-drawer-title-wrap">
+      <span class="sos-alert-badge" id="sos-drawer-status-badge">ACTIVE</span>
+      <span class="sos-drawer-id" id="sos-drawer-ref-id">SOS-00000</span>
+    </div>
+    <button class="sos-drawer-close" id="btn-close-sos-drawer" aria-label="Close drawer">✕</button>
+  </div>
+  <div class="sos-drawer-body">
+    <div class="kv-grid kv-grid--2">
+      <div class="kv"><span class="kv-label">RECEIVED AT</span><span class="kv-val font-data" id="sos-drawer-time">--:--:--</span></div>
+      <div class="kv"><span class="kv-label">PEOPLE AFFECTED</span><span class="kv-val font-data" id="sos-drawer-people">1</span></div>
+      <div class="kv kv--wide"><span class="kv-label">COORDINATES</span><span class="kv-val font-data" id="sos-drawer-coords">--</span></div>
+      <div class="kv"><span class="kv-label">ACCURACY</span><span class="kv-val font-data" id="sos-drawer-accuracy">--</span></div>
+      <div class="kv"><span class="kv-label">CLIENT / DEVICE ID</span><span class="kv-val font-data" id="sos-drawer-client">--</span></div>
+    </div>
+    <div class="sos-drawer-section" style="margin-top:12px">
+      <span class="kv-label">EMERGENCY MESSAGE / DETAILS</span>
+      <div class="sos-message-box" id="sos-drawer-message">None provided.</div>
+    </div>
+    <div class="sos-drawer-actions" style="margin-top:16px">
+      <button class="btn btn-secondary btn-block" id="btn-sos-locate">📍 CENTER ON MAP</button>
+      <button class="btn btn-warning btn-block" id="btn-sos-acknowledge" style="margin-top:8px">✓ ACKNOWLEDGE SOS</button>
+      <button class="btn btn-success btn-block" id="btn-sos-resolve" style="margin-top:8px">★ RESOLVE INCIDENT</button>
+      <button class="btn btn-outline btn-block" id="btn-sos-dismiss" style="margin-top:8px">✕ DISMISS ALERT</button>
+    </div>
+  </div>
+</div>
+
+<!-- In-app SOS Toast Alert Banner -->
+<div id="sos-toast-container" class="sos-toast-container"></div>
+
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-<script src="app.js?v=17"></script>
+<script src="app.js?v=18"></script>
 </body>
 </html>

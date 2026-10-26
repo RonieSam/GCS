@@ -11,11 +11,25 @@ numbers through the code, per the project spec.
 # Phase 9A — Simulation coordinate transformation
 # ---------------------------------------------------------------------------
 
+import os
+from pathlib import Path
+
+# Load .env from project root or backend dir
+try:
+    from dotenv import load_dotenv
+    _root_env = Path(__file__).resolve().parent.parent / ".env"
+    if _root_env.exists():
+        load_dotenv(_root_env)
+    else:
+        load_dotenv()
+except Exception:
+    pass
+
 # Set to True when running against PX4 SITL / Gazebo so the backend
 # transparently remaps coordinates between the GCS planning space and the
 # PX4/Gazebo geographic space.  Set to False for real-hardware deployments
 # where GCS and vehicle share the same WGS84 reference frame.
-SIMULATION_MODE = False
+SIMULATION_MODE = os.getenv("SIMULATION_MODE", "true").lower() in ("true", "1")
 
 # GCS map reference origin — the point on the GCS map that corresponds to the
 # PX4/Gazebo home position.  All user-selected targets are expressed as a
@@ -86,3 +100,12 @@ UAV_HOME_LON = GCS_REFERENCE_LON
 # --- Data files ---
 NODES_FILE = "data/nodes.json"
 SCENARIOS_FILE = "data/scenarios.json"
+
+# --- E-MESH Emergency Mesh Integration ---
+# NOTE: The ESP32 firmware is hardcoded to POST to port 8000 (this GCS).
+# The E-MESH backend must run on a DIFFERENT port (default 8001).
+# The GCS proxies ESP32 hardware traffic to the E-MESH backend.
+EMESH_SERVER_URL = os.getenv("EMESH_SERVER_URL", "http://127.0.0.1:8001")
+EMESH_WS_URL = os.getenv("EMESH_WS_URL", "ws://127.0.0.1:8001/api/v1/ws")
+EMESH_POLL_INTERVAL_S = float(os.getenv("EMESH_POLL_INTERVAL_S", "2.0"))
+EMESH_STALE_THRESHOLD_S = float(os.getenv("EMESH_STALE_THRESHOLD_S", "30.0"))
