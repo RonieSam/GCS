@@ -177,11 +177,13 @@ class EMeshService:
         ws_url: Optional[str] = None,
         poll_interval_s: Optional[float] = None,
         stale_threshold_s: Optional[float] = None,
+        client_timeout_s: Optional[float] = None,
     ):
         self.base_url = (base_url or getattr(config, "EMESH_SERVER_URL", "http://127.0.0.1:8001")).rstrip("/")
         self.ws_url = ws_url or getattr(config, "EMESH_WS_URL", "ws://127.0.0.1:8001/api/v1/ws")
         self.poll_interval_s = poll_interval_s or getattr(config, "EMESH_POLL_INTERVAL_S", 2.0)
         self.stale_threshold_s = stale_threshold_s or getattr(config, "EMESH_STALE_THRESHOLD_S", 30.0)
+        self.client_timeout_s = client_timeout_s or getattr(config, "CLIENT_INACTIVITY_TIMEOUT_S", 35.0)
 
         self.survey_collector = EMeshSurveyCollector(stale_threshold_s=self.stale_threshold_s)
 
@@ -207,6 +209,43 @@ class EMeshService:
         self._subscribers: Set[asyncio.Queue] = set()
         self._subscribers_lock = threading.Lock()
 
+    def _parse_client_timestamp(self, client_dict: Dict[str, Any]) -> float:
+        """Parse timestamp/last_seen/updated_at to epoch seconds (UTC)."""
+        for k in ("last_seen_epoch", "last_seen", "updated_at", "timestamp"):
+            val = client_dict.get(k)
+            if val is not None:
+                if isinstance(val, (int, float)):
+                    if val > 1e11:
+                        return val / 1000.0
+                    return float(val)
+                if isinstance(val, str):
+                    try:
+                        clean_iso = val.replace("Z", "+00:00")
+                        dt = datetime.fromisoformat(clean_iso)
+                        return dt.timestamp()
+                    except Exception:
+                        pass
+        return 0.0
+
+    def _enrich_client_freshness(self, client_dict: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
+        """Compute freshness and authoritative online status based on inactivity timeout."""
+        if now is None:
+            now = time.time()
+        c = dict(client_dict)
+        ts = self._parse_client_timestamp(c)
+        if ts > 0:
+            c["last_seen_epoch"] = ts
+            if not c.get("last_seen"):
+                c["last_seen"] = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+            age_s = max(0.0, now - ts)
+            c["age_seconds"] = round(age_s, 1)
+            c["is_online"] = (age_s <= self.client_timeout_s)
+        else:
+            c["last_seen_epoch"] = 0.0
+            c["age_seconds"] = 999999.0
+            c["is_online"] = False
+        return c
+
     def start(self):
         """Start background polling and WebSocket monitoring threads."""
         if self._running:
@@ -227,12 +266,16 @@ class EMeshService:
 
     def get_status(self) -> Dict[str, Any]:
         """Return connectivity, counts, and survey status."""
+        now = time.time()
         with self._lock:
             connected = self._is_connected
             last_err = self._last_error
             last_success = self._last_successful_at
             node_cnt = len(self._cached_nodes)
-            client_cnt = len(self._cached_clients)
+            # Count only active, online clients satisfying freshness timeout
+            online_clients = [c for c in self._cached_clients if self._enrich_client_freshness(c, now=now).get("is_online")]
+            client_cnt = len(online_clients)
+            total_registered = len(self._cached_clients)
             active_sos = sum(1 for s in self._cached_sos if str(s.get("status", "")).upper() == "ACTIVE")
             total_sos = len(self._cached_sos)
 
@@ -248,6 +291,8 @@ class EMeshService:
             "total_sos_count": total_sos,
             "node_count": node_cnt,
             "client_count": client_cnt,
+            "total_registered_clients": total_registered,
+            "client_timeout_s": self.client_timeout_s,
             "survey": survey_st,
         }
 
@@ -298,23 +343,25 @@ class EMeshService:
             return dict(self._cached_topology)
 
     def fetch_clients(self) -> List[Dict[str, Any]]:
-        """Fetch connected users/devices from /api/v1/location/users."""
+        """Fetch connected users/devices from /api/v1/location/users and compute freshness."""
+        now = time.time()
         try:
             with httpx.Client(timeout=4.0) as client:
                 res = client.get(f"{self.base_url}/api/v1/location/users?active_within_minutes=60")
                 if res.status_code == 200:
                     data = res.json()
-                    clients = data if isinstance(data, list) else data.get("data", [])
+                    raw_clients = data if isinstance(data, list) else data.get("data", [])
                     self._record_success()
+                    enriched = [self._enrich_client_freshness(c, now=now) for c in raw_clients]
                     with self._lock:
-                        self._cached_clients = clients
-                    return clients
+                        self._cached_clients = enriched
+                    return enriched
                 else:
                     self._record_error(f"HTTP {res.status_code}: {res.text[:100]}")
         except Exception as e:
             self._record_error(str(e))
         with self._lock:
-            return list(self._cached_clients)
+            return [self._enrich_client_freshness(c, now=now) for c in self._cached_clients]
 
     def fetch_sos(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
         """Fetch SOS alerts from /api/v1/sos."""
@@ -555,6 +602,12 @@ class EMeshService:
         elif event_name == "user.location_updated":
             cid = data.get("client_id") or data.get("user_id")
             if cid:
+                now = time.time()
+                data["last_seen_epoch"] = now
+                if not data.get("last_seen"):
+                    data["last_seen"] = datetime.now(timezone.utc).isoformat()
+                data["is_online"] = True
+                data["age_seconds"] = 0.0
                 with self._lock:
                     found = False
                     for idx, c in enumerate(self._cached_clients):
@@ -564,6 +617,14 @@ class EMeshService:
                             break
                     if not found:
                         self._cached_clients.insert(0, data)
+        elif event_name in ("user.offline", "user.disconnected"):
+            cid = data.get("client_id") or data.get("user_id")
+            if cid:
+                with self._lock:
+                    for idx, c in enumerate(self._cached_clients):
+                        if c.get("client_id") == cid or c.get("user_id") == cid:
+                            self._cached_clients[idx]["is_online"] = False
+                            break
 
         # Ingest RSSI if this is a node telemetry event during survey
         if event_name in ("node.updated", "node.online", "mesh.telemetry") and self.survey_collector.is_active():

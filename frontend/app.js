@@ -3746,6 +3746,9 @@ async function loadEMeshData() {
 
     if (stRes.status === "fulfilled" && stRes.value && !stRes.value.error) {
       state.emesh.connected = Boolean(stRes.value.connected);
+      if (stRes.value.client_timeout_s) {
+        state.emesh.clientTimeoutMs = stRes.value.client_timeout_s * 1000;
+      }
       updateEMeshStatusPill(stRes.value);
     }
     if (nodesRes.status === "fulfilled" && Array.isArray(nodesRes.value)) {
@@ -3862,6 +3865,9 @@ function handleEMeshWSEvent(payload) {
   if (ev === "emesh_init") {
     if (data.status) {
       state.emesh.connected = Boolean(data.status.connected);
+      if (data.status.client_timeout_s) {
+        state.emesh.clientTimeoutMs = data.status.client_timeout_s * 1000;
+      }
       updateEMeshStatusPill(data.status);
     }
     if (Array.isArray(data.nodes)) {
@@ -3921,6 +3927,8 @@ function handleEMeshWSEvent(payload) {
   if (ev === "user.location_updated") {
     const cid = data.client_id || data.user_id;
     if (cid) {
+      data.last_seen_epoch = data.last_seen_epoch || (Date.now() / 1000);
+      data.is_online = true;
       const idx = state.emesh.clients.findIndex((c) => (c.client_id || c.user_id) === cid);
       if (idx >= 0) {
         state.emesh.clients[idx] = { ...state.emesh.clients[idx], ...data };
@@ -3929,6 +3937,19 @@ function handleEMeshWSEvent(payload) {
       }
       renderEMeshClients();
       renderEMeshOverview();
+    }
+    return;
+  }
+
+  if (ev === "user.offline" || ev === "user.disconnected") {
+    const cid = data.client_id || data.user_id;
+    if (cid) {
+      const idx = state.emesh.clients.findIndex((c) => (c.client_id || c.user_id) === cid);
+      if (idx >= 0) {
+        state.emesh.clients[idx].is_online = false;
+        renderEMeshClients();
+        renderEMeshOverview();
+      }
     }
     return;
   }
@@ -3971,7 +3992,7 @@ function renderEMeshOverview() {
   const activeCount = state.emesh.sos.filter((s) => String(s.status).toUpperCase() === "ACTIVE").length;
   const totalCount = state.emesh.sos.length;
   const nodeCount = state.emesh.nodes.length;
-  const clientCount = state.emesh.clients.length;
+  const clientCount = (state.emesh.clients || []).filter((c) => isClientOnline(c)).length;
 
   const actEl = document.getElementById("stat-emesh-active-sos");
   if (actEl) actEl.textContent = activeCount;
@@ -4080,54 +4101,48 @@ function renderMeshNodeMarkers() {
   }
 }
 
-function renderEMeshClients() {
-  const listEl = document.getElementById("emesh-clients-list");
-  if (!listEl) return;
+const CLIENT_INACTIVITY_TIMEOUT_MS = 35000;
 
-  const clients = state.emesh.clients || [];
-  let gpsCount = 0;
-
-  if (clients.length === 0) {
-    listEl.innerHTML = '<p class="cs-hint">No citizen devices active in the last 60 minutes.</p>';
-    const badge = document.getElementById("badge-client-gps-count");
-    if (badge) badge.textContent = "0 GPS Fix";
-    renderClientMarkers();
-    return;
+function getClientTimestampMs(client) {
+  if (!client) return 0;
+  if (typeof client.last_seen_epoch === "number" && client.last_seen_epoch > 0) {
+    return client.last_seen_epoch * 1000;
   }
-
-  let html = "";
-  for (const c of clients) {
-    const id = c.client_id || c.user_id || "Anonymous Client";
-    const lat = c.latitude;
-    const lon = c.longitude;
-    const hasGps = (lat != null && lon != null && (lat !== 0 || lon !== 0));
-    if (hasGps) gpsCount++;
-
-    const locStr = hasGps
-      ? `${Number(lat).toFixed(5)}, ${Number(lon).toFixed(5)} (±${c.accuracy ? Math.round(c.accuracy) + "m" : "N/A"})`
-      : "No coordinates (Wi-Fi connected only)";
-    const seenStr = formatEmeshTime(c.last_seen || c.timestamp);
-
-    html += `
-      <div class="emesh-client-card">
-        <div class="card-header-row">
-          <span class="card-title text-purple">📱 ${escapeHtml(id)}</span>
-          <span class="badge-status-conn">${c.is_online !== false ? "CONNECTED" : "OFFLINE"}</span>
-        </div>
-        <div class="card-meta-grid">
-          <div style="grid-column: span 2"><span class="muted">LOCATION:</span> ${escapeHtml(locStr)}</div>
-          <div><span class="muted">LAST SEEN:</span> ${escapeHtml(seenStr)}</div>
-          <div><span class="muted">STATUS:</span> ${hasGps ? '<span class="text-green">GPS Fix</span>' : '<span class="muted">No GPS</span>'}</div>
-        </div>
-      </div>
-    `;
+  const raw = client.last_seen || client.updated_at || client.timestamp;
+  if (raw != null) {
+    if (typeof raw === "number") {
+      return raw > 1e11 ? raw : raw * 1000;
+    }
+    if (typeof raw === "string") {
+      const parsed = Date.parse(raw);
+      if (!isNaN(parsed)) return parsed;
+    }
   }
-  listEl.innerHTML = html;
+  return 0;
+}
 
-  const badge = document.getElementById("badge-client-gps-count");
-  if (badge) badge.textContent = `${gpsCount} GPS Fix`;
+function isClientOnline(client) {
+  if (!client) return false;
+  if (client.is_online === false) return false;
+  const tsMs = getClientTimestampMs(client);
+  if (tsMs <= 0) {
+    return client.is_online === true;
+  }
+  const timeoutMs = (state.emesh && state.emesh.clientTimeoutMs) || CLIENT_INACTIVITY_TIMEOUT_MS;
+  const ageMs = Date.now() - tsMs;
+  return ageMs >= 0 && ageMs <= timeoutMs;
+}
 
-  renderClientMarkers();
+function formatClientLastSeen(client) {
+  const tsMs = getClientTimestampMs(client);
+  if (tsMs <= 0) return "Never";
+  const ageSec = Math.max(0, Math.floor((Date.now() - tsMs) / 1000));
+  if (ageSec < 5) return "Just now";
+  if (ageSec < 60) return `${ageSec}s ago`;
+  const ageMin = Math.floor(ageSec / 60);
+  if (ageMin < 60) return `${ageMin}m ago`;
+  const d = new Date(tsMs);
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
 function isValidLatLng(lat, lon) {
@@ -4141,27 +4156,101 @@ function isValidLatLng(lat, lon) {
   return true;
 }
 
+function renderEMeshClients() {
+  const listEl = document.getElementById("emesh-clients-list");
+  if (!listEl) return;
+
+  const clients = state.emesh.clients || [];
+  let onlineGpsCount = 0;
+  let onlineCount = 0;
+
+  for (const c of clients) {
+    if (isClientOnline(c)) {
+      onlineCount++;
+      if (isValidLatLng(c.latitude, c.longitude)) {
+        onlineGpsCount++;
+      }
+    }
+  }
+
+  // Sort: online first, then by freshest timestamp
+  const sorted = [...clients].sort((a, b) => {
+    const aOn = isClientOnline(a) ? 1 : 0;
+    const bOn = isClientOnline(b) ? 1 : 0;
+    if (aOn !== bOn) return bOn - aOn;
+    return getClientTimestampMs(b) - getClientTimestampMs(a);
+  });
+
+  if (sorted.length === 0) {
+    listEl.innerHTML = '<p class="cs-hint">No citizen devices detected on mesh.</p>';
+    const badge = document.getElementById("badge-client-gps-count");
+    if (badge) badge.textContent = "0 GPS Fix";
+    renderClientMarkers();
+    return;
+  }
+
+  let html = "";
+  for (const c of sorted) {
+    const id = c.client_id || c.user_id || "Anonymous Client";
+    const lat = c.latitude;
+    const lon = c.longitude;
+    const isOnline = isClientOnline(c);
+    const hasGps = isValidLatLng(lat, lon);
+    const locStr = hasGps
+      ? `${Number(lat).toFixed(5)}, ${Number(lon).toFixed(5)} (±${c.accuracy ? Math.round(c.accuracy) + "m" : "N/A"})`
+      : (isOnline ? "No coordinates (Wi-Fi connected only)" : "Coordinates unavailable (Device offline)");
+    const seenStr = formatClientLastSeen(c);
+
+    html += `
+      <div class="emesh-client-card ${isOnline ? 'card-client-online' : 'card-client-offline'}">
+        <div class="card-header-row">
+          <span class="card-title text-purple">📱 ${escapeHtml(id)}</span>
+          <span class="badge-status-conn ${isOnline ? '' : 'offline'}">${isOnline ? "CONNECTED" : "OFFLINE"}</span>
+        </div>
+        <div class="card-meta-grid">
+          <div style="grid-column: span 2"><span class="muted">LOCATION:</span> ${escapeHtml(locStr)}</div>
+          <div><span class="muted">LAST SEEN:</span> ${escapeHtml(seenStr)}</div>
+          <div><span class="muted">STATUS:</span> ${hasGps ? '<span class="text-green">GPS Fix</span>' : (isOnline ? '<span class="text-amber">No GPS Fix</span>' : '<span class="muted">Offline</span>')}</div>
+        </div>
+      </div>
+    `;
+  }
+  listEl.innerHTML = html;
+
+  const badge = document.getElementById("badge-client-gps-count");
+  if (badge) badge.textContent = `${onlineGpsCount} GPS Fix`;
+
+  renderClientMarkers();
+}
+
 function renderClientMarkers() {
   if (!state.connectedClientsLayer) return;
   if (!state.emesh.clientMarkers) state.emesh.clientMarkers = new Map();
 
   const clients = state.emesh.clients || [];
-  const activeClientKeys = new Set();
+  const activeOnlineKeys = new Set();
 
   for (const c of clients) {
-    const lat = parseFloat(c.latitude);
-    const lon = parseFloat(c.longitude);
     const cid = String(c.client_id || c.user_id || "");
     if (!cid) continue;
 
-    if (!isValidLatLng(lat, lon)) {
-      // No GPS fix — do NOT display marker on map (per Problem 3 & 5 requirements)
+    // A client must be actively online and fresh to appear on the active map
+    if (!isClientOnline(c)) {
       continue;
     }
 
-    activeClientKeys.add(cid);
+    const lat = parseFloat(c.latitude);
+    const lon = parseFloat(c.longitude);
+
+    // If client has no valid GPS fix, never invent coordinates or plot at (0, 0)
+    if (!isValidLatLng(lat, lon)) {
+      continue;
+    }
+
+    activeOnlineKeys.add(cid);
     const accuracy = c.accuracy != null && !isNaN(parseFloat(c.accuracy)) ? parseFloat(c.accuracy) : null;
-    const popupContent = `<b>Citizen Device: ${escapeHtml(cid)}</b><br>Coords: ${lat.toFixed(6)}, ${lon.toFixed(6)}<br>Accuracy: ±${accuracy ? Math.round(accuracy) + "m" : "N/A"}<br>Last Seen: ${formatEmeshTime(c.last_seen || c.timestamp)}`;
+    const seenStr = formatClientLastSeen(c);
+    const popupContent = `<b>Citizen Device: ${escapeHtml(cid)}</b><br><span style="color:#3BDB7A;font-weight:700">● CONNECTED</span><br>Coords: ${lat.toFixed(6)}, ${lon.toFixed(6)}<br>Accuracy: ±${accuracy ? Math.round(accuracy) + "m" : "N/A"}<br>Last Seen: ${seenStr}`;
 
     if (state.emesh.clientMarkers.has(cid)) {
       const entry = state.emesh.clientMarkers.get(cid);
@@ -4211,9 +4300,9 @@ function renderClientMarkers() {
     }
   }
 
-  // Remove markers for clients that disconnected or lost GPS
+  // Authoritatively remove markers for clients that transitioned to offline or disconnected
   for (const [cid, entry] of state.emesh.clientMarkers.entries()) {
-    if (!activeClientKeys.has(cid)) {
+    if (!activeOnlineKeys.has(cid)) {
       if (entry.marker) state.connectedClientsLayer.removeLayer(entry.marker);
       if (entry.circle) state.connectedClientsLayer.removeLayer(entry.circle);
       state.emesh.clientMarkers.delete(cid);
@@ -4437,8 +4526,16 @@ function openSOSDetailDrawer(sos) {
   const accEl = document.getElementById("sos-drawer-accuracy");
   if (accEl) accEl.textContent = (hasGps && sos.accuracy) ? `±${Math.round(sos.accuracy)} m` : "Unavailable";
 
+  const clientObj = (state.emesh.clients || []).find((c) => (c.client_id || c.user_id) === (sos.client_id || sos.user_id));
+  const isClientActive = clientObj ? isClientOnline(clientObj) : null;
+  let clientDisplay = sos.client_id || sos.user_id || "Anonymous Client";
+  if (isClientActive === false) {
+    clientDisplay += " (Device Offline — SOS Record Preserved)";
+  } else if (isClientActive === true) {
+    clientDisplay += " (Connected)";
+  }
   const clientEl = document.getElementById("sos-drawer-client");
-  if (clientEl) clientEl.textContent = sos.client_id || sos.user_id || "Anonymous";
+  if (clientEl) clientEl.textContent = clientDisplay;
 
   const msgEl = document.getElementById("sos-drawer-message");
   if (msgEl) msgEl.textContent = sos.message || sos.notes || "Emergency assistance requested. No extra details provided.";
@@ -5135,6 +5232,14 @@ boot();
 
   // Hook into telemetry by patching renderTelemetryPanel via interval
   setInterval(syncTopbarChips, 500);
+
+  // Periodic freshness check for citizen client markers & offline eviction
+  setInterval(() => {
+    if (state.emesh && state.emesh.clients && state.emesh.clients.length > 0) {
+      renderEMeshClients();
+      renderEMeshOverview();
+    }
+  }, 2000);
 
   // -------------------------------------------------------------------------
   // Alias: stat-state-rf mirrors stat-state (for RF tab draw state display)
