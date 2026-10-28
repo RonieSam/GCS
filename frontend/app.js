@@ -208,40 +208,104 @@ async function apiDelete(path) {
 }
 
 // ---------------------------------------------------------------------------
-// Map setup, with schematic fallback if tile imagery can't load
+// Map setup, Basemap Switcher & Schematic Fallback
 // ---------------------------------------------------------------------------
+
+const BASEMAP_PROVIDERS = {
+  osm: {
+    name: "OpenStreetMap Standard",
+    url: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    options: {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors',
+      subdomains: ["a", "b", "c"],
+    }
+  },
+  positron: {
+    name: "CartoDB Positron (Street Detail)",
+    url: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+    options: {
+      maxZoom: 20,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a>',
+      subdomains: "abcd",
+    }
+  },
+  darkmatter: {
+    name: "CartoDB Dark Matter",
+    url: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+    options: {
+      maxZoom: 20,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a>',
+      subdomains: "abcd",
+    }
+  },
+  esri: {
+    name: "Esri World Imagery (Satellite)",
+    url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    options: {
+      maxZoom: 19,
+      attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community',
+    }
+  }
+};
+
+let currentTileLayer = null;
+let currentBasemapKey = "osm";
+
+function switchBasemap(key) {
+  if (!BASEMAP_PROVIDERS[key] || typeof map === "undefined" || !map) return;
+
+  if (usingFallbackTiles) {
+    usingFallbackTiles = false;
+    const mapEl = document.getElementById("map");
+    if (mapEl) mapEl.style.background = "";
+    const bannerEl = document.getElementById("map-fallback-banner");
+    if (bannerEl) bannerEl.classList.add("hidden");
+  }
+
+  if (currentTileLayer) {
+    map.removeLayer(currentTileLayer);
+  }
+
+  const def = BASEMAP_PROVIDERS[key];
+  currentBasemapKey = key;
+  currentTileLayer = L.tileLayer(def.url, def.options);
+
+  let tileErrorCount = 0;
+  let successfulTileLoads = 0;
+
+  currentTileLayer.on("tileload", () => {
+    successfulTileLoads += 1;
+    if (tileErrorCount > 0) tileErrorCount = Math.max(0, tileErrorCount - 1);
+  });
+
+  currentTileLayer.on("tileerror", () => {
+    tileErrorCount += 1;
+    // Only fall back to schematic offline grid if genuine network/provider outage occurs
+    if (tileErrorCount >= 30 && successfulTileLoads === 0 && !usingFallbackTiles) {
+      enableFallbackBasemap();
+    }
+  });
+
+  currentTileLayer.addTo(map);
+  if (currentTileLayer.bringToBack) {
+    currentTileLayer.bringToBack();
+  }
+
+  logEvent(`Switched basemap to ${def.name}`);
+}
 
 function initMap(centerLat, centerLon) {
   map = L.map("map", {
     zoomControl: true,
     attributionControl: true,
+    maxZoom: 20,
   }).setView([centerLat, centerLon], 16);
 
   canvasRenderer = L.canvas({ padding: 0.5 });
 
-  const osmLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 19,
-    attribution: "&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors",
-    subdomains: ["a", "b", "c"],
-  });
-
-  let tileErrorCount = 0;
-  let successfulTileLoads = 0;
-
-  osmLayer.on("tileload", () => {
-    successfulTileLoads += 1;
-    if (tileErrorCount > 0) tileErrorCount = Math.max(0, tileErrorCount - 1);
-  });
-
-  osmLayer.on("tileerror", () => {
-    tileErrorCount += 1;
-    // Only fall back to schematic offline grid if genuine network/provider outage occurs
-    if (tileErrorCount >= 25 && successfulTileLoads === 0 && !usingFallbackTiles) {
-      enableFallbackBasemap();
-    }
-  });
-
-  osmLayer.addTo(map);
+  // Initialize with default OpenStreetMap layer
+  switchBasemap("osm");
 
   // E-MESH layer groups
   state.meshNodesLayer = L.layerGroup().addTo(map);
@@ -3756,7 +3820,23 @@ async function loadEMeshData() {
       renderEMeshNodes();
     }
     if (clientsRes.status === "fulfilled" && Array.isArray(clientsRes.value)) {
-      state.emesh.clients = clientsRes.value;
+      const polled = clientsRes.value;
+      const merged = [...polled];
+      // Keep any active client from state that has a newer update than polled
+      for (const existing of (state.emesh.clients || [])) {
+        const ecid = String(existing.client_id || existing.user_id || "");
+        const pIdx = merged.findIndex((p) => String(p.client_id || p.user_id || "") === ecid);
+        if (pIdx >= 0) {
+          const eTs = Number(existing.timestamp || existing.last_seen_epoch || 0);
+          const pTs = Number(merged[pIdx].timestamp || merged[pIdx].last_seen_epoch || 0);
+          if (eTs > pTs) {
+            merged[pIdx] = { ...merged[pIdx], ...existing };
+          }
+        } else {
+          merged.push(existing);
+        }
+      }
+      state.emesh.clients = merged;
       renderEMeshClients();
     }
     if (sosRes.status === "fulfilled" && Array.isArray(sosRes.value)) {
@@ -3927,11 +4007,16 @@ function handleEMeshWSEvent(payload) {
   if (ev === "user.location_updated") {
     const cid = data.client_id || data.user_id;
     if (cid) {
-      data.last_seen_epoch = data.last_seen_epoch || (Date.now() / 1000);
+      const updateTs = Number(data.timestamp || data.last_seen_epoch || (Date.now() / 1000));
+      data.last_seen_epoch = updateTs;
       data.is_online = true;
       const idx = state.emesh.clients.findIndex((c) => (c.client_id || c.user_id) === cid);
       if (idx >= 0) {
-        state.emesh.clients[idx] = { ...state.emesh.clients[idx], ...data };
+        const existingTs = Number(state.emesh.clients[idx].timestamp || state.emesh.clients[idx].last_seen_epoch || 0);
+        // Do not allow an older out-of-order message to overwrite a newer fix
+        if (updateTs >= (existingTs - 0.5)) {
+          state.emesh.clients[idx] = { ...state.emesh.clients[idx], ...data };
+        }
       } else {
         state.emesh.clients.unshift(data);
       }
@@ -4202,7 +4287,7 @@ function renderEMeshClients() {
     const seenStr = formatClientLastSeen(c);
 
     html += `
-      <div class="emesh-client-card ${isOnline ? 'card-client-online' : 'card-client-offline'}">
+      <div class="emesh-client-card ${isOnline ? 'card-client-online' : 'card-client-offline'} ${state.emesh.selectedClientId === id ? 'client-card-selected' : ''}" data-client-id="${escapeHtml(id)}">
         <div class="card-header-row">
           <span class="card-title text-purple">📱 ${escapeHtml(id)}</span>
           <span class="badge-status-conn ${isOnline ? '' : 'offline'}">${isOnline ? "CONNECTED" : "OFFLINE"}</span>
@@ -4212,16 +4297,111 @@ function renderEMeshClients() {
           <div><span class="muted">LAST SEEN:</span> ${escapeHtml(seenStr)}</div>
           <div><span class="muted">STATUS:</span> ${hasGps ? '<span class="text-green">GPS Fix</span>' : (isOnline ? '<span class="text-amber">No GPS Fix</span>' : '<span class="muted">Offline</span>')}</div>
         </div>
+        <div style="margin-top:8px">
+          <button type="button" class="btn btn-xs ${hasGps ? 'btn-primary' : 'btn-outline'} btn-locate-client" data-client-id="${escapeHtml(id)}" ${hasGps ? '' : 'title="No GPS coordinates reported by device"'}>
+            ${hasGps ? '🎯 LOCATE ON MAP' : '📍 GPS FIX UNAVAILABLE'}
+          </button>
+        </div>
       </div>
     `;
   }
   listEl.innerHTML = html;
+
+  listEl.querySelectorAll(".btn-locate-client").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const cid = btn.getAttribute("data-client-id");
+      locateClientOnMap(cid);
+    });
+  });
+
+  listEl.querySelectorAll(".emesh-client-card").forEach((card) => {
+    card.addEventListener("click", () => {
+      const cid = card.getAttribute("data-client-id");
+      locateClientOnMap(cid);
+    });
+  });
 
   const badge = document.getElementById("badge-client-gps-count");
   if (badge) badge.textContent = `${onlineGpsCount} GPS Fix`;
 
   renderClientMarkers();
 }
+
+function locateClientOnMap(clientId) {
+  if (!clientId) return;
+  const client = (state.emesh.clients || []).find(
+    (c) => (c.client_id || c.user_id) === clientId
+  );
+
+  if (!client) {
+    logEvent(`Cannot locate ${clientId}: Client not found in mesh registry.`);
+    alert(`Client "${clientId}" is not found in the current mesh registry.`);
+    return;
+  }
+
+  const lat = parseFloat(client.latitude);
+  const lon = parseFloat(client.longitude);
+  const isOnline = isClientOnline(client);
+
+  if (!isValidLatLng(lat, lon)) {
+    logEvent(`Cannot locate ${clientId}: Location unavailable (no GPS fix reported).`);
+    alert(`GPS Unavailable: Client "${clientId}" is connected via Wi-Fi mesh, but has not reported valid GPS coordinates (e.g., GPS permission denied or device indoors).`);
+    return;
+  }
+
+  const accuracy = client.accuracy != null && !isNaN(parseFloat(client.accuracy)) ? parseFloat(client.accuracy) : null;
+  const seenStr = formatClientLastSeen(client);
+  const isFresh = isOnline && (client.age_seconds != null ? client.age_seconds <= 35 : true);
+
+  state.emesh.selectedClientId = clientId;
+
+  if (typeof map !== "undefined" && map) {
+    // 1. Center map and zoom in to campus-level detail (zoom: 18)
+    map.setView([lat, lon], 18);
+
+    // 2. Ensure clients layer is enabled and visible
+    if (state.connectedClientsLayer && !map.hasLayer(state.connectedClientsLayer)) {
+      map.addLayer(state.connectedClientsLayer);
+      const chk = document.getElementById("chk-layer-clients");
+      if (chk) chk.checked = true;
+    }
+
+    // 3. Highlight client marker and open popup with full diagnostics
+    let entry = state.emesh.clientMarkers && state.emesh.clientMarkers.get(clientId);
+    if (!entry) {
+      renderClientMarkers();
+      entry = state.emesh.clientMarkers && state.emesh.clientMarkers.get(clientId);
+    }
+
+    if (entry && entry.marker) {
+      entry.marker.openPopup();
+    }
+
+    // 4. Update visual selection ring on marker
+    if (state.emesh.clientMarkers) {
+      for (const [id, e] of state.emesh.clientMarkers.entries()) {
+        const iconEl = e.marker && e.marker.getElement();
+        if (iconEl) {
+          const clientDiv = iconEl.querySelector(".leaflet-marker-client");
+          if (clientDiv) {
+            if (id === clientId) {
+              clientDiv.classList.add("leaflet-marker-client--selected");
+            } else {
+              clientDiv.classList.remove("leaflet-marker-client--selected");
+            }
+          }
+        }
+      }
+    }
+
+    logEvent(`🎯 Centered map on Citizen Phone [${clientId}] at ${lat.toFixed(6)}°, ${lon.toFixed(6)}° (±${accuracy ? Math.round(accuracy) + 'm' : 'N/A'}, ${seenStr}, ${isFresh ? 'Fresh' : 'Stale'})`);
+  }
+
+  renderEMeshClients();
+}
+
+window.gcsLocateClient = locateClientOnMap;
 
 function renderClientMarkers() {
   if (!state.connectedClientsLayer) return;
@@ -4250,7 +4430,20 @@ function renderClientMarkers() {
     activeOnlineKeys.add(cid);
     const accuracy = c.accuracy != null && !isNaN(parseFloat(c.accuracy)) ? parseFloat(c.accuracy) : null;
     const seenStr = formatClientLastSeen(c);
-    const popupContent = `<b>Citizen Device: ${escapeHtml(cid)}</b><br><span style="color:#3BDB7A;font-weight:700">● CONNECTED</span><br>Coords: ${lat.toFixed(6)}, ${lon.toFixed(6)}<br>Accuracy: ±${accuracy ? Math.round(accuracy) + "m" : "N/A"}<br>Last Seen: ${seenStr}`;
+    const isSelected = (state.emesh.selectedClientId === cid);
+
+    const popupContent = `
+      <div class="client-popup" style="font-family:var(--font-sans); color:#fff; min-width:200px;">
+        <div style="font-weight:700; color:#B388FF; font-size:13px; margin-bottom:4px;">📱 Citizen Device: ${escapeHtml(cid)}</div>
+        <div style="font-size:11px; margin-bottom:2px;"><span style="color:#8E8E93;">STATUS:</span> <b style="color:#3BDB7A;">CONNECTED (GPS Fix)</b></div>
+        <div style="font-size:11px; margin-bottom:2px;"><span style="color:#8E8E93;">COORDS:</span> <b>${lat.toFixed(6)}°, ${lon.toFixed(6)}°</b></div>
+        <div style="font-size:11px; margin-bottom:2px;"><span style="color:#8E8E93;">ACCURACY:</span> ±${accuracy ? Math.round(accuracy) + "m" : "N/A (unspecified)"}</div>
+        <div style="font-size:11px; margin-bottom:4px;"><span style="color:#8E8E93;">LAST SEEN:</span> ${seenStr}</div>
+        <div style="margin-top:6px;">
+          <button class="btn btn-xs btn-primary" onclick="window.gcsLocateClient('${escapeHtml(cid)}')">🎯 Center Map</button>
+        </div>
+      </div>
+    `;
 
     if (state.emesh.clientMarkers.has(cid)) {
       const entry = state.emesh.clientMarkers.get(cid);
@@ -4277,7 +4470,7 @@ function renderClientMarkers() {
       const marker = L.marker([lat, lon], {
         icon: L.divIcon({
           className: "custom-client-marker",
-          html: '<div class="leaflet-marker-client">👤</div>',
+          html: `<div class="leaflet-marker-client ${isSelected ? 'leaflet-marker-client--selected' : ''}">👤</div>`,
           iconSize: [22, 22],
           iconAnchor: [11, 11],
         }),
@@ -5052,6 +5245,16 @@ boot();
   bindLayerCheckbox("chk-layer-mesh-nodes", () => state.meshNodesLayer);
   bindLayerCheckbox("chk-layer-clients", () => state.connectedClientsLayer);
   bindLayerCheckbox("chk-layer-sos", () => state.sosAlertsLayer);
+
+  // Basemap provider switching
+  const basemapRadios = document.querySelectorAll('input[name="rad-basemap"]');
+  basemapRadios.forEach((radio) => {
+    radio.addEventListener("change", (e) => {
+      if (e.target.checked && typeof switchBasemap === "function") {
+        switchBasemap(e.target.value);
+      }
+    });
+  });
 
   // -------------------------------------------------------------------------
   // Log drawer toggle & Clear

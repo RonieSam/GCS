@@ -211,7 +211,7 @@ class EMeshService:
 
     def _parse_client_timestamp(self, client_dict: Dict[str, Any]) -> float:
         """Parse timestamp/last_seen/updated_at to epoch seconds (UTC)."""
-        for k in ("last_seen_epoch", "last_seen", "updated_at", "timestamp"):
+        for k in ("timestamp", "last_seen_epoch", "last_seen", "updated_at"):
             val = client_dict.get(k)
             if val is not None:
                 if isinstance(val, (int, float)):
@@ -222,6 +222,8 @@ class EMeshService:
                     try:
                         clean_iso = val.replace("Z", "+00:00")
                         dt = datetime.fromisoformat(clean_iso)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
                         return dt.timestamp()
                     except Exception:
                         pass
@@ -603,16 +605,28 @@ class EMeshService:
             cid = data.get("client_id") or data.get("user_id")
             if cid:
                 now = time.time()
-                data["last_seen_epoch"] = now
+                update_ts = data.get("timestamp")
+                if update_ts is None:
+                    update_ts = self._parse_client_timestamp(data)
+                if not update_ts or update_ts <= 0:
+                    update_ts = now
+                else:
+                    update_ts = float(update_ts)
+
+                data["last_seen_epoch"] = update_ts
+                data["timestamp"] = update_ts
                 if not data.get("last_seen"):
-                    data["last_seen"] = datetime.now(timezone.utc).isoformat()
+                    data["last_seen"] = datetime.fromtimestamp(update_ts, tz=timezone.utc).isoformat()
                 data["is_online"] = True
-                data["age_seconds"] = 0.0
+                data["age_seconds"] = max(0.0, now - update_ts)
                 with self._lock:
                     found = False
                     for idx, c in enumerate(self._cached_clients):
                         if c.get("client_id") == cid or c.get("user_id") == cid:
-                            self._cached_clients[idx] = {**c, **data}
+                            existing_ts = c.get("timestamp") or c.get("last_seen_epoch") or 0.0
+                            # Only overwrite if update is newer or equal (reject out-of-order older messages)
+                            if update_ts >= (existing_ts - 0.5):
+                                self._cached_clients[idx] = {**c, **data}
                             found = True
                             break
                     if not found:

@@ -17,6 +17,7 @@ class LocationUpdate(EMeshBaseModel):
     longitude: float = Field(..., ge=-180.0, le=180.0)
     accuracy: Optional[float] = Field(None, ge=0.0, description="Accuracy radius in metres")
     client_id: Optional[str] = None
+    timestamp: Optional[float] = Field(None, description="Position acquisition epoch timestamp in seconds")
 
 
 class LocationRead(EMeshBaseModel):
@@ -30,6 +31,7 @@ class LocationRead(EMeshBaseModel):
     longitude: float
     accuracy: Optional[float] = None
     client_id: Optional[str] = None
+    timestamp: Optional[float] = None
     updated_at: datetime
 
 

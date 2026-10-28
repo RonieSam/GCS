@@ -70,6 +70,91 @@ def get_local_ip():
         s.close()
     return IP
 
+class ProxyHTTPRequestHandler(SimpleHTTPRequestHandler):
+    """
+    Serves static citizen client files over HTTPS and reverse-proxies /api/*
+    traffic to the local GCS backend on port 8000, eliminating browser Mixed Content errors.
+    """
+    BACKEND_URL = "http://127.0.0.1:8000"
+
+    def do_proxy(self):
+        import urllib.request
+        import urllib.error
+
+        target_url = f"{self.BACKEND_URL}{self.path}"
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length > 0 else None
+
+        req_headers = {}
+        for key in ("Content-Type", "Accept", "Authorization", "X-Client-Id"):
+            if key in self.headers:
+                req_headers[key] = self.headers[key]
+
+        req = urllib.request.Request(target_url, data=body, headers=req_headers, method=self.command)
+
+        try:
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                resp_body = resp.read()
+                self.send_response(resp.status)
+                for header_key, header_val in resp.getheaders():
+                    if header_key.lower() not in ("content-length", "transfer-encoding"):
+                        self.send_header(header_key, header_val)
+                self.send_header("Content-Length", str(len(resp_body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(resp_body)
+        except urllib.error.HTTPError as e:
+            err_body = e.read()
+            self.send_response(e.code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err_body)))
+            self.end_headers()
+            self.wfile.write(err_body)
+        except Exception as e:
+            err_json = f'{{"error": "Proxy error", "detail": "{str(e)}"}}\n'.encode("utf-8")
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err_json)))
+            self.end_headers()
+            self.wfile.write(err_json)
+
+    def do_GET(self):
+        if self.path.startswith("/api/"):
+            self.do_proxy()
+        else:
+            super().do_GET()
+
+    def do_POST(self):
+        if self.path.startswith("/api/"):
+            self.do_proxy()
+        else:
+            self.send_error(405, "Method Not Allowed")
+
+    def do_PATCH(self):
+        if self.path.startswith("/api/"):
+            self.do_proxy()
+        else:
+            self.send_error(405, "Method Not Allowed")
+
+    def do_PUT(self):
+        if self.path.startswith("/api/"):
+            self.do_proxy()
+        else:
+            self.send_error(405, "Method Not Allowed")
+
+    def do_DELETE(self):
+        if self.path.startswith("/api/"):
+            self.do_proxy()
+        else:
+            self.send_error(405, "Method Not Allowed")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Client-Id")
+        self.end_headers()
+
 if __name__ == "__main__":
     PORT = 3443 # Using 3443 to avoid conflict with existing 3000
     CERT_FILE = 'cert.pem'
@@ -77,7 +162,7 @@ if __name__ == "__main__":
     
     generate_self_signed_cert(CERT_FILE, KEY_FILE)
     
-    httpd = HTTPServer(('0.0.0.0', PORT), SimpleHTTPRequestHandler)
+    httpd = HTTPServer(('0.0.0.0', PORT), ProxyHTTPRequestHandler)
     
     # Wrap with SSL
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

@@ -38,6 +38,14 @@ _all_auth = require_roles(
 _anonymous_client_locations: dict[str, dict] = {}
 
 
+def _to_utc_timestamp(dt: Optional[datetime]) -> Optional[float]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
 @router.post("", response_model=SuccessResponse, summary="Update my GPS location")
 async def update_my_location(
     body: LocationUpdate,
@@ -56,18 +64,25 @@ async def update_my_location(
         )
         existing = result.scalar_one_or_none()
 
+        update_ts = float(body.timestamp) if body.timestamp is not None else now.timestamp()
+        if existing and existing.updated_at:
+            existing_ts = _to_utc_timestamp(existing.updated_at) or 0.0
+            if update_ts < (existing_ts - 0.5):
+                return SuccessResponse(message="Stale update ignored")
+
+        loc_time = datetime.fromtimestamp(update_ts, tz=timezone.utc)
         if existing:
             existing.latitude = body.latitude
             existing.longitude = body.longitude
             existing.accuracy = body.accuracy
-            existing.updated_at = now
+            existing.updated_at = loc_time
         else:
             new_loc = UserLocation(
                 user_id=actor.id,
                 latitude=body.latitude,
                 longitude=body.longitude,
                 accuracy=body.accuracy,
-                updated_at=now,
+                updated_at=loc_time,
             )
             db.add(new_loc)
 
@@ -84,17 +99,27 @@ async def update_my_location(
                 "latitude": body.latitude,
                 "longitude": body.longitude,
                 "accuracy": body.accuracy,
-                "updated_at": now.isoformat(),
+                "timestamp": update_ts,
+                "updated_at": loc_time.isoformat(),
             },
             scope="admin",
         )
     elif body.client_id:
         cid = body.client_id
+        update_ts = float(body.timestamp) if body.timestamp is not None else now.timestamp()
+        existing = _anonymous_client_locations.get(cid)
+        existing_ts = existing.get("timestamp") if existing else 0.0
+
+        # Reject out-of-order older updates to prevent stale readings from overriding fresh GPS fixes
+        if existing and update_ts < (existing_ts - 0.5):
+            return SuccessResponse(message="Stale update ignored")
+
         _anonymous_client_locations[cid] = {
             "client_id": cid,
-            "latitude": body.latitude,
-            "longitude": body.longitude,
-            "accuracy": body.accuracy,
+            "latitude": float(body.latitude),
+            "longitude": float(body.longitude),
+            "accuracy": float(body.accuracy) if body.accuracy is not None else None,
+            "timestamp": update_ts,
             "updated_at": now,
         }
         # Broadcast location update event to admin clients
@@ -104,9 +129,10 @@ async def update_my_location(
                 "client_id": cid,
                 "username": f"Citizen ({cid[:8]})",
                 "role": "CIVILIAN",
-                "latitude": body.latitude,
-                "longitude": body.longitude,
-                "accuracy": body.accuracy,
+                "latitude": float(body.latitude),
+                "longitude": float(body.longitude),
+                "accuracy": float(body.accuracy) if body.accuracy is not None else None,
+                "timestamp": update_ts,
                 "updated_at": now.isoformat(),
             },
             scope="admin",
@@ -200,6 +226,7 @@ async def get_location_users(
             longitude=loc.longitude,
             accuracy=loc.accuracy,
             client_id=None,
+            timestamp=_to_utc_timestamp(loc.updated_at),
             updated_at=loc.updated_at,
         )
         for loc, user in rows
@@ -220,6 +247,7 @@ async def get_location_users(
                     longitude=data["longitude"],
                     accuracy=data.get("accuracy"),
                     client_id=cid,
+                    timestamp=data.get("timestamp"),
                     updated_at=up_at,
                 )
             )

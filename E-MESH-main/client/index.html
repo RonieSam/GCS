@@ -111,11 +111,16 @@
       <!-- Location Status & Permission Feedback Card -->
       <div class="location-card" id="location-card">
         <div class="location-card-header">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
-            <circle cx="12" cy="10" r="3"></circle>
-          </svg>
-          <span class="location-card-title">LOCATION STATUS</span>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
+              <circle cx="12" cy="10" r="3"></circle>
+            </svg>
+            <span class="location-card-title">LOCATION STATUS</span>
+          </div>
+          <button type="button" id="btn-refresh-location" class="btn btn-sm btn-outline" title="Request fresh browser GPS fix">
+            🔄 Refresh Location
+          </button>
         </div>
         <div id="location-card-content" class="location-card-content">
           <span id="location-text">Acquiring device GPS coordinates…</span>
@@ -125,19 +130,63 @@
           </div>
         </div>
 
+        <!-- Insecure Context Alert (dynamically shown on HTTP) -->
+        <div id="insecure-context-alert" class="diag-alert hidden">
+          ⚠️ <b>Insecure Context (HTTP):</b> Browser blocks GPS hardware on non-HTTPS origins. Access via HTTPS (e.g. <code>https://&lt;IP&gt;:8443/client</code> or <code>https://&lt;IP&gt;:3443</code>) for real GPS hardware access.
+        </div>
+
+        <!-- Temporary Visible Location Diagnostics Panel -->
+        <div id="location-diagnostics-panel" class="location-diagnostics-panel">
+          <div class="diag-header">
+            <span>🛰️ LIVE GPS DIAGNOSTICS</span>
+            <span id="diag-badge-freshness" class="badge-freshness badge-freshness--pending">ACQUIRING</span>
+          </div>
+
+          <div class="diag-grid">
+            <div class="diag-item">
+              <span class="diag-label">RAW LATITUDE</span>
+              <span id="diag-raw-lat" class="diag-val font-mono">--</span>
+            </div>
+            <div class="diag-item">
+              <span class="diag-label">RAW LONGITUDE</span>
+              <span id="diag-raw-lon" class="diag-val font-mono">--</span>
+            </div>
+            <div class="diag-item">
+              <span class="diag-label">ACCURACY (METRES)</span>
+              <span id="diag-accuracy" class="diag-val font-mono">--</span>
+            </div>
+            <div class="diag-item">
+              <span class="diag-label">ACQUISITION TIME</span>
+              <span id="diag-acquired-at" class="diag-val">--</span>
+            </div>
+            <div class="diag-item">
+              <span class="diag-label">PERMISSION / CONTEXT</span>
+              <span id="diag-permission" class="diag-val">--</span>
+            </div>
+            <div class="diag-item">
+              <span class="diag-label">BACKEND DELIVERY</span>
+              <span id="diag-backend-sync" class="diag-val">--</span>
+            </div>
+            <div class="diag-item" style="grid-column: span 2;">
+              <span class="diag-label">LAST BACKEND UPDATE</span>
+              <span id="diag-last-sync" class="diag-val">--</span>
+            </div>
+          </div>
+        </div>
+
         <!-- Manual Location Fallback Panel -->
         <div id="manual-location-panel" class="manual-location-panel">
           <div class="manual-loc-header">
-            <span>📍 Fallback Coordinates:</span>
+            <span>📍 Fallback Coordinates (Testing / Indoor):</span>
             <button type="button" id="btn-use-preset-loc" class="btn btn-sm btn-outline">Preset (13.0827, 80.2707)</button>
           </div>
           <div class="manual-loc-inputs">
-            <input type="number" id="manual-lat" step="0.0001" placeholder="Lat (13.0827)" value="13.0827">
-            <input type="number" id="manual-lon" step="0.0001" placeholder="Lon (80.2707)" value="80.2707">
-            <button type="button" id="btn-apply-manual-loc" class="btn btn-sm btn-primary">Set GPS</button>
+            <input type="number" id="manual-lat" step="0.000001" placeholder="Lat (13.082700)" value="13.0827">
+            <input type="number" id="manual-lon" step="0.000001" placeholder="Lon (80.270700)" value="80.2707">
+            <button type="button" id="btn-apply-manual-loc" class="btn btn-sm btn-primary">Set Coordinates</button>
           </div>
           <span style="font-size:11px; color:#94A3B8; margin-top:5px; display:block;">
-            Note: If device GPS is denied by browser (HTTP), tap "Set GPS" to attach these coordinates to your SOS.
+            Note: If device GPS hardware is denied or obstructed indoors, tap "Set Coordinates" to manually attach test coordinates.
           </span>
         </div>
 

@@ -49,6 +49,18 @@
     elements.manualLon       = document.getElementById('manual-lon');
     elements.btnUsePresetLoc = document.getElementById('btn-use-preset-loc');
     elements.btnApplyManualLoc = document.getElementById('btn-apply-manual-loc');
+
+    // Diagnostics elements
+    elements.diagRawLat        = document.getElementById('diag-raw-lat');
+    elements.diagRawLon        = document.getElementById('diag-raw-lon');
+    elements.diagAccuracy      = document.getElementById('diag-accuracy');
+    elements.diagAcquiredAt    = document.getElementById('diag-acquired-at');
+    elements.diagPermission    = document.getElementById('diag-permission');
+    elements.diagBackendSync   = document.getElementById('diag-backend-sync');
+    elements.diagLastSync      = document.getElementById('diag-last-sync');
+    elements.diagBadgeFreshness= document.getElementById('diag-badge-freshness');
+    elements.insecureContextAlert = document.getElementById('insecure-context-alert');
+    elements.btnRefreshLocation = document.getElementById('btn-refresh-location');
   }
 
   // ── Toast System ───────────────────────────────────────────────────────
@@ -64,6 +76,83 @@
     }, 4000);
   }
 
+  // ── Real-Time Diagnostics Panel Updater ────────────────────────────────
+  function renderDiagnostics(diag) {
+    if (!elements.diagRawLat) return;
+
+    // Check secure context
+    if (elements.insecureContextAlert) {
+      if (!diag.isSecureContext) {
+        elements.insecureContextAlert.classList.remove('hidden');
+      } else {
+        elements.insecureContextAlert.classList.add('hidden');
+      }
+    }
+
+    if (diag.rawLatitude != null && diag.rawLongitude != null) {
+      elements.diagRawLat.textContent = `${diag.rawLatitude.toFixed(7)}°`;
+      elements.diagRawLon.textContent = `${diag.rawLongitude.toFixed(7)}°`;
+    } else {
+      elements.diagRawLat.textContent = "--";
+      elements.diagRawLon.textContent = "--";
+    }
+
+    if (diag.horizontalAccuracy != null) {
+      elements.diagAccuracy.textContent = `±${diag.horizontalAccuracy.toFixed(1)} m`;
+    } else {
+      elements.diagAccuracy.textContent = "--";
+    }
+
+    if (diag.positionAcquiredAt) {
+      const elapsedSec = Math.max(0, Math.round((Date.now() - diag.positionAcquiredAt.getTime()) / 1000));
+      elements.diagAcquiredAt.textContent = `${diag.positionAcquiredAt.toLocaleTimeString()} (${elapsedSec}s ago)`;
+    } else {
+      elements.diagAcquiredAt.textContent = "--";
+    }
+
+    // Freshness Badge
+    if (elements.diagBadgeFreshness) {
+      if (diag.rawLatitude == null) {
+        elements.diagBadgeFreshness.className = 'badge-freshness badge-freshness--pending';
+        elements.diagBadgeFreshness.textContent = 'NO FIX';
+      } else if (diag.isFresh) {
+        elements.diagBadgeFreshness.className = 'badge-freshness badge-freshness--fresh';
+        elements.diagBadgeFreshness.textContent = 'FRESH FIX';
+      } else {
+        elements.diagBadgeFreshness.className = 'badge-freshness badge-freshness--stale';
+        elements.diagBadgeFreshness.textContent = 'POTENTIALLY STALE';
+      }
+    }
+
+    // Permission & Security Context
+    if (elements.diagPermission) {
+      const secLabel = diag.isSecureContext ? "HTTPS" : "HTTP (Insecure)";
+      elements.diagPermission.textContent = `${diag.permissionStatus} [${secLabel}]`;
+    }
+
+    // Backend Delivery Status
+    if (elements.diagBackendSync) {
+      if (diag.backendSyncStatus === "ACKNOWLEDGED_BY_SERVER") {
+        elements.diagBackendSync.innerHTML = `<span style="color:#34D399;font-weight:700">✓ DELIVERED</span> (#${diag.syncCount})`;
+      } else if (diag.backendSyncStatus === "TRANSMITTING") {
+        elements.diagBackendSync.innerHTML = `<span style="color:#FBBF24">Transmitting…</span>`;
+      } else if (diag.backendSyncStatus === "SYNC_FAILED") {
+        elements.diagBackendSync.innerHTML = `<span style="color:#F87171">Failed (${diag.syncError || 'error'})</span>`;
+      } else {
+        elements.diagBackendSync.textContent = diag.backendSyncStatus;
+      }
+    }
+
+    if (elements.diagLastSync) {
+      if (diag.lastSyncTime) {
+        const syncElapsed = Math.max(0, Math.round((Date.now() - diag.lastSyncTime.getTime()) / 1000));
+        elements.diagLastSync.textContent = `${diag.lastSyncTime.toLocaleTimeString()} (${syncElapsed}s ago)`;
+      } else {
+        elements.diagLastSync.textContent = "Awaiting first transmission…";
+      }
+    }
+  }
+
   // ── Geolocation UI Updates ─────────────────────────────────────────────
   function onLocationSuccess(pos) {
     if (!elements.gpsIndicator) return;
@@ -72,7 +161,7 @@
     elements.gpsLabel.textContent = acc > 0 ? `GPS ±${acc}m` : 'GPS READY';
 
     if (elements.locationText) {
-      elements.locationText.textContent = 'High-accuracy GPS fix established:';
+      elements.locationText.textContent = 'Hardware GPS fix established:';
     }
     if (elements.locationCoords) {
       elements.locationCoords.classList.remove('hidden');
@@ -305,11 +394,33 @@
       resetToActiveScreen();
     });
 
+    // Refresh Location Button
+    if (elements.btnRefreshLocation) {
+      elements.btnRefreshLocation.addEventListener('click', async (e) => {
+        e.preventDefault();
+        elements.btnRefreshLocation.disabled = true;
+        const originalText = elements.btnRefreshLocation.textContent;
+        elements.btnRefreshLocation.textContent = "🔄 Refreshing…";
+        showToast("Requesting fresh high-accuracy GPS fix…", "info");
+
+        try {
+          const freshPos = await API.refreshLocation();
+          onLocationSuccess(freshPos);
+          showToast(`Fresh GPS fix acquired (±${Math.round(freshPos.accuracy || 0)}m)`, "success");
+        } catch (err) {
+          showToast(`GPS Refresh Failed: ${err.message || 'Check location permissions'}`, "error");
+        } finally {
+          elements.btnRefreshLocation.disabled = false;
+          elements.btnRefreshLocation.textContent = originalText;
+        }
+      });
+    }
+
     // Manual Location Override Listeners
     if (elements.btnUsePresetLoc) {
       elements.btnUsePresetLoc.addEventListener('click', () => {
-        if (elements.manualLat) elements.manualLat.value = "13.0827";
-        if (elements.manualLon) elements.manualLon.value = "80.2707";
+        if (elements.manualLat) elements.manualLat.value = "13.082700";
+        if (elements.manualLon) elements.manualLon.value = "80.270700";
         applyManualCoordinates(13.0827, 80.2707);
       });
     }
@@ -318,10 +429,10 @@
       elements.btnApplyManualLoc.addEventListener('click', () => {
         const lat = parseFloat(elements.manualLat ? elements.manualLat.value : NaN);
         const lon = parseFloat(elements.manualLon ? elements.manualLon.value : NaN);
-        if (!isNaN(lat) && !isNaN(lon)) {
+        if (!isNaN(lat) && !isNaN(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
           applyManualCoordinates(lat, lon);
         } else {
-          showToast("Please enter valid decimal coordinates", "error");
+          showToast("Please enter valid decimal coordinates (lat -90..90, lon -180..180)", "error");
         }
       });
     }
@@ -330,7 +441,7 @@
   function applyManualCoordinates(lat, lon) {
     const pos = API.setManualPosition(lat, lon, 10);
     onLocationSuccess(pos);
-    showToast(`Manual GPS fix active: ${lat.toFixed(4)}, ${lon.toFixed(4)}`, "success");
+    showToast(`Manual coordinates active: ${lat.toFixed(6)}, ${lon.toFixed(6)}`, "success");
   }
 
   // ── Bootstrap ──────────────────────────────────────────────────────────
@@ -338,11 +449,23 @@
     cacheElements();
     setupEvents();
 
-    // Start geolocation engine immediately
+    // Subscribe to live diagnostics updates
+    API.onDiagnosticsChange((diag) => {
+      renderDiagnostics(diag);
+    });
+
+    // Start geolocation engine with high accuracy
     API.startLocationTracking(onLocationSuccess, onLocationError);
 
     // Connect WebSocket for mesh gateway health
     API.connectWebSocket(onNetworkStatusChange);
+
+    // Regular 1-second timer to update elapsed timers on diagnostics panel
+    setInterval(() => {
+      if (API && API.diagnostics) {
+        renderDiagnostics(API.diagnostics);
+      }
+    }, 1000);
   }
 
   document.addEventListener('DOMContentLoaded', init);
